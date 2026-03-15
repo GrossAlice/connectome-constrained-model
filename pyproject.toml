@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stage1_lgssm"
+version = "0.1.0"
+description = "Single‑neuron LGSSM deconvolution and EM fitting"
+authors = [ { name = "Generated Project" } ]
+readme = "README.md"
+requires-python = ">=3.10"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["stage1*"]

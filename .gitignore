@@ -1,0 +1,27 @@
+# Python cache/bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local editor settings
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Data and outputs (large files)
+src/data/
+src/output_plots/
+*.h5
+*.npy
+*.pkl
+*.csv
+
+nohup.out
+*.zip
