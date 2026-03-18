@@ -38,9 +38,17 @@ def _build_per_source_reversals(T_sv, sign_t, e_exc, e_inh):
     return torch.where(total <= 1, torch.zeros_like(E), E)
 
 
-class Stage2ModelPT(nn.Module):
-    """Conductance-based neural dynamics: gap junctions + SV/DCV synapses."""
+def _build_edge_specific_reversals(T_sv, sign_t, e_exc, e_inh):
+    mask = T_sv > 0
+    E = torch.where(
+        sign_t > 0,
+        torch.full_like(sign_t, float(e_exc)),
+        torch.where(sign_t < 0, torch.full_like(sign_t, float(e_inh)), torch.zeros_like(sign_t)),
+    )
+    return E * mask.float()
 
+
+class Stage2ModelPT(nn.Module):
     def __init__(self, N: int, T_e: torch.Tensor, T_sv: torch.Tensor,
                  T_dcv: torch.Tensor, dt: float, cfg, device: torch.device,
                  d_ell: int = 0, lambda_u_init: Optional[torch.Tensor] = None,
@@ -61,7 +69,11 @@ class Stage2ModelPT(nn.Module):
         for attr, T_mat, cfg_name in [("W_sv", self.T_sv, "W_sv_init"),
                                        ("W_dcv", self.T_dcv, "W_dcv_init")]:
             val = float(getattr(cfg, cfg_name, 1.0))
-            W_raw = torch.full_like(T_mat, float(torch.log(torch.exp(torch.tensor(val)) - 1)))
+            W_lo, W_hi = float(getattr(cfg, "W_lo", 0.0)), None
+            setattr(self, f"_{attr}_lo", W_lo)
+            setattr(self, f"_{attr}_hi", W_hi)
+            W_init = torch.full_like(T_mat, val)
+            W_raw = _reparam_inv(W_init, W_lo, W_hi)
             W_raw = W_raw * (T_mat > 0).float()
             learn = bool(getattr(cfg, f"learn_{attr}", False))
             if learn:
@@ -70,18 +82,26 @@ class Stage2ModelPT(nn.Module):
                 self.register_buffer(f"_{attr}_raw", W_raw, persistent=False)
 
         # Lambda (leak/decay)
-        lu = (lambda_u_init.to(device).float() if lambda_u_init is not None
-              else torch.tensor(float(getattr(cfg, "lambda_u_fallback", 0.3)), device=device))
-        self._lambda_u_lo, self._lambda_u_hi = 0.0, float(getattr(cfg, "lambda_u_max", 0.9999))
+        if lambda_u_init is None:
+            raise ValueError("lambda_u_init is required (from OLS on smoothed data)")
+        lu = lambda_u_init.to(device).float()
+        self._lambda_u_lo = float(getattr(cfg, "lambda_u_lo", 0.0))
+        self._lambda_u_hi = float(getattr(cfg, "lambda_u_hi", 0.9999))
         self._lambda_u_raw = nn.Parameter(
             _reparam_inv(lu, self._lambda_u_lo, self._lambda_u_hi),
             requires_grad=bool(getattr(cfg, "learn_lambda_u", False)))
 
         # Gap-junction conductance
-        self._G_lo = float(getattr(cfg, "G_min", 0.0))
+        self._G_lo = float(getattr(cfg, "G_lo", 0.0))
         self._G_hi = float(cfg.G_max) if getattr(cfg, "G_max", None) else None
-        G_init = torch.tensor(cfg.G_init, dtype=torch.float32, device=device)
-        self._G_raw = nn.Parameter(_reparam_inv(G_init, self._G_lo, self._G_hi))
+        self.edge_specific_G = bool(getattr(cfg, "edge_specific_G", False))
+        if self.edge_specific_G:
+            G_mat = torch.full_like(self.T_e, cfg.G_init)
+            G_mat = G_mat * (self.T_e > 0).float()
+            self._G_raw = nn.Parameter(_reparam_inv(G_mat, self._G_lo, self._G_hi))
+        else:
+            G_init = torch.tensor(cfg.G_init, dtype=torch.float32, device=device)
+            self._G_raw = nn.Parameter(_reparam_inv(G_init, self._G_lo, self._G_hi))
 
         # Tonic drive
         self.I0 = nn.Parameter(torch.zeros(N, device=device),
@@ -102,10 +122,10 @@ class Stage2ModelPT(nn.Module):
 
     def _init_synaptic_params(self, cfg, device, N):
         for prefix, r in [("sv", self.r_sv), ("dcv", self.r_dcv)]:
-            a_lo = float(getattr(cfg, f"a_{prefix}_min", 0.0))
+            a_lo = float(getattr(cfg, "a_lo", 0.0))
             a_hi = float(v) if (v := getattr(cfg, f"a_{prefix}_max", None)) else None
-            tau_lo = float(getattr(cfg, f"tau_{prefix}_min", 1e-4))
-            tau_hi = float(v) if (v := getattr(cfg, f"tau_{prefix}_max", None)) else None
+            tau_lo = float(getattr(cfg, "tau_lo", 1e-4))
+            tau_hi = None
             setattr(self, f"_a_{prefix}_lo", a_lo); setattr(self, f"_a_{prefix}_hi", a_hi)
             setattr(self, f"_tau_{prefix}_lo", tau_lo); setattr(self, f"_tau_{prefix}_hi", tau_hi)
 
@@ -126,7 +146,9 @@ class Stage2ModelPT(nn.Module):
     def _init_reversals(self, cfg, sign_t, device):
         e_exc = float(cfg.E_sv_exc_init)
         e_inh = float(getattr(cfg, "E_sv_inh_init", -e_exc))
-        if bool(getattr(cfg, "per_neuron_reversals", True)) and sign_t is not None:
+        if bool(getattr(cfg, "edge_specific_reversals", False)) and sign_t is not None:
+            E_sv = _build_edge_specific_reversals(self.T_sv, sign_t.to(device).float(), e_exc, e_inh)
+        elif bool(getattr(cfg, "per_neuron_reversals", True)) and sign_t is not None:
             E_sv = _build_per_source_reversals(self.T_sv, sign_t.to(device).float(), e_exc, e_inh)
         else:
             E_sv = torch.tensor(e_exc, device=device)
@@ -139,7 +161,9 @@ class Stage2ModelPT(nn.Module):
     # ── Properties (constrained parameters) ────────────────────────────
 
     def _get_W(self, name: str) -> torch.Tensor:
-        return F.softplus(getattr(self, f"_{name}_raw"))
+        lo = getattr(self, f"_{name}_lo")
+        hi = getattr(self, f"_{name}_hi")
+        return _reparam_fwd(getattr(self, f"_{name}_raw"), lo, hi)
 
     @property
     def W_sv(self): return self._get_W("W_sv")
@@ -169,7 +193,12 @@ class Stage2ModelPT(nn.Module):
         return torch.sigmoid(u)
 
     def laplacian(self) -> torch.Tensor:
-        W = self.T_e * self.G; W = (W + W.t()) * 0.5
+        G = self.G
+        if self.edge_specific_G:
+            W = G * (self.T_e > 0).float()
+        else:
+            W = self.T_e * G
+        W = (W + W.t()) * 0.5
         return W - torch.diag(W.sum(0))
 
     def _synaptic_current(self, u_prev, phi_gated, s, T_eff, a, tau, E):
@@ -180,15 +209,34 @@ class Stage2ModelPT(nn.Module):
         g = (pool * a_post).sum(1)
         if E.dim() == 0:
             I = g * (E - u_prev)
-        else:
+        elif E.dim() == 1:
             I = (T_eff.t() @ (s_next * E.view(-1, 1)) * a_post).sum(1) - g * u_prev
+        else:
+            I = (((T_eff * E).t() @ (s_next * a_post)).sum(1) - g * u_prev)
         return I, s_next
 
-    def prior_step(self, u_prev: torch.Tensor, s_sv: torch.Tensor, s_dcv: torch.Tensor,
-                   gating: torch.Tensor, stim: Optional[torch.Tensor] = None):
-        """One-step dynamics: u(t) → u(t+1)."""
+    def prior_step(
+        self,
+        u_prev: torch.Tensor,
+        s_sv: torch.Tensor,
+        s_dcv: torch.Tensor,
+        gating: torch.Tensor,
+        stim: Optional[torch.Tensor] = None,
+        lambda_u: Optional[torch.Tensor] = None,
+        I0: Optional[torch.Tensor] = None,
+    ):
+        """One-step dynamics: u(t) → u(t+1).
+
+        Parameters
+        ----------
+        lambda_u, I0
+            Optional per-call overrides used by the multi-worm path. When not
+            provided, the model's own constrained parameters are used.
+        """
         N, device = self.N, u_prev.device
         phi_gated = self.phi(u_prev) * gating.view(N)
+        lambda_u_eff = self.lambda_u if lambda_u is None else lambda_u.to(device=device, dtype=u_prev.dtype)
+        I0_eff = self.I0 if I0 is None else I0.to(device=device, dtype=u_prev.dtype)
 
         I_sv = I_dcv = torch.zeros(N, device=device)
         if self.r_sv > 0:
@@ -203,7 +251,7 @@ class Stage2ModelPT(nn.Module):
         if self.d_ell > 0 and stim is not None:
             I_stim = (self.b * stim.view(N)) if self.stim_diagonal_only else (self.b @ stim)
 
-        u_next = (1.0 - self.lambda_u) * u_prev + self.lambda_u * (self.I0 + I_gap + I_sv + I_dcv + I_stim)
+        u_next = (1.0 - lambda_u_eff) * u_prev + lambda_u_eff * (I0_eff + I_gap + I_sv + I_dcv + I_stim)
         lo, hi = self.u_clip
         if lo is not None or hi is not None:
             u_next = u_next.clamp(min=lo, max=hi)

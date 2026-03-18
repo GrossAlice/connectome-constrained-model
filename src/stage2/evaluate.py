@@ -1,4 +1,3 @@
-"""Stage-2 evaluation helpers and public evaluation entry points."""
 from __future__ import annotations
 
 import numpy as np
@@ -7,7 +6,6 @@ from typing import Dict, Any, Optional, Tuple, List
 
 from .behavior import (
     behaviour_all_neurons_prediction,
-    evaluate_e2e_decoder,
     evaluate_training_decoder,
 )
 from . import get_stage2_logger
@@ -21,7 +19,6 @@ __all__ = [
     "choose_loo_subset",
     "compute_current_decomposition",
     "evaluate_training_decoder",
-    "evaluate_e2e_decoder",
     "behaviour_all_neurons_prediction",
     "run_full_evaluation",
 ]
@@ -57,7 +54,6 @@ def _rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 def _per_neuron_metrics(
     u_true: np.ndarray, u_pred: np.ndarray, indices: List[int],
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Compute R², Pearson r, RMSE for *indices* columns; others stay NaN."""
     N = u_true.shape[1]
     r2, corr, rmse = np.full(N, np.nan), np.full(N, np.nan), np.full(N, np.nan)
     for i in indices:
@@ -67,8 +63,11 @@ def _per_neuron_metrics(
     return r2, corr, rmse
 
 def _get_clip_bounds(model) -> Tuple[Optional[float], Optional[float]]:
-    lo = getattr(model, "u_next_clip_min", -50.0)
-    hi = getattr(model, "u_next_clip_max", 50.0)
+    clip = getattr(model, "u_clip", (None, None))
+    if isinstance(clip, (tuple, list)) and len(clip) == 2:
+        lo, hi = clip
+    else:
+        lo, hi = None, None
     return (float(lo) if lo is not None else None,
             float(hi) if hi is not None else None)
 
@@ -98,27 +97,20 @@ def _teacher_forced_prior(
     """
     T, N = u.shape
     device = u.device
+    ones = torch.ones(N, device=device)
     prior_mu = torch.zeros_like(u)
     prior_mu[0] = u[0]
     s_sv  = torch.zeros(N, model.r_sv,  device=device)
     s_dcv = torch.zeros(N, model.r_dcv, device=device)
     with torch.no_grad():
         for t in range(1, T):
-            g = gating[t - 1] if gating is not None else torch.ones(N, device=device)
+            g = gating[t - 1] if gating is not None else ones
             s = stim[t - 1]   if stim   is not None else None
             prior_mu[t], s_sv, s_dcv = model.prior_step(u[t - 1], s_sv, s_dcv, g, s)
     return prior_mu
 
 
 def _ar1_smooth(u: torch.Tensor, lam: torch.Tensor, I0: torch.Tensor) -> np.ndarray:
-    """Apply per-neuron AR(1) smoothing without any network coupling.
-
-    u(t+1) = (1-λ)*u(t) + λ*I₀
-
-    This isolates the temporal-smoothing effect of the leak so that a
-    behaviour decoder trained on these traces can be compared fairly
-    against one trained on the full-model traces.
-    """
     T, N = u.shape
     out = torch.zeros_like(u)
     out[0] = u[0]
@@ -161,6 +153,7 @@ def compute_free_run(model: Stage2ModelPT, data: Dict[str, Any]) -> Dict[str, An
     cfg = data.get("_cfg")
     gating, stim = data.get("gating"), data.get("stim")
     lo, hi = _get_clip_bounds(model)
+    ones = torch.ones(N, device=device)
 
     motor_idx: list[int] = []
     if cfg is not None and getattr(cfg, "motor_neurons", None) is not None:
@@ -176,7 +169,7 @@ def compute_free_run(model: Stage2ModelPT, data: Dict[str, Any]) -> Dict[str, An
         s_sv  = torch.zeros(N, model.r_sv,  device=device)
         s_dcv = torch.zeros(N, model.r_dcv, device=device)
         for t in range(1, T):
-            g = gating[t - 1] if gating is not None else torch.ones(N, device=device)
+            g = gating[t - 1] if gating is not None else ones
             s = stim[t - 1]   if stim   is not None else None
             u_prev = u0[t - 1].clone() if conditioned else u_free[t - 1]
             if conditioned:
@@ -208,6 +201,7 @@ def loo_forward_simulate(
     device = u_all.device
     i = held_out
     lo, hi = _get_clip_bounds(model)
+    ones = torch.ones(N, device=device)
 
     u_pred = torch.zeros(T, device=device)
     u_pred[0] = u_all[0, i]
@@ -218,7 +212,7 @@ def loo_forward_simulate(
         for t in range(T - 1):
             u_t = u_all[t].clone()
             u_t[i] = u_pred[t]
-            g = gating[t] if gating is not None else torch.ones(N, device=device)
+            g = gating[t] if gating is not None else ones
             s = stim[t]   if stim   is not None else None
             mu_next, s_sv, s_dcv = model.prior_step(u_t, s_sv, s_dcv, g, s)
             u_pred[t + 1] = _clamp(mu_next[i : i + 1], lo, hi).squeeze()
@@ -243,10 +237,10 @@ def run_loo_all(
         preds[i] = loo_forward_simulate(model, u, i, gating, stim)
         if cnt == 0 or (cnt + 1) % 10 == 0:
             _logger.info("loo_progress", done=cnt + 1, total=len(indices),
-                         neuron=int(i), r2=float(_r2(u_np[:, i], preds[i])))
+                         neuron=int(i), r2=float(_r2(u_np[1:, i], preds[i][1:])))
 
     pred_full = np.column_stack([preds.get(i, u_np[:, i]) for i in range(u.shape[1])])
-    r2, corr, rmse = _per_neuron_metrics(u_np, pred_full, indices)
+    r2, corr, rmse = _per_neuron_metrics(u_np[1:], pred_full[1:], indices)
     return {"pred": preds, "r2": r2, "corr": corr, "rmse": rmse}
 
 
@@ -292,31 +286,50 @@ def compute_current_decomposition(
         s_sv_state  = torch.zeros(N, model.r_sv,  device=device)
         s_dcv_state = torch.zeros(N, model.r_dcv, device=device)
         lam, dt = model.lambda_u.detach(), model.dt
+        L = model.laplacian()
+        ones = torch.ones(N, device=device)
+
+        syn_terms = []
+        if model.r_sv > 0:
+            syn_terms.append({
+                "prefix": "I_sv",
+                "state_name": "sv",
+                "gamma": torch.exp(-dt / (model.tau_sv + 1e-12)),
+                "T_eff": model.T_sv * model._get_W("W_sv"),
+                "a": model.a_sv,
+                "E": model.E_sv,
+            })
+        if model.r_dcv > 0:
+            syn_terms.append({
+                "prefix": "I_dcv",
+                "state_name": "dcv",
+                "gamma": torch.exp(-dt / (model.tau_dcv + 1e-12)),
+                "T_eff": model.T_dcv * model._get_W("W_dcv"),
+                "a": model.a_dcv,
+                "E": model.E_dcv,
+            })
 
         for t in range(T - 1):
             u_prev = u[t]
-            g = gating[t] if gating is not None else torch.ones(N, device=device)
+            g = gating[t] if gating is not None else ones
             s = stim[t]   if stim   is not None else None
 
             out["I_leak"][t] = ((1.0 - lam) * u_prev).cpu().numpy()
             out["I_bias"][t] = (lam * model.I0).cpu().numpy()
-            out["I_gap"][t]  = (lam * (model.laplacian() @ u_prev)).cpu().numpy()
+            out["I_gap"][t]  = (lam * (L @ u_prev)).cpu().numpy()
 
             phi_prev = model.phi(u_prev) * g
 
-            for prefix, r, s_state, T_mask, W_param, a_param, tau_param, E_param in [
-                ("I_sv",  model.r_sv,  s_sv_state,  model.T_sv,  model._get_W("W_sv"),
-                 model.a_sv,  model.tau_sv,  model.E_sv),
-                ("I_dcv", model.r_dcv, s_dcv_state, model.T_dcv, model._get_W("W_dcv"),
-                 model.a_dcv, model.tau_dcv, model.E_dcv),
-            ]:
-                if r == 0:
-                    continue
-                gamma = torch.exp(-dt / (tau_param + 1e-12))
+            for term in syn_terms:
+                prefix = term["prefix"]
+                s_state = s_sv_state if term["state_name"] == "sv" else s_dcv_state
+                gamma = term["gamma"]
+                T_eff = term["T_eff"]
+                a_param = term["a"]
+                E_param = term["E"]
                 s_state = gamma.view(1, -1) * s_state + phi_prev.unsqueeze(1)
                 a = a_param.unsqueeze(0) if a_param.dim() == 1 else a_param
                 sa = s_state * a
-                T_eff = T_mask * W_param
                 g_syn = torch.matmul(T_eff.t(), sa).sum(dim=1)
 
                 E = E_param
@@ -346,8 +359,7 @@ def compute_current_decomposition(
 
 def run_full_evaluation(
     model: Stage2ModelPT, data: Dict[str, Any], cfg,
-    decoder=None, e2e_decoder=None, beh_all_baseline=None, *,
-    skip_beh_all: bool = False,
+    decoder=None, beh_all_baseline=None,
 ) -> Dict[str, Any]:
     data["_cfg"] = cfg
 
@@ -369,25 +381,21 @@ def run_full_evaluation(
     free_run = compute_free_run(model, data)
 
     beh     = evaluate_training_decoder(decoder, data, onestep) if decoder is not None else None
-    beh_e2e = evaluate_e2e_decoder(e2e_decoder, data, onestep)  if e2e_decoder is not None else None
     beh_all = (
-        beh_all_baseline if (not skip_beh_all and beh_all_baseline is not None)
-        else behaviour_all_neurons_prediction(data) if not skip_beh_all
-        else None
+        beh_all_baseline if beh_all_baseline is not None
+        else behaviour_all_neurons_prediction(data)
     )
 
     r2_model_mean = None
-    for src in (beh_e2e, beh):
-        if src is not None:
-            r2 = src.get("r2_model_heldout")
-            if r2 is None or not np.any(np.isfinite(r2)):
-                r2 = src["r2_model"]
-            r2_model_mean = float(np.nanmean(r2))
-            break
+    if beh is not None:
+        r2 = beh.get("r2_model_heldout")
+        if r2 is None or not np.any(np.isfinite(r2)):
+            r2 = beh["r2_model"]
+        r2_model_mean = float(np.nanmean(r2))
 
     return {
         "onestep": onestep, "loo": loo, "currents": currents,
         "free_run": free_run,
-        "beh": beh, "beh_e2e": beh_e2e, "beh_all": beh_all,
+        "beh": beh, "beh_all": beh_all,
         "beh_r2_model": r2_model_mean,
     }

@@ -25,7 +25,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--num_epochs", type=int, default=cfg_default.num_epochs, help="Number of training epochs")
     parser.add_argument("--learning_rate", type=float, default=cfg_default.learning_rate, help="Learning rate for Adam optimiser")
     parser.add_argument("--device", type=str, default=cfg_default.device, help="PyTorch device: 'cpu' or 'cuda'")
-    parser.add_argument("--beta", type=float, default=cfg_default.beta, help="Weight on dynamics loss term")
+    parser.add_argument("--dynamics_scale", type=float, default=cfg_default.dynamics_scale, help="Weight on dynamics loss term")
     parser.add_argument("--r_sv", type=int, default=cfg_default.r_sv, help="Number of exponential basis functions for SV kernels")
     parser.add_argument("--r_dcv", type=int, default=cfg_default.r_dcv, help="Number of exponential basis functions for DCV kernels")
     parser.add_argument(
@@ -146,15 +146,13 @@ def main(argv: list[str] | None = None) -> None:
         default=None,
         help="Keep lambda_u fixed at Stage 1 rho values.",
     )
-    parser.add_argument("--lambda_u_warmup_frac", type=float, default=cfg_default.lambda_u_warmup_frac,
-                        help="If lambda_u is learned, fraction of epochs to keep it frozen initially (0=disabled, 0.5=first half)")
     parser.add_argument(
         "--force_interactions",
         action="store_true",
         help=(
             "Convenience flag to encourage interaction-driven dynamics: "
             "sets --fix_lambda_u. "
-            "(Does not change lambda_u_fallback/G_init unless you pass them.)"
+            "(Does not change G_init unless you pass it.)"
         ),
     )
     parser.add_argument("--dt", type=float, default=cfg_default.dt, help="Override sampling interval (seconds)")
@@ -267,19 +265,13 @@ def main(argv: list[str] | None = None) -> None:
         "--rollout_weight",
         type=float,
         default=cfg_default.rollout_weight,
-        help="Weight of short-horizon rollout loss (default: 0.1).",
+        help=f"Weight of short-horizon rollout loss (default: {cfg_default.rollout_weight}).",
     )
     parser.add_argument(
         "--rollout_starts",
         type=int,
         default=cfg_default.rollout_starts,
         help="Number of random starting points per epoch for rollout loss (default: 8).",
-    )
-    parser.add_argument(
-        "--e2e_decoder_l2",
-        type=float,
-        default=cfg_default.e2e_decoder_l2,
-        help="L2 penalty on E2E decoder weights (default: 1e-3).",
     )
     parser.add_argument(
         "--alpha_cv_every",
@@ -292,12 +284,6 @@ def main(argv: list[str] | None = None) -> None:
         type=float,
         default=cfg_default.neuron_dropout_frac,
         help="Fraction of neurons masked per step for LOO-aligned training (0=disabled).",
-    )
-    parser.add_argument(
-        "--posthoc_cv_regularize",
-        type=int,
-        default=int(cfg_default.posthoc_cv_regularize),
-        help="Post-hoc CV regularization of network scale (0=off, 1=on).",
     )
     parser.add_argument(
         "--warmstart_rollout",
@@ -403,20 +389,7 @@ def main(argv: list[str] | None = None) -> None:
         "--behavior_weight",
         type=float,
         default=None,
-        help=f"Weight of behaviour prediction loss in training (used only for mode='e2e'; default: {cfg_default.behavior_weight}).",
-    )
-    parser.add_argument(
-        "--behavior_decoder_mode",
-        type=str,
-        choices=["none", "frozen", "e2e"],
-        default=cfg_default.behavior_decoder_mode,
-        help="Behaviour decoder mode: no decoder, frozen ridge decoder, or trainable end-to-end decoder.",
-    )
-    parser.add_argument(
-        "--fit_all_neuron_baseline",
-        action="store_true",
-        default=cfg_default.fit_all_neuron_baseline,
-        help="Also fit the all-neuron ridge baseline for diagnostics.",
+        help=f"Weight of behaviour prediction loss in training (default: {cfg_default.behavior_weight}).",
     )
     parser.add_argument(
         "--make_posture_video",
@@ -469,7 +442,7 @@ def main(argv: list[str] | None = None) -> None:
         "num_epochs": args.num_epochs,
         "learning_rate": args.learning_rate,
         "device": args.device,
-        "beta": args.beta,
+        "dynamics_scale": args.dynamics_scale,
         "r_sv": args.r_sv,
         "r_dcv": args.r_dcv,
         "fix_tau_sv": ((cfg_default.fix_tau_sv if getattr(args, "fix_tau_sv", None) is None else bool(args.fix_tau_sv))
@@ -519,8 +492,6 @@ def main(argv: list[str] | None = None) -> None:
         cfg_kwargs["E_sv_exc_init"] = float(args.E_sv_init)
     if getattr(args, "E_dcv_init", None) is not None:
         cfg_kwargs["E_dcv_init"] = float(args.E_dcv_init)
-    if getattr(args, "lambda_u_warmup_frac", None) is not None:
-        cfg_kwargs["lambda_u_warmup_frac"] = float(args.lambda_u_warmup_frac)
     # parse optional time constants and amplitudes
     if args.tau_sv_init is not None and len(args.tau_sv_init) > 0:
         cfg_kwargs["tau_sv_init"] = tuple(args.tau_sv_init)
@@ -559,14 +530,10 @@ def main(argv: list[str] | None = None) -> None:
         cfg_kwargs["rollout_weight"] = float(args.rollout_weight)
     if getattr(args, "rollout_starts", None) is not None:
         cfg_kwargs["rollout_starts"] = int(args.rollout_starts)
-    if getattr(args, "e2e_decoder_l2", None) is not None:
-        cfg_kwargs["e2e_decoder_l2"] = float(args.e2e_decoder_l2)
     if getattr(args, "alpha_cv_every", None) is not None:
         cfg_kwargs["alpha_cv_every"] = int(args.alpha_cv_every)
     if getattr(args, "neuron_dropout_frac", None) is not None:
         cfg_kwargs["neuron_dropout_frac"] = float(args.neuron_dropout_frac)
-    if getattr(args, "posthoc_cv_regularize", None) is not None:
-        cfg_kwargs["posthoc_cv_regularize"] = bool(int(args.posthoc_cv_regularize))
     if getattr(args, "warmstart_rollout", None) is not None:
         cfg_kwargs["warmstart_rollout"] = bool(int(args.warmstart_rollout))
     if args.eval_loo_subset_neurons is not None and len(args.eval_loo_subset_neurons) > 0:
@@ -580,10 +547,6 @@ def main(argv: list[str] | None = None) -> None:
         cfg_kwargs["behavior_lag_steps"] = args.behavior_lag_steps
     if getattr(args, "behavior_weight", None) is not None:
         cfg_kwargs["behavior_weight"] = float(args.behavior_weight)
-    if getattr(args, "behavior_decoder_mode", None) is not None:
-        cfg_kwargs["behavior_decoder_mode"] = str(args.behavior_decoder_mode)
-    if getattr(args, "fit_all_neuron_baseline", None) is not None:
-        cfg_kwargs["fit_all_neuron_baseline"] = bool(args.fit_all_neuron_baseline)
     if getattr(args, "make_posture_video", None) is not None:
         cfg_kwargs["make_posture_video"] = bool(args.make_posture_video)
     if getattr(args, "posture_video_fps", None) is not None:

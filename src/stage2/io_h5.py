@@ -393,8 +393,11 @@ def save_results_pt(
     u_mean: torch.Tensor,
     params: Dict[str, torch.Tensor],
     diagnostics: Optional[Dict[str, Any]] = None,
+    output_path: Optional[str | Path] = None,
 ) -> None:
-    with h5py.File(cfg.h5_path, "a") as f:
+    target_path = Path(output_path) if output_path is not None else Path(cfg.h5_path)
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    with h5py.File(target_path, "a") as f:
         if cfg.out_u_mean is not None:
             if cfg.out_u_mean in f:
                 del f[cfg.out_u_mean]

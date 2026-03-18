@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import dataclasses
+import json
+import sys
 import numpy as np
 import torch
 import torch.nn as nn
@@ -8,9 +11,9 @@ from typing import Dict, Any, Optional
 from pathlib import Path
 
 from .behavior import (
+    behaviour_all_neurons_prediction,
     compute_behaviour_loss,
-    fit_linear_behaviour_decoder_for_training,
-    normalize_behavior_decoder_mode,
+    init_behaviour_decoder,
     _log_ridge_grid,
     _make_contiguous_folds,
 )
@@ -28,7 +31,6 @@ __all__ = [
     "compute_teacher_forced_states",
     "apply_training_step",
     "snapshot_model_state",
-    "_clamp_params",
     # Ridge-CV alpha solver (merged from ridge_alpha.py)
     "ridge_cv_solve_alpha",
     "inject_alpha_into_model",
@@ -261,13 +263,14 @@ def compute_neuron_dropout_loss(
 
     # For held-out neurons, track the model's own prediction
     u_pred_held = u_target[0].clone()  # initial state is ground truth
+    u_input = u_target[0].clone()  # pre-allocated buffer
 
     total_loss = torch.tensor(0.0, device=device)
     n_valid = 0
 
     for t in range(T - 1):
         # Build input: ground truth for non-held, model prediction for held
-        u_input = u_target[t].clone()
+        u_input.copy_(u_target[t])
         u_input[held_mask] = u_pred_held[held_mask]
 
         g = gating_data[t] if gating_data is not None else torch.ones(N, device=device)
@@ -439,7 +442,10 @@ def _solve_neuron_ridge_cv(
         if fold_errors:
             cv_mse[lam_idx] = float(np.mean(fold_errors))
 
-    best_idx = int(np.nanargmin(cv_mse))
+    if not np.any(np.isfinite(cv_mse)):
+        best_idx = 0  # all folds failed; fall back to unregularized
+    else:
+        best_idx = int(np.nanargmin(np.where(np.isfinite(cv_mse), cv_mse, np.inf)))
     best_lambda = float(ridge_grid[best_idx])
 
     gram_full = Xs.T @ Xs
@@ -654,50 +660,77 @@ def apply_training_step(
 #  Parameter clamping                                                           #
 # --------------------------------------------------------------------------- #
 
-def _clamp(p: torch.Tensor, lo: float | None, hi: float | None) -> None:
-    if lo is not None or hi is not None:
-        p.clamp_(min=lo, max=hi)
-
-
-def _cfg_clamp(p: torch.Tensor, cfg, attr_min: str, default_min: float,
-               attr_max: str | None = None, default_max=None) -> None:
-    lo = float(getattr(cfg, attr_min, default_min))
-    hi_raw = getattr(cfg, attr_max, default_max) if attr_max else default_max
-    _clamp(p, lo, float(hi_raw) if hi_raw is not None else None)
-
-
 def _clamp_params(model: Stage2ModelPT, cfg: Stage2PTConfig) -> None:
-    if model.lambda_u.requires_grad:
-        _cfg_clamp(model.lambda_u, cfg, "lambda_u_min", 0.0, "lambda_u_max", 0.9999)
+    # Reparameterized parameters (lambda_u, G, a_sv/dcv, tau_sv/dcv, W_sv/dcv)
+    # are bounded by construction via sigmoid / softplus — no clamping needed.
 
-    _cfg_clamp(model.G,       cfg, "G_min",       0.0,  "G_max",       None)
-    _cfg_clamp(model.a_sv,    cfg, "a_sv_min",    0.0,  "a_sv_max",    None)
-    _cfg_clamp(model.tau_sv,  cfg, "tau_sv_min",  1e-4, "tau_sv_max",  None)
-    _cfg_clamp(model.a_dcv,   cfg, "a_dcv_min",   0.0,  "a_dcv_max",   None)
-    _cfg_clamp(model.tau_dcv, cfg, "tau_dcv_min", 1e-4, "tau_dcv_max", None)
-
-    # W_sv and W_dcv are now enforced non-negative via softplus (no clamping needed)
-
-    # beta_interaction frozen at 1.0 — no clamping needed
-
+    # Stimulus weights are plain nn.Parameters → clamp if cfg specifies bounds.
     if model.d_ell > 0:
         b_min = getattr(cfg, "b_min", None)
         b_max = getattr(cfg, "b_max", None)
         lo = float(b_min) if b_min is not None else (-float(b_max) if b_max is not None else None)
         hi = float(b_max) if b_max is not None else None
-        _clamp(model.b, lo, hi)
+        if lo is not None or hi is not None:
+            model.b.data.clamp_(min=lo, max=hi)
 
 
 # --------------------------------------------------------------------------- #
 #  Logging                                                                      #
 # --------------------------------------------------------------------------- #
 
+class _TeeWriter:
+    """Duplicate stdout to a file, preserving original stdout."""
+
+    def __init__(self, log_path: str | Path):
+        self._file = open(log_path, "w", buffering=1)
+        self._stdout = sys.stdout
+
+    def write(self, msg: str):
+        self._stdout.write(msg)
+        self._file.write(msg)
+
+    def flush(self):
+        self._stdout.flush()
+        self._file.flush()
+
+    def close(self):
+        self._file.close()
+        sys.stdout = self._stdout
+
+
+def _config_to_dict(cfg: Stage2PTConfig) -> dict:
+    """Serialize full config to a JSON-safe dict."""
+    out: dict = {}
+    for sec_name in ("data", "dynamics", "stimulus", "behavior", "train", "eval", "output"):
+        sub = getattr(cfg, sec_name, None)
+        if sub is None or not dataclasses.is_dataclass(sub):
+            continue
+        sec_dict: dict = {}
+        for f in dataclasses.fields(sub):
+            v = getattr(sub, f.name)
+            # Convert non-serializable types
+            if isinstance(v, Path):
+                v = str(v)
+            elif isinstance(v, tuple):
+                v = list(v)
+            sec_dict[f.name] = v
+        out[sec_name] = sec_dict
+    return out
+
+
+def _save_run_config(cfg: Stage2PTConfig, save_dir: str | Path) -> Path:
+    """Write the complete run config as JSON into *save_dir*/run_config.json."""
+    p = Path(save_dir) / "run_config.json"
+    with open(p, "w") as f:
+        json.dump(_config_to_dict(cfg), f, indent=2, default=str)
+    return p
+
 def _log_config(cfg: Stage2PTConfig, d_ell: int) -> None:
     sep = "=" * 60
     print(
         f"\n{sep}\n"
         f"[Stage2] Config\n"
-        f"  device={cfg.device}  lr={cfg.learning_rate}  epochs={cfg.num_epochs}  beta={cfg.beta}\n"
+        f"  device={cfg.device}  lr={cfg.learning_rate}  epochs={cfg.num_epochs}  dynamics_scale={cfg.dynamics_scale}\n"
         f"  masks: T_e={cfg.T_e_dataset}  T_sv={cfg.T_sv_dataset}  T_dcv={cfg.T_dcv_dataset}\n"
         f"  silencing={cfg.silencing_dataset}  stim={cfg.stim_dataset}  d_ell={d_ell}  "
         f"ridge_b={getattr(cfg, 'ridge_b', 0.0)}\n"
@@ -705,6 +738,7 @@ def _log_config(cfg: Stage2PTConfig, d_ell: int) -> None:
         f"  fix_taus: sv={getattr(cfg, 'fix_tau_sv', False)} dcv={getattr(cfg, 'fix_tau_dcv', False)}\n"
         f"  ranks: r_sv={cfg.r_sv} r_dcv={cfg.r_dcv}\n"
         f"  learn_W: sv={getattr(cfg, 'learn_W_sv', False)} dcv={getattr(cfg, 'learn_W_dcv', False)}\n"
+        f"  gap_junctions: edge_specific_G={getattr(cfg, 'edge_specific_G', False)}\n"
         f"  reversals: learn={getattr(cfg, 'learn_reversals', False)} "
         f"edge_specific={getattr(cfg, 'edge_specific_reversals', False)}\n"
         f"  u_var: weighting={getattr(cfg, 'use_u_var_weighting', False)} "
@@ -716,7 +750,11 @@ def _log_config(cfg: Stage2PTConfig, d_ell: int) -> None:
 def _log_init_params(model: Stage2ModelPT, cfg: Stage2PTConfig) -> None:
     print("[Stage2] Model parameters (init)")
     print(f"  lambda_u ({_tag(model.lambda_u)}): {_fmt(model.lambda_u)}")
-    print(f"  G ({_tag(model.G)}): {_fmt(model.G)}")
+    if model.edge_specific_G:
+        G_edges = model.G[model.T_e > 0]
+        print(f"  G ({_tag(model.G)}, edge-specific): mean={G_edges.mean():.6g} min={G_edges.min():.6g} max={G_edges.max():.6g}")
+    else:
+        print(f"  G ({_tag(model.G)}): {_fmt(model.G)}")
     print(f"  I0 ({_tag(model.I0)}): {_fmt(model.I0)}")
     print(f"  a_sv ({_tag(model.a_sv)}): {_fmt(model.a_sv)}")
     if model._W_sv_raw.requires_grad:
@@ -734,6 +772,82 @@ def _log_init_params(model: Stage2ModelPT, cfg: Stage2PTConfig) -> None:
     # beta_interaction frozen at 1.0
     trainable = [n for n, p in model.named_parameters() if p.requires_grad]
     print(f"[Stage2] Trainable: {', '.join(trainable) or '(none)'}")
+
+
+# --------------------------------------------------------------------------- #
+#  Parameter snapshot (for trajectory plots)                                    #
+# --------------------------------------------------------------------------- #
+
+@torch.no_grad()
+def _snapshot_params(model) -> dict:
+    """Return a dict of scalar summaries of every tracked model parameter."""
+    snap: dict = {}
+
+    # Gap-junction conductance
+    G = model.G
+    snap["G"] = float(G.mean())
+
+    # Synaptic kernel amplitudes (RMS)
+    snap["a_sv_rms"] = float(model.a_sv.pow(2).mean().sqrt()) if model.a_sv.numel() > 0 else 0.0
+    snap["a_dcv_rms"] = float(model.a_dcv.pow(2).mean().sqrt()) if model.a_dcv.numel() > 0 else 0.0
+
+    # Leak rate λ_u
+    lam = model.lambda_u
+    if lam.numel() > 0:
+        snap["lambda_u_min"] = float(lam.min())
+        snap["lambda_u_max"] = float(lam.max())
+        snap["lambda_u_med"] = float(lam.median())
+        snap["lambda_u_mean"] = float(lam.mean())
+    else:
+        snap["lambda_u_min"] = snap["lambda_u_max"] = 0.0
+        snap["lambda_u_med"] = snap["lambda_u_mean"] = 0.0
+
+    # Tonic drive I0
+    I0 = model.I0
+    snap["I0_rms"] = float(I0.pow(2).mean().sqrt()) if I0.numel() > 0 else 0.0
+    snap["I0_absmax"] = float(I0.abs().max()) if I0.numel() > 0 else 0.0
+    if I0.numel() > 0:
+        snap["I0_min"] = float(I0.min())
+        snap["I0_max"] = float(I0.max())
+        snap["I0_med"] = float(I0.median())
+        snap["I0_mean"] = float(I0.mean())
+    else:
+        snap["I0_min"] = snap["I0_max"] = 0.0
+        snap["I0_med"] = snap["I0_mean"] = 0.0
+
+    def _active_weight_stats(W: torch.Tensor, mask: torch.Tensor, prefix: str) -> None:
+        active = W[mask > 0]
+        if active.numel() > 0:
+            snap[f"{prefix}_min"] = float(active.min())
+            snap[f"{prefix}_max"] = float(active.max())
+            snap[f"{prefix}_med"] = float(active.median())
+            snap[f"{prefix}_mean"] = float(active.mean())
+        else:
+            snap[f"{prefix}_min"] = snap[f"{prefix}_max"] = 0.0
+            snap[f"{prefix}_med"] = snap[f"{prefix}_mean"] = 0.0
+
+    _active_weight_stats(model.W_sv, model.T_sv, "W_sv")
+    _active_weight_stats(model.W_dcv, model.T_dcv, "W_dcv")
+
+    # Reversal potentials
+    E_sv = model.E_sv
+    if E_sv.numel() > 1:
+        snap["E_sv_mean"] = float(E_sv.mean())
+        snap["E_sv_min"] = float(E_sv.min())
+        snap["E_sv_max"] = float(E_sv.max())
+    else:
+        val = float(E_sv)
+        snap["E_sv_mean"] = snap["E_sv_min"] = snap["E_sv_max"] = val
+    snap["E_dcv"] = float(model.E_dcv.mean())
+
+    # Time constants τ (already in seconds) — store as lists for multi-rank
+    snap["tau_sv"] = model.tau_sv.tolist() if model.tau_sv.numel() > 0 else []
+    snap["tau_dcv"] = model.tau_dcv.tolist() if model.tau_dcv.numel() > 0 else []
+
+    # Stimulus weights ‖b‖
+    snap["b_norm"] = float(model.b.pow(2).sum().sqrt()) if model.b.numel() > 0 else 0.0
+
+    return snap
 
 
 # --------------------------------------------------------------------------- #
@@ -768,232 +882,342 @@ def train_stage2(
 
     if save_dir is not None:
         Path(save_dir).mkdir(parents=True, exist_ok=True)
+        _save_run_config(cfg, save_dir)
+        _tee = _TeeWriter(Path(save_dir) / "run.log")
+        sys.stdout = _tee
+    else:
+        _tee = None
 
-    # ---- lambda_u from Stage 1 rho -------------------------------------------
-    from .init import init_lambda_u, init_all_from_data, InitConfig
-    lambda_u_init = init_lambda_u(data.get("rho_stage1"), N)
-
-    # ---- neurotransmitter sign data for reversals ----------------------------
-    sign_t = data.get("sign_t")
-
-    # ---- build model ---------------------------------------------------------
-    model = Stage2ModelPT(
-        N, data["T_e"], data["T_sv"], data["T_dcv"], data["dt"],
-        cfg, device, d_ell=d_ell,
-        lambda_u_init=lambda_u_init,
-        sign_t=sign_t,
-    ).to(device)
-
-    init_all_from_data(model, u_stage1, network_frac=cfg.init_network_frac)
-
-    _log_config(cfg, d_ell)
-    with torch.no_grad():
-        _log_init_params(model, cfg)
-
-    # ---- optimiser -----------------------------------------------------------
-    params = list(model.parameters())
-    optimiser = optim.Adam(params, lr=cfg.learning_rate)
-
-    z_obs = u_stage1.to(device)
-    z_target = z_obs
-    uvar = u_var_stage1.to(device) if u_var_stage1 is not None else None
-
-    use_uvar = bool(getattr(cfg, "use_u_var_weighting", False))
-    uvar_scale = float(getattr(cfg, "u_var_scale", 1.0))
-    uvar_floor = float(getattr(cfg, "u_var_floor", 1e-8))
-    if use_uvar and uvar is None:
-        print("[Stage2][warn] use_u_var_weighting requested but u_var missing; using sigma_u^2 only.")
-
-    print(f"[Stage2] One-step training: T={T}, N={N}, dt={data['dt']:.4f}s")
-
-    # ---- rollout helper ------------------------------------------------------
-    def compute_prior(u: torch.Tensor) -> torch.Tensor:
-        s_sv = torch.zeros((N, model.r_sv), device=device)
-        s_dcv = torch.zeros((N, model.r_dcv), device=device)
-        preds = [u[0]]
-        for t in range(1, T):
-            g = gating_data[t - 1] if gating_data is not None else torch.ones(N, device=device)
-            s = stim_data[t - 1] if stim_data is not None else None
-            u_next, s_sv, s_dcv = model.prior_step(u[t - 1], s_sv, s_dcv, g, s)
-            preds.append(u_next)
-        return torch.stack(preds)
-
-    def posterior_check(prior_mu: torch.Tensor, target: torch.Tensor) -> None:
-        if uvar is None:
-            return
-        ok = torch.isfinite(target) & torch.isfinite(prior_mu) & torch.isfinite(uvar) & (uvar > 0)
-        n = int(ok.sum().item())
-        if n == 0:
-            return
-        zs = ((target - prior_mu) / torch.sqrt(uvar + 1e-8))[ok]
-        print(
-            f"[Stage2][PosteriorCheck] z-score mean={zs.mean():+.3f} "
-            f"std={zs.std(unbiased=False):.3f} "
-            f"P(|z|>2)={(zs.abs() > 2).float().mean():.3f} "
-            f"P(|z|>3)={(zs.abs() > 3).float().mean():.3f} (n={n})"
-        )
-
-    # ---- behaviour decoder ---------------------------------------------------
-    behavior_weight = float(getattr(cfg, "behavior_weight", 0.0) or 0.0)
-    behavior_decoder_mode = normalize_behavior_decoder_mode(
-        getattr(cfg, "behavior_decoder_mode", "frozen")
-    )
-    fit_all_neuron_baseline = bool(getattr(cfg, "fit_all_neuron_baseline", True))
-    skip_beh_all = (behavior_decoder_mode == "none") or (not fit_all_neuron_baseline)
-    beh_decoder = None
-    if behavior_weight > 0.0 and b_seq is not None:
-        print("[Stage2] Fitting linear behaviour decoder for training loss ...")
-        beh_decoder = fit_linear_behaviour_decoder_for_training(data)
-        if beh_decoder is None:
-            print("[Stage2][warn] Behaviour decoder fitting failed; behaviour loss disabled.")
-
-    # ---- warmup --------------------------------------------------------------
-    epoch_losses: list[dict] = []
-    warmup_frac = float(getattr(cfg, "lambda_u_warmup_frac", 0.0) or 0.0)
-    warmup_epochs = int(warmup_frac * cfg.num_epochs)
-    lu_trainable = model._lambda_u_raw.requires_grad
-    if warmup_epochs > 0 and lu_trainable:
-        model._lambda_u_raw.requires_grad_(False)
-        print(f"[Stage2] \u03bb_u frozen for first {warmup_epochs} epochs (warmup)")
-
-    grad_clip = float(getattr(cfg, "grad_clip_norm", 0.0) or 0.0)
-    ridge_b = float(getattr(cfg, "ridge_b", 0.0) or 0.0)
-    interaction_l2 = float(getattr(cfg, "interaction_l2", 0.0) or 0.0)
-    ridge_W_sv = float(getattr(cfg, "ridge_W_sv", 0.0) or 0.0)
-    ridge_W_dcv = float(getattr(cfg, "ridge_W_dcv", 0.0) or 0.0)
-    plot_every = int(getattr(cfg, "plot_every", 0) or 0)
-
-    # ---- behaviour decoder schedule ----------------------------------------
-    beh_refit_every = int(getattr(cfg, "beh_refit_every", 10) or 0)
-    if beh_refit_every > 0:
-        print(f"[Stage2] Behaviour decoder re-fit every {beh_refit_every} epochs")
-
-    # Interaction L2 penalty (penalises network-driven component beyond AR(1))
-    if interaction_l2 > 0:
-        print(f"[Stage2] Interaction L2 penalty = {interaction_l2:.4g}")
-    if ridge_W_sv > 0:
-        print(f"[Stage2] Ridge W_sv = {ridge_W_sv:.4g}")
-    if ridge_W_dcv > 0:
-        print(f"[Stage2] Ridge W_dcv = {ridge_W_dcv:.4g}")
-
-    # ---- training loop -------------------------------------------------------
-    for epoch in range(cfg.num_epochs):
-        if epoch == warmup_epochs and warmup_epochs > 0 and lu_trainable:
-            model._lambda_u_raw.requires_grad_(True)
-            print(f"[Stage2] \u03bb_u unfrozen at epoch {epoch + 1}")
-
-        optimiser.zero_grad()
-
-        prior_mu = compute_prior(z_target)
-        dynamics_loss = compute_dynamics_loss(
-            z_target,
-            prior_mu,
-            sigma_u,
-            u_var=uvar,
-            use_u_var_weighting=use_uvar,
-            u_var_scale=uvar_scale,
-            u_var_floor=uvar_floor,
-        )
-
-        if epoch in (0, cfg.num_epochs - 1):
-            with torch.no_grad():
-                posterior_check(prior_mu, z_target)
-
-        loss = cfg.beta * dynamics_loss
-        if ridge_b > 0 and model.d_ell > 0:
-            loss = loss + ridge_b * model.b.pow(2).mean()
-
-        # Ridge on synaptic edge weights (shrinks toward prior)
-        if ridge_W_sv > 0 and model.learn_W_sv:
-            # Penalise deviation from init (softplus(raw) - init)^2, masked by topology
-            W_sv_active = model.W_sv[model.T_sv > 0]
-            if W_sv_active.numel() > 0:
-                loss = loss + ridge_W_sv * W_sv_active.pow(2).mean()
-        if ridge_W_dcv > 0 and model.learn_W_dcv:
-            W_dcv_active = model.W_dcv[model.T_dcv > 0]
-            if W_dcv_active.numel() > 0:
-                loss = loss + ridge_W_dcv * W_dcv_active.pow(2).mean()
-
-        # Interaction L2: penalise network-driven component beyond AR(1)
+    try:  # ensure tee is closed even on crash
+        from .init_from_data import init_lambda_u, init_all_from_data
+        lambda_u_init = init_lambda_u(u_stage1, cfg)
+        beh_all_baseline = behaviour_all_neurons_prediction(data)
+    
+        # ---- neurotransmitter sign data for reversals ----------------------------
+        sign_t = data.get("sign_t")
+    
+        # ---- build model ---------------------------------------------------------
+        model = Stage2ModelPT(
+            N, data["T_e"], data["T_sv"], data["T_dcv"], data["dt"],
+            cfg, device, d_ell=d_ell,
+            lambda_u_init=lambda_u_init,
+            sign_t=sign_t,
+        ).to(device)
+    
+        init_all_from_data(model, u_stage1, cfg)
+    
+        # ---- init decomposition diagnostic --------------------------------------
+        from .plot_eval import _compute_input_decomposition
+        with torch.no_grad():
+            decomp, per_neuron = _compute_input_decomposition(model, data)
+            # Pretty-print with plain labels for terminal
+            _label_map = {
+                "Target\nresidual": "AR1_resid",
+                "$\\lambda I_{gap}$": "λI_gap",
+                "$\\lambda I_{sv}$": "λI_sv",
+                "$\\lambda I_{dcv}$": "λI_dcv",
+                "$\\lambda I_{stim}$": "λI_stim",
+                "Unexplained": "unexpl",
+            }
+            parts = "  ".join(
+                f"{_label_map.get(k, k)}={v:.4f}" for k, v in decomp.items()
+            )
+            print(f"[Stage2][init-decomp] RMS:  {parts}")
+            # Per-neuron: flag neurons where unexplained >> target residual
+            resid_rms = per_neuron[:, 0]  # target residual per neuron
+            gap_rms = per_neuron[:, 1]
+            net_rms = np.sqrt(per_neuron[:, 1]**2 + per_neuron[:, 2]**2 + per_neuron[:, 3]**2)
+            ratio = net_rms / np.maximum(resid_rms, 1e-12)
+            n_over = int((ratio > 2.0).sum())
+            n_under = int((ratio < 0.1).sum())
+            print(f"[Stage2][init-decomp] Per-neuron: "
+                  f"{n_over}/{len(ratio)} have network/resid > 2×  "
+                  f"{n_under}/{len(ratio)} have network/resid < 0.1×")
+    
+        _log_config(cfg, d_ell)
+        with torch.no_grad():
+            _log_init_params(model, cfg)
+    
+        # ---- optimiser -----------------------------------------------------------
+        params = list(model.parameters())
+        optimiser = optim.Adam(params, lr=cfg.learning_rate)
+    
+        z_obs = u_stage1.to(device)
+        z_target = z_obs
+        uvar = u_var_stage1.to(device) if u_var_stage1 is not None else None
+    
+        use_uvar = bool(getattr(cfg, "use_u_var_weighting", False))
+        uvar_scale = float(getattr(cfg, "u_var_scale", 1.0))
+        uvar_floor = float(getattr(cfg, "u_var_floor", 1e-8))
+        if use_uvar and uvar is None:
+            print("[Stage2][warn] use_u_var_weighting requested but u_var missing; using sigma_u^2 only.")
+    
+        print(f"[Stage2] One-step training: T={T}, N={N}, dt={data['dt']:.4f}s")
+    
+        # ---- rollout helper ------------------------------------------------------
+        def compute_prior(u: torch.Tensor) -> torch.Tensor:
+            s_sv = torch.zeros((N, model.r_sv), device=device)
+            s_dcv = torch.zeros((N, model.r_dcv), device=device)
+            preds = [u[0]]
+            for t in range(1, T):
+                g = gating_data[t - 1] if gating_data is not None else torch.ones(N, device=device)
+                s = stim_data[t - 1] if stim_data is not None else None
+                u_next, s_sv, s_dcv = model.prior_step(u[t - 1], s_sv, s_dcv, g, s)
+                preds.append(u_next)
+            return torch.stack(preds)
+    
+        def posterior_check(prior_mu: torch.Tensor, target: torch.Tensor) -> None:
+            if uvar is None:
+                return
+            ok = torch.isfinite(target) & torch.isfinite(prior_mu) & torch.isfinite(uvar) & (uvar > 0)
+            n = int(ok.sum().item())
+            if n == 0:
+                return
+            zs = ((target - prior_mu) / torch.sqrt(uvar + 1e-8))[ok]
+            print(
+                f"[Stage2][PosteriorCheck] z-score mean={zs.mean():+.3f} "
+                f"std={zs.std(unbiased=False):.3f} "
+                f"P(|z|>2)={(zs.abs() > 2).float().mean():.3f} "
+                f"P(|z|>3)={(zs.abs() > 3).float().mean():.3f} (n={n})"
+            )
+    
+        # ---- behaviour decoder ---------------------------------------------------
+        behavior_weight = float(getattr(cfg, "behavior_weight", 0.0) or 0.0)
+        beh_decoder = None
+        if behavior_weight > 0.0 and b_seq is not None:
+            print("[Stage2] Initialising learnable behaviour decoder ...")
+            beh_decoder = init_behaviour_decoder(data)
+            if beh_decoder is None:
+                print("[Stage2][warn] Behaviour decoder init failed; behaviour loss disabled.")
+            else:
+                params.append(beh_decoder["W"])
+                optimiser.add_param_group({"params": [beh_decoder["W"]]})
+    
+        epoch_losses: list[dict] = []
+        grad_clip = float(getattr(cfg, "grad_clip_norm", 0.0) or 0.0)
+        ridge_b = float(getattr(cfg, "ridge_b", 0.0) or 0.0)
+        dynamics_l2 = float(getattr(cfg, "dynamics_l2", 0.0) or 0.0)
+        dynamics_objective = str(getattr(cfg, "dynamics_objective", "one_step") or "one_step").strip().lower()
+        rollout_steps = int(getattr(cfg, "rollout_steps", 0) or 0)
+        rollout_weight = float(getattr(cfg, "rollout_weight", 0.0) or 0.0)
+        rollout_starts = int(getattr(cfg, "rollout_starts", 0) or 0)
+        warmstart_rollout = bool(getattr(cfg, "warmstart_rollout", False))
+        neuron_dropout_frac = float(getattr(cfg, "neuron_dropout_frac", 0.0) or 0.0)
+        interaction_l2 = float(getattr(cfg, "interaction_l2", 0.0) or 0.0)
+        ridge_W_sv = float(getattr(cfg, "ridge_W_sv", 0.0) or 0.0)
+        ridge_W_dcv = float(getattr(cfg, "ridge_W_dcv", 0.0) or 0.0)
+        plot_every = int(getattr(cfg, "plot_every", 0) or 0)
+    
+        # Interaction L2 penalty (penalises network-driven component beyond AR(1))
         if interaction_l2 > 0:
-            with torch.no_grad():
-                lam = model.lambda_u.detach()
-                I0_det = model.I0.detach()
-                ar1_mu = (1.0 - lam) * z_target[:-1] + lam * I0_det
-            interaction = prior_mu[1:] - ar1_mu
-            loss = loss + interaction_l2 * interaction.pow(2).mean()
+            print(f"[Stage2] Interaction L2 penalty = {interaction_l2:.4g}")
+        if ridge_W_sv > 0:
+            print(f"[Stage2] Ridge W_sv = {ridge_W_sv:.4g}")
+        if ridge_W_dcv > 0:
+            print(f"[Stage2] Ridge W_dcv = {ridge_W_dcv:.4g}")
+        if dynamics_l2 > 0:
+            print(f"[Stage2] Dynamics L2 = {dynamics_l2:.4g}")
+        if dynamics_objective == "rollout":
+            print(f"[Stage2] Dynamics objective = rollout ({rollout_steps} steps, {rollout_starts} starts)")
+        elif rollout_weight > 0 and rollout_steps > 0:
+            print(f"[Stage2] Rollout auxiliary = {rollout_weight:.4g} × rollout_loss ({rollout_steps} steps, {rollout_starts} starts)")
+        if neuron_dropout_frac > 0:
+            print(f"[Stage2] Neuron-dropout auxiliary = {neuron_dropout_frac:.3f}")
 
-        beh_loss_val = None
-        if beh_decoder is not None and behavior_weight > 0.0:
-            beh_loss_val = compute_behaviour_loss(prior_mu, beh_decoder)
-            loss = loss + behavior_weight * beh_loss_val
+        alpha_cv_every = int(getattr(cfg, "alpha_cv_every", 0) or 0)
+        alpha_cv_blend = float(getattr(cfg, "alpha_cv_blend", 1.0) or 1.0)
+        alpha_cv_max_ratio = float(getattr(cfg, "alpha_cv_max_ratio", 0.0) or 0.0)
+        if alpha_cv_every > 0:
+            print(f"[Stage2] Alpha ridge-CV every {alpha_cv_every} epochs (blend={alpha_cv_blend:.2f})")
 
-        apply_training_step(
-            loss,
-            optimiser,
-            params,
-            model,
-            cfg,
-            grad_clip=grad_clip,
-        )
+        # ---- training loop -------------------------------------------------------
+        for epoch in range(cfg.num_epochs):
+            # ── In-loop alpha ridge-CV ────────────────────────────────────
+            if (alpha_cv_every > 0
+                    and epoch > 0
+                    and epoch % alpha_cv_every == 0):
+                try:
+                    alpha_result = ridge_cv_solve_alpha(model, data, cfg)
+                    inject_alpha_into_model(
+                        model, alpha_result,
+                        blend=alpha_cv_blend,
+                        max_ratio=alpha_cv_max_ratio,
+                    )
+                    print(f"[Stage2] Alpha-CV @ epoch {epoch}: "
+                          f"{alpha_result['n_updated']}/{N} updated, "
+                          f"{alpha_result['n_at_upper']} at upper boundary")
+                except Exception as e:
+                    print(f"[Stage2][warn] Alpha-CV failed at epoch {epoch}: {e}")
 
-        rec = {"dynamics": dynamics_loss.item(), "total": loss.item()}
-        if beh_loss_val is not None:
-            rec["behaviour_loss"] = beh_loss_val.item()
-        epoch_losses.append(rec)
+            optimiser.zero_grad()
+    
+            prior_mu = compute_prior(z_target)
+            one_step_loss = compute_dynamics_loss(
+                z_target,
+                prior_mu,
+                sigma_u,
+                u_var=uvar,
+                use_u_var_weighting=use_uvar,
+                u_var_scale=uvar_scale,
+                u_var_floor=uvar_floor,
+            )
 
-        parts = [f"dynamics={dynamics_loss.item():.4f}", f"total={loss.item():.4f}"]
-        if beh_loss_val is not None:
-            parts.append(f"beh_loss={beh_loss_val.item():.4f}")
-        print(f"[Stage2] Epoch {epoch + 1}/{cfg.num_epochs}: {'  '.join(parts)}")
-
-        # ---- periodic behaviour decoder re-fit --------------------------------
-        if (beh_refit_every > 0 and beh_decoder is not None
-                and (epoch + 1) % beh_refit_every == 0
-                and epoch + 1 < cfg.num_epochs):
-            try:
-                new_decoder = fit_linear_behaviour_decoder_for_training(data)
-                if new_decoder is not None:
-                    beh_decoder = new_decoder
-                    print(f"    [beh-refit] Behaviour decoder re-fit at epoch {epoch + 1}")
-            except Exception as e:
-                print(f"    [beh-refit][warn] re-fit failed: {e}")
-
-        if save_dir and plot_every > 0 and (epoch + 1) % plot_every == 0:
-            try:
-                epoch_dir = Path(save_dir) / f"epoch_{epoch + 1:04d}"
-                ev = generate_eval_loo_plots(
-                    model=model, data=data, cfg=cfg,
-                    epoch_losses=epoch_losses, save_dir=str(epoch_dir), show=False,
-                    decoder=beh_decoder,
-                    skip_beh_all=skip_beh_all,
+            use_rollout_main = dynamics_objective == "rollout" and rollout_steps > 0 and rollout_starts > 0
+            use_rollout_aux = dynamics_objective != "rollout" and rollout_weight > 0 and rollout_steps > 0 and rollout_starts > 0
+            use_dropout_aux = neuron_dropout_frac > 0
+            cached_states = None
+            if warmstart_rollout and (use_rollout_main or use_rollout_aux or use_dropout_aux):
+                cached_states = compute_teacher_forced_states(
+                    model,
+                    z_target,
+                    gating_data=gating_data,
+                    stim_data=stim_data,
                 )
-                if ev is not None:
-                    br2 = ev.get("beh_r2_model")
-                    if br2 is not None:
-                        epoch_losses[-1]["beh_r2_eval"] = br2
-                print(f"[Stage2] Plots saved to {epoch_dir}/")
-            except Exception as e:
-                print(f"[Stage2][warn] plotting failed at epoch {epoch + 1}: {e}")
 
-    # ---- save ----------------------------------------------------------------
-    params_final = snapshot_model_state(model)
-    save_results_pt(cfg, z_target.detach(), params_final)
-    print("[Stage2] Training complete. Results saved.")
+            rollout_loss_val = None
+            if use_rollout_main or use_rollout_aux:
+                rollout_loss_val = compute_rollout_loss(
+                    model,
+                    z_target,
+                    sigma_u,
+                    rollout_steps=rollout_steps,
+                    rollout_starts=rollout_starts,
+                    gating_data=gating_data,
+                    stim_data=stim_data,
+                    cached_states=cached_states if warmstart_rollout else None,
+                )
 
-    # ---- final evaluation ----------------------------------------------------
-    eval_result = None
-    if save_dir or show:
-        eval_result = generate_eval_loo_plots(
-            model=model, data=data, cfg=cfg,
-            epoch_losses=epoch_losses,
-            save_dir=save_dir or "plots/eval_loo", show=show,
-            decoder=beh_decoder,
-            skip_beh_all=skip_beh_all,
-        )
-        if eval_result is not None:
-            br2 = eval_result.get("beh_r2_model")
-            if br2 is not None:
-                epoch_losses[-1]["beh_r2_eval"] = br2
+            dropout_loss_val = None
+            if use_dropout_aux:
+                dropout_loss_val = compute_neuron_dropout_loss(
+                    model,
+                    z_target,
+                    sigma_u,
+                    dropout_frac=neuron_dropout_frac,
+                    gating_data=gating_data,
+                    stim_data=stim_data,
+                    cached_states=cached_states if warmstart_rollout else None,
+                    u_var=uvar,
+                    use_u_var_weighting=use_uvar,
+                    u_var_scale=uvar_scale,
+                    u_var_floor=uvar_floor,
+                )
 
-    return eval_result
+            dynamics_loss = rollout_loss_val if use_rollout_main and rollout_loss_val is not None else one_step_loss
+    
+            if epoch in (0, cfg.num_epochs - 1):
+                with torch.no_grad():
+                    posterior_check(prior_mu, z_target)
+    
+            loss = cfg.dynamics_scale * dynamics_loss
+            if use_rollout_aux and rollout_loss_val is not None:
+                loss = loss + cfg.dynamics_scale * rollout_weight * rollout_loss_val
+            if dropout_loss_val is not None:
+                loss = loss + cfg.dynamics_scale * dropout_loss_val
+            if ridge_b > 0 and model.d_ell > 0:
+                loss = loss + ridge_b * model.b.pow(2).mean()
+            if dynamics_l2 > 0:
+                dyn_l2_terms = [p.pow(2).mean() for p in model.parameters() if p.requires_grad]
+                if dyn_l2_terms:
+                    loss = loss + dynamics_l2 * torch.stack(dyn_l2_terms).mean()
+    
+            # Ridge on synaptic edge weights (shrinks toward prior)
+            if ridge_W_sv > 0 and model._W_sv_raw.requires_grad:
+                W_sv_active = model.W_sv[model.T_sv > 0]
+                if W_sv_active.numel() > 0:
+                    loss = loss + ridge_W_sv * W_sv_active.pow(2).mean()
+            if ridge_W_dcv > 0 and model._W_dcv_raw.requires_grad:
+                W_dcv_active = model.W_dcv[model.T_dcv > 0]
+                if W_dcv_active.numel() > 0:
+                    loss = loss + ridge_W_dcv * W_dcv_active.pow(2).mean()
+    
+            # Interaction L2: penalise network-driven component beyond AR(1)
+            if interaction_l2 > 0:
+                with torch.no_grad():
+                    lam = model.lambda_u.detach()
+                    I0_det = model.I0.detach()
+                    ar1_mu = (1.0 - lam) * z_target[:-1] + lam * I0_det
+                interaction = prior_mu[1:] - ar1_mu
+                loss = loss + interaction_l2 * interaction.pow(2).mean()
+    
+            beh_loss_val = None
+            if beh_decoder is not None and behavior_weight > 0.0:
+                beh_loss_val = compute_behaviour_loss(prior_mu, beh_decoder)
+                loss = loss + behavior_weight * beh_loss_val
+    
+            apply_training_step(
+                loss,
+                optimiser,
+                params,
+                model,
+                cfg,
+                grad_clip=grad_clip,
+            )
+    
+            rec = {"dynamics": dynamics_loss.item(), "total": loss.item()}
+            rec["one_step_loss"] = one_step_loss.item()
+            if rollout_loss_val is not None:
+                rec["rollout_loss"] = rollout_loss_val.item()
+            if dropout_loss_val is not None:
+                rec["dropout_loss"] = dropout_loss_val.item()
+            if beh_loss_val is not None:
+                rec["behaviour_loss"] = beh_loss_val.item()
+            rec.update(_snapshot_params(model))
+            epoch_losses.append(rec)
+    
+            parts = [f"dynamics={dynamics_loss.item():.4f}", f"total={loss.item():.4f}"]
+            if rollout_loss_val is not None:
+                parts.append(f"rollout={rollout_loss_val.item():.4f}")
+            if dropout_loss_val is not None:
+                parts.append(f"dropout={dropout_loss_val.item():.4f}")
+            if beh_loss_val is not None:
+                parts.append(f"beh_loss={beh_loss_val.item():.4f}")
+            print(f"[Stage2] Epoch {epoch + 1}/{cfg.num_epochs}: {'  '.join(parts)}")
+    
+            if save_dir and plot_every > 0 and (epoch + 1) % plot_every == 0:
+                try:
+                    epoch_dir = Path(save_dir) / f"epoch_{epoch + 1:04d}"
+                    ev = generate_eval_loo_plots(
+                        model=model, data=data, cfg=cfg,
+                        epoch_losses=epoch_losses, save_dir=str(epoch_dir), show=False,
+                        decoder=beh_decoder,
+                        beh_all_baseline=beh_all_baseline,
+                        include_ridge_diagnostics=False,
+                    )
+                    if ev is not None:
+                        br2 = ev.get("beh_r2_model")
+                        if br2 is not None:
+                            epoch_losses[-1]["beh_r2_eval"] = br2
+                    print(f"[Stage2] Plots saved to {epoch_dir}/")
+                except Exception as e:
+                    print(f"[Stage2][warn] plotting failed at epoch {epoch + 1}: {e}")
+    
+        # ---- save ----------------------------------------------------------------
+        params_final = snapshot_model_state(model)
+        results_h5 = None if save_dir is None else str(Path(save_dir) / "stage2_results.h5")
+        save_results_pt(cfg, z_target.detach(), params_final, output_path=results_h5)
+        if results_h5 is not None:
+            print(f"[Stage2] Training complete. Results saved to {results_h5}")
+        else:
+            print(f"[Stage2] Training complete. Results saved to {cfg.h5_path}")
+    
+        # ---- final evaluation ----------------------------------------------------
+        eval_result = None
+        if save_dir or show:
+            eval_result = generate_eval_loo_plots(
+                model=model, data=data, cfg=cfg,
+                epoch_losses=epoch_losses,
+                save_dir=save_dir or "plots/eval_loo", show=show,
+                decoder=beh_decoder,
+                beh_all_baseline=beh_all_baseline,
+            )
+            if eval_result is not None:
+                br2 = eval_result.get("beh_r2_model")
+                if br2 is not None:
+                    epoch_losses[-1]["beh_r2_eval"] = br2
+    
+            return eval_result
+    
+    finally:  # close log tee
+        if _tee is not None:
+            _tee.close()
