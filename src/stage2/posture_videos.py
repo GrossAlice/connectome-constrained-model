@@ -30,7 +30,7 @@ from matplotlib.collections import LineCollection
 from matplotlib.animation import FuncAnimation, FFMpegWriter
 from scipy.interpolate import interp1d
 
-from scripts.preprocess import normalize_body_angle_fixed_length
+from stage1.preprocess import normalize_body_angle_fixed_length
 
 __all__ = ["make_posture_compare_video"]
 
@@ -48,16 +48,34 @@ def angles_to_xy(angles: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     return x, y
 
 
-def _find_eigenvectors(h5_path: str) -> np.ndarray:
-    """Locate the global ``eigenvectors.npy`` alongside the H5 file."""
-    h5_dir = Path(h5_path).resolve().parent
-    for p in (h5_dir / "eigenvectors.npy",
-              h5_dir.parent / "eigenvectors.npy"):
+# Default Stephens eigenvectors path (relative to the file or project root).
+_STEPHENS_EIGVEC_NAME = "eigenvectors_stephens.npy"
+
+
+def _load_eigenvectors(eigvec_npy: Optional[str] = None,
+                       h5_path: Optional[str] = None) -> np.ndarray:
+    """Load Stephens eigenvectors from *eigvec_npy*.
+
+    Search order (first match wins):
+    1. Explicit *eigvec_npy* argument.
+    2. ``eigenvectors_stephens.npy`` in the same folder as the H5 file.
+    3. ``eigenvectors_stephens.npy`` in the parent / grandparent folders of the H5.
+    """
+    candidates: list[Path] = []
+    if eigvec_npy:
+        candidates.append(Path(eigvec_npy))
+    if h5_path:
+        h5_dir = Path(h5_path).resolve().parent
+        for d in (h5_dir, h5_dir.parent, h5_dir.parent.parent):
+            candidates.append(d / _STEPHENS_EIGVEC_NAME)
+            # Also check sibling ``stephens (2016)`` folder.
+            candidates.append(d / "stephens (2016)" / _STEPHENS_EIGVEC_NAME)
+    for p in candidates:
         if p.exists():
             return np.load(p)
     raise FileNotFoundError(
-        f"Cannot find eigenvectors.npy near {h5_path}. "
-        "Run build_shapes_and_reconstruct_video.py first."
+        f"Cannot find {_STEPHENS_EIGVEC_NAME}. "
+        "Run scripts/add_stephens_eigenworms.py first, or pass --eigvec_npy."
     )
 
 
@@ -307,10 +325,11 @@ def make_eigenworm_video(
     dpi: int = 120,
     show_original: bool = True,
     n_modes: int = 6,
+    eigvec_npy: Optional[str] = None,
 ) -> None:
     """Render worm posture video from eigenworm amplitudes."""
 
-    eigvecs_all = _find_eigenvectors(h5_path)
+    eigvecs_all = _load_eigenvectors(eigvec_npy=eigvec_npy, h5_path=h5_path)
     E = eigvecs_all[:, :n_modes]
     print(f"Loaded eigenvectors: {eigvecs_all.shape[1]} total, using {n_modes}")
 
@@ -323,8 +342,7 @@ def make_eigenworm_video(
                 break
         body_angle = f[ba_key][:]
 
-        for ew_key in ("behaviour/eigenworms_calc_6",
-                       "behaviour/eigenworms_calc_5",
+        for ew_key in ("behaviour/eigenworms_stephens",
                        "behavior/eigenworms"):
             if ew_key in f:
                 break
@@ -342,11 +360,12 @@ def make_eigenworm_video(
     E = E[:, :n_modes]
     eigenworms = eigenworms[:, :n_modes]
     dt = 1.0 / sr
+    n_seg_recon = E.shape[0]   # eigenvector dimension (e.g. 100 for Stephens basis)
 
     # ── reconstruct: amps @ E.T ──────────────────────────────────────
-    print(f"Reconstructing from {n_modes} eigenworms → ({n_seg},) body angles")
-    all_xy_recon = np.zeros((T, n_seg, 2))
-    all_curv_recon = np.zeros((T, n_seg))
+    print(f"Reconstructing from {n_modes} eigenworms → ({n_seg_recon},) body angles")
+    all_xy_recon = np.zeros((T, n_seg_recon, 2))
+    all_curv_recon = np.zeros((T, n_seg_recon))
     for t in range(T):
         recon = eigenworms[t] @ E.T
         x, y = angles_to_xy(recon)
@@ -356,13 +375,17 @@ def make_eigenworm_video(
         all_curv_recon[t, 0] = all_curv_recon[t, 1]
 
     # ── precompute original body angles ──────────────────────────────
+    # Resample raw angles to n_seg_recon so arc-length matches the reconstruction.
     all_xy_orig = []
     if show_original:
+        xp = np.linspace(0, 1, n_seg)
+        xq = np.linspace(0, 1, n_seg_recon)
         for t in range(T):
             row = body_angle[t]
-            shape = row - np.mean(row)
+            shape = row - np.nanmean(row)
             if np.all(np.isfinite(shape)):
-                x, y = angles_to_xy(shape)
+                shape_r = np.interp(xq, xp, shape)
+                x, y = angles_to_xy(shape_r)
                 all_xy_orig.append((x, y))
             else:
                 all_xy_orig.append((np.array([]), np.array([])))
@@ -469,6 +492,7 @@ def make_eigenworm_video(
                          blit=False)
     writer = FFMpegWriter(fps=fps, metadata={"title": "Worm eigenworm posture"},
                           bitrate=2000)
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     print(f"Rendering {T} frames at {fps} fps → {out_path} …")
     anim.save(out_path, writer=writer, dpi=dpi)
     print(f"Done. Video saved to {out_path}")
@@ -497,6 +521,7 @@ def make_posture_compare_video(
     fps: int = 15,
     dpi: int = 120,
     max_frames: int = 0,
+    eigvec_npy: Optional[str] = None,
 ) -> None:
     """Render side-by-side posture video.
 
@@ -521,7 +546,7 @@ def make_posture_compare_video(
             "and ew_model_cv (motor model) eigenworm predictions."
         )
 
-    eigvecs_all = _find_eigenvectors(h5_path)
+    eigvecs_all = _load_eigenvectors(eigvec_npy=eigvec_npy, h5_path=h5_path)
 
     with h5py.File(h5_path, "r") as f:
         for ba_key in ("behaviour/body_angle_dtarget",
@@ -532,8 +557,7 @@ def make_posture_compare_video(
         body_angle = np.asarray(f[ba_key][:], dtype=float)
 
         if ew_raw is None:
-            for ew_key in ("behaviour/eigenworms_calc_6",
-                           "behaviour/eigenworms_calc_5"):
+            for ew_key in ("behaviour/eigenworms_stephens",):
                 if ew_key in f:
                     break
             ew_raw = np.asarray(f[ew_key][:], dtype=float)
@@ -564,10 +588,12 @@ def make_posture_compare_video(
     ew_s1 = ew_stage1[:T, :n_modes]
     ew_mod = ew_model_cv[:T, :n_modes]
     d_seg = body_angle.shape[1]
+    d_recon = E.shape[0]  # eigenvector dimension (e.g. 100 for Stephens basis)
 
-    print(f"[posture_video] {n_modes} eigenworm modes, {d_seg} body segments, {T} frames")
+    print(f"[posture_video] {n_modes} eigenworm modes, {d_seg} body segments, "
+          f"{d_recon} recon segments, {T} frames")
 
-    recon_raw_ew = ew_raw_t @ E.T
+    recon_raw_ew = ew_raw_t @ E.T   # (T, d_recon)
     recon_s1 = ew_s1 @ E.T
     recon_mod = ew_mod @ E.T
 
@@ -585,10 +611,11 @@ def make_posture_compare_video(
                   ", ".join(f"m{i}={r:.3f}" for i, r in enumerate(r2_modes)))
 
     # ── convert to XY trajectories ───────────────────────────────────
+    # Raw body angles use d_seg; eigenworm reconstructions use d_recon.
     xy_raw = np.zeros((T, d_seg, 2), dtype=float)
-    xy_raw_ew = np.zeros((T, d_seg, 2), dtype=float)
-    xy_s1 = np.zeros((T, d_seg, 2), dtype=float)
-    xy_mod = np.zeros((T, d_seg, 2), dtype=float)
+    xy_raw_ew = np.zeros((T, d_recon, 2), dtype=float)
+    xy_s1 = np.zeros((T, d_recon, 2), dtype=float)
+    xy_mod = np.zeros((T, d_recon, 2), dtype=float)
 
     for t in range(T):
         shape = body_angle[t] - np.mean(body_angle[t])
@@ -706,7 +733,8 @@ def _cli_eigenworm(args):
     out = args.out or (Path(args.h5).stem + "_eigenworm.mp4")
     make_eigenworm_video(args.h5, out, fps=args.fps, dpi=args.dpi,
                          show_original=not args.no_original,
-                         n_modes=args.n_modes)
+                         n_modes=args.n_modes,
+                         eigvec_npy=getattr(args, "eigvec_npy", None))
 
 
 def main(argv=None):
@@ -737,6 +765,8 @@ def main(argv=None):
                       help="Number of eigenworm modes (default: 6)")
     p_ew.add_argument("--no_original", action="store_true",
                       help="Don't overlay the original body-angle trace")
+    p_ew.add_argument("--eigvec_npy", default=None,
+                      help="Path to eigenvectors_stephens.npy (auto-detected if omitted)")
     p_ew.set_defaults(func=_cli_eigenworm)
 
     args = parser.parse_args(argv)

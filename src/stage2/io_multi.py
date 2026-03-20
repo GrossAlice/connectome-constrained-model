@@ -1,16 +1,3 @@
-"""Multi-worm data loading for joint training with MAP trajectory inference.
-
-Handles two dataset types:
-  - Atanas (2023): freely-behaving worms with behaviour + neural activity.
-    Contains ``behaviour/eigenworms_calc_6`` and optionally ``stage1/u_mean``.
-  - Randi (2023): immobilised worms with optogenetic stimulation + neural
-    activity.  Contains ``optogenetics/stim_matrix`` and optionally
-    ``stage1/u_mean``.
-
-All worms are embedded into a common atlas coordinate system (up to 302
-neurons).  Neurons unobserved in a given worm will later receive MAP
-free-variable trajectories during training.
-"""
 from __future__ import annotations
 
 import re
@@ -40,9 +27,6 @@ _MASKS_DIR = _SRC_DIR / "data" / "used" / "masks+motor neurons"
 __all__ = ["load_multi_worm_data"]
 
 
-# ═══════════════════════════════════════════════════════════════════════
-#  1. Atlas construction
-# ═══════════════════════════════════════════════════════════════════════
 
 def _load_full_atlas() -> List[str]:
     """Load the canonical 302-neuron atlas from ``neuron_names.npy``."""
@@ -81,7 +65,6 @@ def _match_labels_to_atlas(
     return recovered, np.array(indices, dtype=np.int64)
 
 
-# ── Per-file metadata scan ─────────────────────────────────────────────
 
 def _detect_dataset_type(f: h5py.File) -> str:
     """Return ``'randi'`` if the file has optogenetics data, else ``'atanas'``."""
@@ -195,9 +178,6 @@ def _build_atlas(
     return atlas_idx, atlas_labels, coverage
 
 
-# ═══════════════════════════════════════════════════════════════════════
-#  2. Connectivity matrix loading (atlas-scale)
-# ═══════════════════════════════════════════════════════════════════════
 
 def _load_npy_matrix(ds_path: Optional[str]) -> Optional[np.ndarray]:
     """Load a .npy matrix, resolving the path against known directories."""
@@ -247,9 +227,6 @@ def _load_and_subset_sign(
     return torch.tensor(mat, dtype=torch.float32, device=device)
 
 
-# ═══════════════════════════════════════════════════════════════════════
-#  3. Per-worm data loading
-# ═══════════════════════════════════════════════════════════════════════
 
 def _atlas_embedding_indices(
     worm_atlas_idx: np.ndarray,
@@ -346,7 +323,6 @@ def _embed_vector_in_atlas(
     return out
 
 
-# ── Resampling ──────────────────────────────────────────────────────────
 
 def _resample_1d(x: np.ndarray, T_old: int, T_new: int) -> np.ndarray:
     """Linearly resample a (T_old, ...) array to (T_new, ...)."""
@@ -393,11 +369,10 @@ def _maybe_resample(
     return out, T_new
 
 
-# ── Behaviour loading (Atanas only) ────────────────────────────────────
 
 def _load_behaviour(f: h5py.File, T: int) -> Optional[np.ndarray]:
     """Load eigenworm amplitudes from an Atanas file."""
-    for ds in ("behaviour/eigenworms_calc_6", "behaviour/eigenworms_calc_5"):
+    for ds in ("behaviour/eigenworms_stephens",):
         if ds in f:
             b = _ensure_TN(np.array(f[ds], dtype=np.float64))
             if b.shape[0] == T:
@@ -407,7 +382,6 @@ def _load_behaviour(f: h5py.File, T: int) -> Optional[np.ndarray]:
     return None
 
 
-# ── Stimulus loading (Randi only) ──────────────────────────────────────
 
 def _load_optogenetic_stimulus(
     f: h5py.File,
@@ -431,7 +405,6 @@ def _load_optogenetic_stimulus(
     return None
 
 
-# ── Temporal validation split ──────────────────────────────────────────
 
 def _build_val_mask(T: int, val_frac: float) -> np.ndarray:
     """Create boolean mask: True = held out (last ``val_frac`` of time).
@@ -445,9 +418,6 @@ def _build_val_mask(T: int, val_frac: float) -> np.ndarray:
     return mask
 
 
-# ═══════════════════════════════════════════════════════════════════════
-#  4. Single-worm loader (orchestrates the above)
-# ═══════════════════════════════════════════════════════════════════════
 
 def _load_worm(
     info: Dict[str, Any],
@@ -474,7 +444,6 @@ def _load_worm(
     N_worm = len(embed_idx)
 
     with h5py.File(h5_path, "r") as f:
-        # ── Neural activity ──────────────────────────────────────
         if has_s1:
             u_raw, u_var_raw, sigma_u_raw, lambda_u_raw = _load_neural_data_stage1(
                 f, info,
@@ -509,20 +478,16 @@ def _load_worm(
                 lambda_u_raw = lambda_u_raw[:n_matched]
             N_file = n_matched
 
-        # ── Determine original dt ────────────────────────────────
         original_dt = common_dt  # fallback
         if info["sample_rate_hz"] is not None and info["sample_rate_hz"] > 0:
             original_dt = 1.0 / info["sample_rate_hz"]
 
-        # ── Behaviour (Atanas only) ──────────────────────────────
         behaviour = _load_behaviour(f, T_raw) if ds_type == "atanas" else None
 
-        # ── Stimulus (Randi only) ────────────────────────────────
         stim_raw = None
         if ds_type == "randi":
             stim_raw = _load_optogenetic_stimulus(f, T_raw, N_file)
 
-    # ── Resample to common dt ────────────────────────────────────
     resample_arrays = {"u": u_raw, "u_var": u_var_raw, "behaviour": behaviour,
                        "stim": stim_raw}
     resample_arrays, T = _maybe_resample(resample_arrays, original_dt, common_dt, T_raw)
@@ -531,7 +496,6 @@ def _load_worm(
     behaviour = resample_arrays["behaviour"]
     stim_raw = resample_arrays["stim"]
 
-    # ── Replace NaN with 0 in neural data ────────────────────────
     nan_mask = ~np.isfinite(u_raw)
     if nan_mask.any():
         n_nan = int(nan_mask.sum())
@@ -540,7 +504,6 @@ def _load_worm(
     if u_var_raw is not None:
         u_var_raw = np.nan_to_num(u_var_raw, nan=0.0)
 
-    # ── Embed into atlas coordinates ─────────────────────────────
     u_atlas = _embed_in_atlas(u_raw, embed_idx, keep_mask, T, N_atlas)
     u_var_atlas = (
         _embed_in_atlas(u_var_raw, embed_idx, keep_mask, T, N_atlas)
@@ -559,12 +522,15 @@ def _load_worm(
     )
 
     # lambda_u_init: observed from stage1 OLS, unobserved = population median
+    # Typical OLS-derived values are 0.02–0.15; 0.5 is far too fast and
+    # makes a poor initialisation when stage1 rho is absent.
+    _lam_fallback = 0.1
     if lambda_u_raw is not None:
         obs_median_lam = float(np.median(lambda_u_raw[np.isfinite(lambda_u_raw)]))
     else:
-        obs_median_lam = 0.5
+        obs_median_lam = _lam_fallback
     lambda_u_atlas = _embed_vector_in_atlas(
-        lambda_u_raw if lambda_u_raw is not None else np.full(N_file, 0.5),
+        lambda_u_raw if lambda_u_raw is not None else np.full(N_file, _lam_fallback),
         embed_idx, keep_mask, N_atlas, fill_value=obs_median_lam,
     )
 
@@ -583,7 +549,6 @@ def _load_worm(
     # val_mask (temporal hold-out)
     val_mask = _build_val_mask(T, val_frac)
 
-    # ── Convert to tensors ───────────────────────────────────────
     def _t(x, dtype=torch.float32):
         return torch.tensor(np.ascontiguousarray(x), dtype=dtype, device=device)
 
@@ -627,9 +592,6 @@ def _load_worm(
     return result
 
 
-# ═══════════════════════════════════════════════════════════════════════
-#  5. Worm weighting
-# ═══════════════════════════════════════════════════════════════════════
 
 def _assign_worm_weights(
     worms: List[Dict[str, Any]],
@@ -661,9 +623,6 @@ def _assign_worm_weights(
         w["weight"] = float(wt)
 
 
-# ═══════════════════════════════════════════════════════════════════════
-#  6. Main entry point
-# ═══════════════════════════════════════════════════════════════════════
 
 def load_multi_worm_data(cfg: Stage2PTConfig) -> Dict[str, Any]:
     """Load data from multiple worms and build a shared atlas.
@@ -695,7 +654,6 @@ def load_multi_worm_data(cfg: Stage2PTConfig) -> Dict[str, Any]:
             "to a tuple of H5 file paths."
         )
 
-    # ── Scan all files ───────────────────────────────────────────
     require_s1 = bool(cfg.require_stage1)
     file_infos: List[Dict[str, Any]] = []
     n_skipped_no_labels = 0
@@ -727,13 +685,11 @@ def load_multi_worm_data(cfg: Stage2PTConfig) -> Dict[str, Any]:
             f"{n_skipped_no_stage1} missing stage1)."
         )
 
-    # ── Build atlas ──────────────────────────────────────────────
     atlas_idx, atlas_labels, coverage = _build_atlas(
         file_infos, full_labels, min_count=int(cfg.atlas_min_worm_count),
     )
     N_atlas = len(atlas_idx)
 
-    # ── Load connectivity ────────────────────────────────────────
     T_e = _load_and_subset_matrix(cfg.T_e_dataset, atlas_idx, N_atlas, device)
     T_sv = _load_and_subset_matrix(cfg.T_sv_dataset, atlas_idx, N_atlas, device)
     T_sv = T_sv.abs()
@@ -744,7 +700,6 @@ def load_multi_worm_data(cfg: Stage2PTConfig) -> Dict[str, Any]:
         atlas_idx, N_atlas, device,
     )
 
-    # ── Load each worm ───────────────────────────────────────────
     common_dt = float(cfg.common_dt)
     val_frac = float(cfg.val_frac)
 
@@ -769,7 +724,6 @@ def load_multi_worm_data(cfg: Stage2PTConfig) -> Dict[str, Any]:
 
     _assign_worm_weights(worms, str(cfg.worm_weight_mode))
 
-    # ── Summary ──────────────────────────────────────────────────
     n_obs_list = [w["N_obs"] for w in worms]
     print(
         f"[MultiWorm] Loaded {len(worms)} worms "

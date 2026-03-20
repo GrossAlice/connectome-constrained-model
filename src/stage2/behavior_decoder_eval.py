@@ -12,6 +12,7 @@ __all__ = [
 	"build_lagged_features_np",
 	"build_lagged_features_torch",
 	"valid_lag_mask_np",
+	"MLPBehaviourDecoder",
 	"fit_linear_behaviour_decoder_for_training",
 	"init_behaviour_decoder",
 	"compute_behaviour_loss",
@@ -279,31 +280,46 @@ def fit_linear_behaviour_decoder_for_training(data: Dict[str, Any]) -> Optional[
 	}
 
 
-def init_behaviour_decoder(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-	"""Initialise a learnable linear decoder for the training behaviour loss.
+class MLPBehaviourDecoder(nn.Module):
+	"""Small MLP decoder: Linear → LayerNorm → ReLU → Dropout → Linear.
 
-	The decoder weight matrix ``W`` is warm-started from a GT ridge-CV fit
-	on the ground-truth neural traces, then set to ``requires_grad=True``
-	so it is fine-tuned jointly with the dynamics model.
+	The first linear layer can be warm-started from ridge-CV weights.
 	"""
-	# Fit a frozen ridge decoder on GT traces first
+
+	def __init__(self, in_dim: int, out_dim: int,
+				 hidden: int = 32, dropout: float = 0.1):
+		super().__init__()
+		self.net = nn.Sequential(
+			nn.Linear(in_dim, hidden),
+			nn.LayerNorm(hidden),
+			nn.ReLU(),
+			nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
+			nn.Linear(hidden, out_dim),
+		)
+
+	def forward(self, x: torch.Tensor) -> torch.Tensor:
+		return self.net(x)
+
+
+def init_behaviour_decoder(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+	"""Initialise a learnable behaviour decoder for the training loss.
+
+	Supports ``"linear"`` (warm-started from GT ridge-CV) and ``"mlp"``
+	(Linear→LayerNorm→ReLU→Dropout→Linear).  The decoder type is read from
+	``cfg.behavior_decoder_type`` (default ``"mlp"``).
+	"""
+	# Fit a frozen ridge decoder on GT traces first (used for both types)
 	gt_fit = fit_linear_behaviour_decoder_for_training(data)
 	if gt_fit is None:
 		return None
 
-	W = gt_fit["W"].clone().detach().requires_grad_(True)
-
-	n_features, n_modes = W.shape
+	cfg = data.get("_cfg")
+	decoder_type = str(getattr(cfg, "behavior_decoder_type", "mlp") or "mlp").strip().lower()
+	device = gt_fit["W"].device
+	n_features, n_modes = gt_fit["W"].shape
 	n_valid = int(gt_fit["valid"].sum().item())
-	print(
-		f"  [behaviour-decoder/init] learnable linear decoder (warm-started from GT ridge): "
-		f"{n_features} features \u2192 {n_modes} modes "
-		f"({n_valid} valid frames)"
-	)
 
-	return {
-		"type": "linear",
-		"W": W,
+	base = {
 		"motor_idx": gt_fit["motor_idx"],
 		"n_lags": gt_fit["n_lags"],
 		"valid": gt_fit["valid"],
@@ -315,6 +331,30 @@ def init_behaviour_decoder(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 		"cv_mse_curves": gt_fit["cv_mse_curves"],
 		"cv_models": gt_fit["cv_models"],
 	}
+
+	if decoder_type == "mlp":
+		hidden = int(getattr(cfg, "behavior_decoder_hidden", 32) or 32)
+		dropout = float(getattr(cfg, "behavior_decoder_dropout", 0.1) or 0.0)
+		model = MLPBehaviourDecoder(n_features, n_modes, hidden, dropout).to(device)
+		n_params = sum(p.numel() for p in model.parameters())
+		print(
+			f"  [behaviour-decoder/init] MLP decoder ({n_features}→{hidden}→{n_modes}, "
+			f"{n_params:,} params, {n_valid} valid frames)"
+		)
+		base["type"] = "mlp"
+		base["model"] = model
+		return base
+
+	# Linear: warm-start from ridge-CV
+	W = gt_fit["W"].clone().detach().requires_grad_(True)
+	print(
+		f"  [behaviour-decoder/init] learnable linear decoder (warm-started from GT ridge): "
+		f"{n_features} features \u2192 {n_modes} modes "
+		f"({n_valid} valid frames)"
+	)
+	base["type"] = "linear"
+	base["W"] = W
+	return base
 
 
 def compute_behaviour_loss(prior_mu: torch.Tensor, decoder: Dict[str, Any]) -> torch.Tensor:
@@ -331,9 +371,13 @@ def compute_behaviour_loss(prior_mu: torch.Tensor, decoder: Dict[str, Any]) -> t
 	u_motor = prior_mu[:, motor_idx]
 	X = build_lagged_features_torch(u_motor, n_lags)
 
-	W = decoder["W"]
-	X_aug = torch.cat([X, torch.ones(X.shape[0], 1, device=device)], dim=1)
-	b_pred = X_aug @ W
+	if decoder["type"] == "mlp":
+		X_aug = torch.cat([X, torch.ones(X.shape[0], 1, device=device)], dim=1)
+		b_pred = decoder["model"](X_aug)
+	else:
+		W = decoder["W"]
+		X_aug = torch.cat([X, torch.ones(X.shape[0], 1, device=device)], dim=1)
+		b_pred = X_aug @ W
 
 	b_pred_v = b_pred[valid]
 	b_true_v = b_actual[valid].to(device)
@@ -484,7 +528,6 @@ def _eval_decoder_common(
 			if mask.sum() > 2:
 				r2_gt_ho[j] = _r2(b_np[mask, j], b_gt_ho[mask, j])
 
-	# ── Transfer R²: apply *training* decoder weights to model outputs ──
 	r2_transfer = np.full(n_modes, np.nan)
 	b_pred_transfer = np.zeros_like(b_np)
 	for j in range(n_modes):
@@ -493,7 +536,6 @@ def _eval_decoder_common(
 		if valid.sum() > 2:
 			r2_transfer[j] = _r2(b_np[valid, j], b_pred_transfer[valid, j])
 
-	# ── Refit R²: fresh ridge-CV decoder on model outputs (upper bound) ──
 	n_folds = int(_cfg_val(cfg, "train_behavior_ridge_folds", 5, int))
 	log_lam_min = _cfg_val(cfg, "train_behavior_ridge_log_lambda_min", -3.0)
 	log_lam_max = _cfg_val(cfg, "train_behavior_ridge_log_lambda_max", 10.0)
@@ -516,8 +558,10 @@ def _eval_decoder_common(
 		"b_pred_transfer": b_pred_transfer,
 		"r2_transfer": r2_transfer,
 		"b_pred_model": model_fit["b_pred_full"],
-		"r2_model": model_fit["r2_full"],
-		"r2_gt": r2_gt,
+		"r2_model": model_fit["r2_ho"],
+		"r2_model_insample": model_fit["r2_full"],
+		"r2_gt": r2_gt_ho,
+		"r2_gt_insample": r2_gt,
 		"r2_ar1": r2_ar1,
 		"b_mask": bm_np,
 		"decoder_type": decoder_type,
@@ -542,12 +586,117 @@ def _eval_decoder_common(
 	return result
 
 
+@torch.no_grad()
+def _evaluate_mlp_decoder(
+	decoder: Dict[str, Any], data: Dict[str, Any], onestep: Dict[str, Any],
+	*, calibrate: bool = True,
+) -> Optional[Dict[str, Any]]:
+	"""Evaluate an MLP behaviour decoder on GT and model traces."""
+	beh = _extract_beh_data(data)
+	if beh is None:
+		return None
+	b_np, bm_np, u_np = beh
+	mu_np = onestep["prior_mu"]
+	n_modes = b_np.shape[1]
+	cfg = data.get("_cfg")
+	motor_idx = decoder["motor_idx"]
+	n_lags = decoder["n_lags"]
+	model = decoder["model"]
+	model.eval()
+	device = next(model.parameters()).device
+
+	valid_masks = [valid_lag_mask_np(b_np.shape[0], n_lags, bm_np[:, j] > 0.5) for j in range(n_modes)]
+
+	# MLP predictions on GT and model traces
+	X_gt = build_lagged_features_np(u_np[:, motor_idx], n_lags)
+	X_pred = build_lagged_features_np(mu_np[:, motor_idx], n_lags)
+
+	def _predict_mlp(X: np.ndarray) -> np.ndarray:
+		X_aug = np.concatenate([X, np.ones((X.shape[0], 1), dtype=X.dtype)], axis=1)
+		t = torch.tensor(X_aug, dtype=torch.float32, device=device)
+		return model(t).cpu().numpy()
+
+	b_pred_gt = _predict_mlp(X_gt)
+	b_pred_transfer = _predict_mlp(X_pred)
+
+	r2_gt = np.full(n_modes, np.nan)
+	r2_transfer = np.full(n_modes, np.nan)
+	for j in range(n_modes):
+		valid = valid_masks[j]
+		if valid.sum() > 2:
+			r2_gt[j] = _r2(b_np[valid, j], b_pred_gt[valid, j])
+			r2_transfer[j] = _r2(b_np[valid, j], b_pred_transfer[valid, j])
+
+	# Refit ridge-CV on model outputs (decoder-independent upper bound)
+	n_folds = int(_cfg_val(cfg, "train_behavior_ridge_folds", 5, int))
+	log_lam_min = _cfg_val(cfg, "train_behavior_ridge_log_lambda_min", -3.0)
+	log_lam_max = _cfg_val(cfg, "train_behavior_ridge_log_lambda_max", 10.0)
+	n_grid = int(_cfg_val(cfg, "train_behavior_ridge_n_grid", 50, int))
+	ridge_grid = _log_ridge_grid(log_lam_min, log_lam_max, n_grid)
+	bm_nopad = valid_lag_mask_np(bm_np.shape[0], n_lags, bm_np).astype(float)
+	model_fit = _fit_ridge_cv_decoder(X_pred, b_np, bm_nopad, ridge_grid, n_folds)
+	gt_fit = _fit_ridge_cv_decoder(X_gt, b_np, bm_nopad, ridge_grid, n_folds)
+
+	ar1_np = onestep.get("ar1_mu")
+	r2_ar1 = np.full(n_modes, np.nan)
+	if ar1_np is not None:
+		X_ar1 = build_lagged_features_np(ar1_np[:, motor_idx], n_lags)
+		ar1_fit = _fit_ridge_cv_decoder(X_ar1, b_np, bm_nopad, ridge_grid, n_folds)
+		r2_ar1 = ar1_fit["r2_ho"]
+
+	result: Dict[str, Any] = {
+		"b_actual": b_np,
+		"b_pred_gt": b_pred_gt,
+		"b_pred_transfer": b_pred_transfer,
+		"r2_transfer": r2_transfer,
+		"b_pred_model": model_fit["b_pred_full"],
+		"r2_model": model_fit["r2_ho"],
+		"r2_model_insample": model_fit["r2_full"],
+		"r2_gt": gt_fit["r2_ho"],
+		"r2_gt_insample": r2_gt,
+		"r2_ar1": r2_ar1,
+		"b_mask": bm_np,
+		"decoder_type": "mlp",
+		"b_pred_gt_heldout": gt_fit["b_pred_ho"],
+		"b_pred_model_heldout": model_fit["b_pred_ho"],
+		"r2_model_heldout": model_fit["r2_ho"],
+		"r2_gt_heldout": gt_fit["r2_ho"],
+		"ridge_cv_model": {
+			"ridge_grid": model_fit["ridge_grid"],
+			"best_lambdas": model_fit["best_lambdas"],
+			"cv_mse_curves": model_fit["cv_mse_curves"],
+			"coefs": model_fit["coefs"],
+			"intercepts": model_fit["intercepts"],
+			"at_zero": model_fit["at_zero"],
+			"at_upper": model_fit["at_upper"],
+		},
+	}
+
+	if calibrate:
+		_calibrate_predictions(b_np, bm_np, b_pred_gt, result["b_pred_model"])
+
+	n_show = min(n_modes, 6)
+	logger = get_stage2_logger()
+	logger.info(
+		"behaviour_eval_training",
+		r2_gt_ho=gt_fit["r2_ho"][:n_show].tolist(),
+		r2_ar1_ho=r2_ar1[:n_show].tolist(),
+		r2_model_ho=model_fit["r2_ho"][:n_show].tolist(),
+		decoder_type="mlp",
+	)
+	return result
+
+
 def evaluate_training_decoder(
 	decoder: Dict[str, Any], data: Dict[str, Any], onestep: Dict[str, Any],
 	*, calibrate: bool = True,
 ) -> Optional[Dict[str, Any]]:
 	if decoder is None or data.get("b") is None:
 		return None
+
+	if decoder["type"] == "mlp":
+		return _evaluate_mlp_decoder(decoder, data, onestep, calibrate=calibrate)
+
 	W_np = decoder["W"].detach().cpu().numpy()
 	dtype = "linear_learned" if decoder["W"].requires_grad else "linear_frozen"
 	result = _eval_decoder_common(
@@ -584,15 +733,11 @@ def evaluate_training_decoder(
 	logger = get_stage2_logger()
 	logger.info(
 		"behaviour_eval_training",
-		r2_gt_full=result["r2_gt"][:n_show].tolist(),
+		r2_gt_ho=result["r2_gt"][:n_show].tolist(),
 		r2_ar1_ho=result["r2_ar1"][:n_show].tolist(),
 		r2_transfer=result["r2_transfer"][:n_show].tolist(),
-		r2_model_refit=result["r2_model"][:n_show].tolist(),
+		r2_model_ho=result["r2_model"][:n_show].tolist(),
 	)
-	if np.any(np.isfinite(result.get("r2_gt_heldout", []))):
-		logger.info("behaviour_eval_training_ho", r2_gt_ho=result["r2_gt_heldout"][:n_show].tolist())
-	if np.any(np.isfinite(result.get("r2_model_heldout", []))):
-		logger.info("behaviour_eval_training_ho", r2_model_ho=result["r2_model_heldout"][:n_show].tolist())
 	return result
 
 

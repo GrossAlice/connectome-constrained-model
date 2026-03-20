@@ -23,99 +23,90 @@ class DataConfig:
     stage1_u_var_dataset: Optional[str] = "stage1/u_var"
     stage1_params_group: str = "stage1/params"
     silencing_dataset: Optional[str] = None
-    dt: Optional[float] = None
+    dt: Optional[float] = 0.6
     T_e_dataset: Optional[str] = str(_DATA_ROOT / "T_e.npy")
     T_sv_dataset: Optional[str] = str(_DATA_ROOT / "T_sv.npy")
     T_dcv_dataset: Optional[str] = str(_DATA_ROOT / "T_dcv.npy")
     neurotransmitter_sign_dataset: Optional[str] = str(_DATA_ROOT / "neurotransmitter_sign.npy")
 
+    behavior_dataset: Optional[str] = "behaviour/eigenworms_stephens"
+    motor_neurons: Optional[Tuple[str | int, ...]] = field(default_factory=_load_motor_neurons)
 
 @dataclass
 class DynamicsConfig:
-    dynamics_scale: float = 1.0
+    learn_lambda_u: bool = True     # init: OLS on AR(1) u(t+1)=(1−λ)u(t)+λI₀
+    learn_I0: bool = True           # init: OLS residual (ȳ−(1−λ)ẋ)/λ
 
-    # ── Leak / tonic drive ──────────────────────────────────────────
-    learn_lambda_u: bool = True
-    learn_I0: bool = True
+    edge_specific_G: bool = False   # False→scalar G; True→per-edge (N,N)
+    G_init_mode: str = "uniform"    # "uniform"|"log_counts"|"sqrt_counts" (edge-specific only)
 
-    # ── Gap junctions ──────────────────────────────────────────────
-    G_init: float = 0.1
-    G_max: Optional[float] = 2.0
-    edge_specific_G: bool = False
+    tau_sv_init: Tuple[float, ...] = (0.5, 0.85, 1.5, 2.5, 5.0)   # time constants (s); fixed when fix_tau_sv
+    a_sv_init: Tuple[float, ...] = (2.5, 1.8, 1.2, 0.8, 0.5)      # per-rank amplitudes; OLS-rescaled by init_network_scale
+    fix_tau_sv: bool = True         # False → tau_sv becomes trainable
+    learn_W_sv: bool = False        # init: 1.0 (uniform) or from synapse counts
+    W_sv_init_mode: str = "uniform" # "uniform"|"log_counts"|"sqrt_counts"
+    W_sv_normalize: bool = False    # row-normalise so (T_sv·W_sv).sum(1)=1
 
-    # ── SV synapses ────────────────────────────────────────────────
-    # a_sv: set to a_sv_init per rank, then scaled by init_network_scale
-    # tau_sv: fixed at tau_sv_init (log-spaced temporal basis)
-    # W_sv: per-edge weights, init to W_sv_init (softplus domain)
-    # E_sv: per-neuron reversal from NT sign × data quantiles
-    r_sv: int = 5
-    tau_sv_init: Tuple[float, ...] = (0.5, 0.85, 1.5, 2.5, 5.0)
-    a_sv_init: Tuple[float, ...] = (0.25, 0.18, 0.12, 0.08, 0.05)
-    a_sv_max: Optional[float] = 2.0
-    fix_tau_sv: bool = True
-    W_sv_init: float = 1.0
-    learn_W_sv: bool = False
-    E_sv_exc_init: float = 0.1
-    E_sv_inh_init: float = -0.1
-
-    # ── DCV synapses ───────────────────────────────────────────────
-    # a_dcv: set to a_dcv_init per rank, then scaled by init_network_scale
-    # tau_dcv: fixed at tau_dcv_init (slower temporal basis than SV)
-    # W_dcv: per-edge weights, init to W_dcv_init (softplus domain)
-    # E_dcv: set to median of I₀ baseline
-    r_dcv: int = 5
-    tau_dcv_init: Tuple[float, ...] = (2.0, 6.0, 10.0, 15.0, 20.0)
-    a_dcv_init: Tuple[float, ...] = (0.08, 0.06, 0.045, 0.03, 0.02)
-    a_dcv_max: Optional[float] = 2.0
+    tau_dcv_init: Tuple[float, ...] = (2.0, 6.0, 10.0, 15.0, 20.0) # slower basis than SV (s)
+    a_dcv_init: Tuple[float, ...] = (0.8, 0.6, 0.45, 0.3, 0.2)    # OLS-rescaled by init_network_scale
     fix_tau_dcv: bool = True
-    W_dcv_init: float = 1.0
-    learn_W_dcv: bool = False
-    E_dcv_init: float = 0.0
+    learn_W_dcv: bool = False       # init: 1.0, same as W_sv
 
-    # ── Reversal potentials ────────────────────────────────────────
-    # E_sv_exc/inh: data quantiles (q_hi / q_lo) per NT sign
-    # E_dcv: median of OLS-derived I₀ baseline
-    learn_reversals: bool = False
-    per_neuron_reversals: bool = False
-    edge_specific_reversals: bool = False
+    # init: E_sv sign from NT type, magnitudes = 1st/99th pctile of u; E_dcv = median(I₀)
+    learn_reversals: bool = False           # True → E_sv/E_dcv trainable
+    reversal_mode: str = "scalar"       # "scalar"|"per_neuron" (N,)|"per_edge" (N,N)
 
+    network_init_mode: str = "ols"  # "ols" (global) | "per_neuron_ridge" (per-neuron ridge, median β)
 
-    # ── Ridge-CV for per-neuron kernel amplitudes ──────────────────
-    alpha_per_neuron: bool = True
-    alpha_cv_every: int = 5
-    alpha_cv_n_folds: int = 5
-    alpha_cv_log_lambda_min: float = -6.0
-    alpha_cv_log_lambda_max: float = 6.0
-    alpha_cv_n_grid: int = 60
+    u_next_clip_min: Optional[float] = -10
+    u_next_clip_max: Optional[float] = 10
 
-    # ── Safety clamps ──────────────────────────────────────────────
-    u_next_clip_min: Optional[float] = -6
-    u_next_clip_max: Optional[float] = 6
-
-    # ── Physical bounds (reparameterization constraints) ───────────
-    lambda_u_lo: float = 0.0
-    lambda_u_hi: float = 0.9999
-    G_lo: float = 0.0
-    a_lo: float = 0.0
-    tau_lo: float = 1e-4
-    W_lo: float = 0.0
-
+@dataclass
+class BehaviorConfig:
+    behavior_lag_steps: int = 8
+    behavior_weight: float = 0.1
+    behavior_decoder_type: str = "linear"     # "linear" | "mlp"
+    behavior_decoder_hidden: int = 32
+    behavior_decoder_dropout: float = 0.1
 
 @dataclass
 class StimulusConfig:
     stim_dataset: Optional[str] = None
     stim_diagonal_only: bool = True
     ridge_b: float = 0.1
-    b_min:              Optional[float] = None
-    b_max:              Optional[float] = None
-
+    b_min: Optional[float] = None
+    b_max: Optional[float] = None
 
 @dataclass
-class BehaviorConfig:
-    behavior_dataset: Optional[str] = "behaviour/eigenworms_calc_6"
-    motor_neurons: Optional[Tuple[str | int, ...]] = field(default_factory=_load_motor_neurons)
-    behavior_lag_steps: int = 8
-    behavior_weight: float = 0.1
+class TrainConfig:
+    num_epochs: int = 100
+    learning_rate: float = 0.001
+    device: str = "cuda"
+    grad_clip_norm: float = 1.0
+    dynamics_l2:    float = 0.0
+    dynamics_objective: str = "one_step"
+
+    rollout_steps: int = 0
+    rollout_weight: float = 0.1
+    rollout_starts: int = 8
+    warmstart_rollout: bool = False
+
+    interaction_l2: float = 0.0
+    ridge_W_sv: float = 0.0
+    ridge_W_dcv: float = 0.0
+    synaptic_lr_multiplier: float = 10.0
+    sigma_u_default:     float = 1.0
+    use_u_var_weighting: bool  = False
+    u_var_scale:         float = 5.0
+    u_var_floor:         float = 1e-6
+
+    alpha_per_neuron: bool = True
+    alpha_cv_every: int = 0         # re-solve every N epochs (0=disabled)
+    alpha_cv_n_folds: int = 5
+    alpha_cv_log_min: float = -6.0  # log₁₀(λ) grid bounds
+    alpha_cv_log_max: float = 10.0
+    alpha_cv_n_grid: int = 80
+
     train_behavior_ridge_folds: int = 5
     train_behavior_ridge_log_lambda_min: float = -3.0
     train_behavior_ridge_log_lambda_max: float = 10.0
@@ -123,33 +114,9 @@ class BehaviorConfig:
 
 
 @dataclass
-class TrainConfig:
-    num_epochs: int = 40
-    learning_rate: float = 0.001
-    device: str = "cuda"
-    grad_clip_norm: float = 1.0
-    dynamics_l2:    float = 0.0
-    dynamics_objective: str = "one_step"
-
-    rollout_steps: int = 5
-    rollout_weight: float = 0.0
-    rollout_starts: int = 8
-    warmstart_rollout: bool = False
-
-    neuron_dropout_frac: float = 0.0
-    interaction_l2: float = 0.0
-    ridge_W_sv: float = 0.0
-    ridge_W_dcv: float = 0.0
-    sigma_u_default:     float = 1.0
-    use_u_var_weighting: bool  = False
-    u_var_scale:         float = 5.0
-    u_var_floor:         float = 1e-6
-
-
-@dataclass
 class EvalConfig:
-    eval_loo_subset_size: int = 5
-    eval_loo_subset_mode: str = "best_onestep"
+    eval_loo_subset_size: int = 50
+    eval_loo_subset_mode: str = "motor_best_onestep" # "motor_best_onestep"
     eval_loo_subset_seed: int = 0
     eval_loo_subset_neurons: Optional[Tuple[int, ...]] = None
 
@@ -168,45 +135,24 @@ class OutputConfig:
 
 @dataclass
 class MultiWormConfig:
-    # ── Mode switch ────────────────────────────────────────────────
+    # Shared params: G, W_sv, W_dcv, a, tau, E, behaviour decoder
+    # Per-worm params: lambda_u, I0, b (stimulus), u_unobs
     multi_worm: bool = False
-    h5_paths: Tuple[str, ...] = ()          # one H5 per worm; ignored when multi_worm=False
-
-    # ── Data alignment ─────────────────────────────────────────────
-    common_dt: float = 0.6                  # resample every worm to this dt (seconds)
-
-    # ── Loss weighting ─────────────────────────────────────────────
-    #   "equal"       — 1/W per worm  (recommended)
-    #   "by_observed" — weight ∝ N_w^obs / Σ N^obs
-    worm_weight_mode: str = "equal"
-
-    # ── Parameter sharing ──────────────────────────────────────────
-    #   Shared across worms:  G (or per-worm, see below), W_sv, W_dcv,
-    #                         a_sv, a_dcv, tau_sv, tau_dcv, E_sv, E_dcv,
-    #                         behaviour decoder
-    #   Per-worm:             lambda_u, I0, b (stimulus), u_unobs
-    per_worm_G: bool = False                # per-worm scalar G vs one shared scalar
-    G_consistency_weight: float = 0.01      # λ_gc Σ_w (G_w − Ḡ)²  (only when per_worm_G)
-
-    # ── MAP trajectory inference for unobserved neurons ────────────
-    #   Two-level alternating optimisation (EPFL-style):
-    #     Step 1 — fix θ,ψ, update u_U    (trajectory inference)
-    #     Step 2 — fix u_U, update θ,ψ    (model learning)
-    infer_unobserved: bool = True
-    u_unobs_lr: float = 0.01               # Adam LR for trajectory free-variables
-    u_unobs_inner_steps: int = 10           # gradient steps on u_U per outer epoch
-    u_unobs_smoothness: float = 0.01        # temporal smoothness prior weight
-    sigma_u_unobs_scale: float = 2.0        # inflate σ_u for unobserved neurons
-
-    # ── Atlas construction ─────────────────────────────────────────
-    atlas_min_worm_count: int = 0           # 0 = full 302 atlas; >0 = neuron must appear in ≥ K worms
-    require_stage1: bool = True             # True = skip files without stage1; False = z-score raw traces
-
-    # ── Temporal & cross-worm evaluation ───────────────────────────
-    val_frac: float = 0.2                   # fraction of time held out per worm
-    leave_worm_out_eval: bool = True        # train on W−1, eval on held-out worm
-
-
+    h5_paths: Tuple[str, ...] = ()
+    common_dt: float = 0.6
+    worm_weight_mode: str = "equal"             # "equal" (1/W) | "by_observed" (weight ∝ N_obs)
+    per_worm_G: bool = False                    # per-worm G scalar vs one shared
+    G_consistency_weight: float = 0.01          # λ_gc Σ(G_w−Ģ)²; only when per_worm_G
+    infer_unobserved: bool = True               # MAP inference for unobserved neuron trajectories
+    u_unobs_lr: float = 0.01                    # Adam LR for u_U free-variables
+    u_unobs_inner_steps: int = 10               # gradient steps on u_U per outer epoch
+    u_unobs_smoothness: float = 0.01            # temporal smoothness prior on u_U
+    sigma_u_unobs_scale: float = 2.0            # inflate σ_u for unobserved neurons
+    atlas_min_worm_count: int = 2               # 0=full 302; >0=neuron in ≥K worms
+    require_stage1: bool = True                 # skip files without stage1 (False=z-score raw)
+    val_frac: float = 0.2                       # temporal hold-out fraction per worm
+    leave_worm_out_eval: bool = True            # train on W−1, eval on held-out worm
+    loo_subset_size: int = 20                   # max neurons per worm for LOO eval
 @dataclass
 class Stage2PTConfig:
     data: DataConfig

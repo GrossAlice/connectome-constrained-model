@@ -255,7 +255,7 @@ def _resolve_dt(f: h5py.File, cfg: Stage2PTConfig) -> float:
             sr = float(container.attrs["sample_rate_hz"])
             if sr > 0:
                 return 1.0 / sr
-    return 1.0
+    return 0.6
 
 
 def _load_stimulus(
@@ -310,12 +310,12 @@ def _load_behaviour(
     result: Dict[str, Any] = {"b": None, "b_mask": None, "L_b": 0}
     behavior_ds = cfg.behavior_dataset
     if behavior_ds is None:
-        behavior_ds = "behaviour/eigenworms_calc_6"
+        behavior_ds = "behaviour/eigenworms_stephens"
 
     if behavior_ds not in f:
         raise KeyError(
             f"behaviour dataset '{behavior_ds}' not found. "
-            "Stage 2 now requires precomputed eigenworm amplitudes (e.g. /behaviour/eigenworms_calc_6)."
+            "Stage 2 now requires precomputed eigenworm amplitudes (e.g. /behaviour/eigenworms_stephens)."
         )
     b_np = _ensure_TN(np.array(f[behavior_ds], dtype=float))
     if b_np.shape[0] != T:

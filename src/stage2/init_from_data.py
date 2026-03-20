@@ -63,61 +63,106 @@ def init_reversals(model: "Stage2ModelPT", u: torch.Tensor, baseline: torch.Tens
         model.E_dcv.data.fill_(rest)
     print(f"[init] reversals: E_exc={e_exc:.4f}, E_inh={e_inh:.4f}, E_dcv={rest:.4f}")
 
-def init_network_scale(model: "Stage2ModelPT", u: torch.Tensor,
-                       min_network_frac: float = 0.25):
-    with torch.no_grad():
-        dev, lam = model.I0.device, model.lambda_u
-        u = u.to(dev)
-        T, N = u.shape
+def _collect_current_patterns(
+    model: "Stage2ModelPT", u: torch.Tensor,
+) -> tuple[torch.Tensor, list[torch.Tensor], list[str]]:
+    """Forward-simulate gap / sv / dcv currents at current parameter values.
 
-        resid = u[1:] - ((1 - lam) * u[:-1] + lam * model.I0)
+    Returns
+    -------
+    resid : (T-1, N)  AR(1) residual
+    patterns : list of (T-1, N) tensors, one per channel
+    names : list of channel names ("G", "a_sv", "a_dcv")
+    """
+    dev, lam = model.I0.device, model.lambda_u
+    u = u.to(dev)
+    T, N = u.shape
+
+    resid = u[1:] - ((1 - lam) * u[:-1] + lam * model.I0)
+
+    L = model.laplacian()
+    g = torch.ones(N, device=dev)
+    names = ["G"]
+    c_gap = torch.zeros(T - 1, N, device=dev)
+    s_sv  = torch.zeros(N, model.r_sv,  device=dev)
+    s_dcv = torch.zeros(N, model.r_dcv, device=dev)
+    c_sv_all  = torch.zeros(T - 1, N, device=dev) if model.r_sv  > 0 else None
+    c_dcv_all = torch.zeros(T - 1, N, device=dev) if model.r_dcv > 0 else None
+
+    for t in range(T - 1):
+        c_gap[t] = lam * (L @ u[t])
+        phi_g = model.phi(u[t]) * g
+        if model.r_sv > 0:
+            I, s_sv = model._synaptic_current(
+                u[t], phi_g, s_sv,
+                model.T_sv * model._get_W("W_sv"),
+                model.a_sv, model.tau_sv, model.E_sv)
+            c_sv_all[t] = lam * I
+        if model.r_dcv > 0:
+            I, s_dcv = model._synaptic_current(
+                u[t], phi_g, s_dcv,
+                model.T_dcv * model._get_W("W_dcv"),
+                model.a_dcv, model.tau_dcv, model.E_dcv)
+            c_dcv_all[t] = lam * I
+
+    patterns = [c_gap]
+    if model.r_sv  > 0: names.append("a_sv");  patterns.append(c_sv_all)
+    if model.r_dcv > 0: names.append("a_dcv"); patterns.append(c_dcv_all)
+    return resid, patterns, names
+
+
+def _apply_scales(
+    model: "Stage2ModelPT",
+    names: list[str],
+    betas: list[float],
+    rms_list: list[float],
+    rms_resid: float,
+    label: str,
+) -> None:
+    """Scale model parameters by *betas* and log diagnostics."""
+    total_rms = math.sqrt(sum(r ** 2 for r in rms_list))
+    print(f"[init] network_scale ({label}): AR1_rms={rms_resid:.4f}"
+          f"  net_rms={total_rms:.4f} ({total_rms / rms_resid:.0%})")
+    for i, name in enumerate(names):
+        b = betas[i]
+        cur = getattr(model, name)
+        if cur.numel() == 0:
+            continue
+        rms_after = rms_list[i]
+        frac = rms_after / rms_resid
+        if name == "G" and model.edge_specific_G:
+            from .model import _reparam_inv
+            model._G_raw.data.copy_(_reparam_inv(cur * b, model._G_lo, model._G_hi))
+        else:
+            model.set_param_constrained(name, cur * b)
+        print(f"[init]   {name}: \u03b2={b:.4f}, RMS={rms_after:.4f} ({frac:.0%} of AR1)")
+
+
+# ── Global-OLS init (original) ──────────────────────────────────────────
+
+def _init_network_scale_ols(
+    model: "Stage2ModelPT", u: torch.Tensor,
+    min_network_frac: float = 0.25,
+) -> None:
+    with torch.no_grad():
+        resid, patterns, names = _collect_current_patterns(model, u)
         rms_resid = resid.pow(2).mean().sqrt().item()
         if rms_resid < 1e-12:
             return
 
-        L = model.laplacian()
-        g = torch.ones(N, device=dev)
-        names = ["G"]
-        c_gap = torch.zeros(T - 1, N, device=dev)
-        s_sv  = torch.zeros(N, model.r_sv,  device=dev)
-        s_dcv = torch.zeros(N, model.r_dcv, device=dev)
-        c_sv_all  = torch.zeros(T - 1, N, device=dev) if model.r_sv  > 0 else None
-        c_dcv_all = torch.zeros(T - 1, N, device=dev) if model.r_dcv > 0 else None
-
-        for t in range(T - 1):
-            c_gap[t] = lam * (L @ u[t])
-            phi_g = model.phi(u[t]) * g
-            if model.r_sv > 0:
-                I, s_sv = model._synaptic_current(
-                    u[t], phi_g, s_sv,
-                    model.T_sv * model._get_W("W_sv"),
-                    model.a_sv, model.tau_sv, model.E_sv)
-                c_sv_all[t] = lam * I
-            if model.r_dcv > 0:
-                I, s_dcv = model._synaptic_current(
-                    u[t], phi_g, s_dcv,
-                    model.T_dcv * model._get_W("W_dcv"),
-                    model.a_dcv, model.tau_dcv, model.E_dcv)
-                c_dcv_all[t] = lam * I
-
-        patterns = [c_gap]
-        if model.r_sv  > 0: names.append("a_sv");  patterns.append(c_sv_all)
-        if model.r_dcv > 0: names.append("a_dcv"); patterns.append(c_dcv_all)
-
+        dev = model.I0.device
+        K = len(patterns)
         r_flat = resid.reshape(-1)
         C = torch.stack([p.reshape(-1) for p in patterns], dim=1)
-        K = C.shape[1]
         CTC = C.T @ C + 1e-8 * torch.eye(K, device=dev)
         CTr = C.T @ r_flat
         beta = torch.linalg.solve(CTC, CTr).clamp(min=0)
 
-        # Per-channel RMS after OLS scaling
         betas = [max(beta[i].item(), 1e-6) for i in range(K)]
         rms_list = [patterns[i].pow(2).mean().sqrt().item() * betas[i]
                     for i in range(K)]
         total_rms = math.sqrt(sum(r ** 2 for r in rms_list))
 
-        # If network contribution is too small, boost uniformly
         target_rms = min_network_frac * rms_resid
         if total_rms < target_rms and total_rms > 1e-12:
             base_boost = target_rms / total_rms
@@ -127,8 +172,8 @@ def init_network_scale(model: "Stage2ModelPT", u: torch.Tensor,
         scales = [base_boost for _ in range(K)]
         channel_floor_frac = {
             "G": 0.10,
-            "a_sv": 0.06,
-            "a_dcv": 0.03,
+            "a_sv": 0.20,
+            "a_dcv": 0.10,
         }
         for i, name in enumerate(names):
             floor_frac = channel_floor_frac.get(name, 0.0)
@@ -139,27 +184,91 @@ def init_network_scale(model: "Stage2ModelPT", u: torch.Tensor,
             if rms_after_base < target_channel_rms and rms_list[i] > 1e-12:
                 scales[i] = max(scales[i], target_channel_rms / rms_list[i])
 
-        final_rms_list = [rms_list[i] * scales[i] for i in range(K)]
-        final_total_rms = math.sqrt(sum(r ** 2 for r in final_rms_list))
+        final_betas = [betas[i] * scales[i] for i in range(K)]
+        final_rms   = [rms_list[i] * scales[i] for i in range(K)]
 
-        print(f"[init] network_scale (OLS): AR1_rms={rms_resid:.4f}"
-              f"  net_rms={final_total_rms:.4f} ({final_total_rms / rms_resid:.0%})"
-              f"  boost={base_boost:.2f}")
+        print(f"  boost={base_boost:.2f}")
+        _apply_scales(model, names, final_betas, final_rms, rms_resid, "OLS")
+
+
+# ── Per-neuron ridge init ───────────────────────────────────────────────
+
+def _init_network_scale_per_neuron_ridge(
+    model: "Stage2ModelPT", u: torch.Tensor,
+    ridge_alpha: float = 1.0,
+    min_beta: float = 1e-6,
+) -> None:
+    """Initialise G / a_sv / a_dcv via per-neuron ridge regression.
+
+    For each neuron *n* independently, solve the ridge problem::
+
+        r_{t,n} ≈ β_{G,n} · c_gap_{t,n} + β_{sv,n} · c_sv_{t,n}
+                   + β_{dcv,n} · c_dcv_{t,n}
+
+    then take the **median** across neurons for each channel's global
+    scale factor.  This is more robust than the pooled OLS because it
+    avoids cancellation across neurons and doesn't need hard-coded
+    floor fractions.
+    """
+    with torch.no_grad():
+        resid, patterns, names = _collect_current_patterns(model, u)
+        rms_resid = resid.pow(2).mean().sqrt().item()
+        if rms_resid < 1e-12:
+            return
+
+        dev = model.I0.device
+        K = len(patterns)
+        T_1, N = resid.shape
+
+        # (T-1, N, K) feature tensor
+        X = torch.stack(patterns, dim=2)          # (T-1, N, K)
+        # Per-neuron ridge: β_n = (X_n'X_n + αI)^{-1} X_n' r_n
+        # Batch over neurons using (N, K, T) x (N, T, 1) → (N, K, 1)
+        X_t = X.permute(1, 2, 0)                  # (N, K, T-1)
+        r_t = resid.permute(1, 0).unsqueeze(2)    # (N, T-1, 1)
+        XtX = torch.bmm(X_t, X_t.permute(0, 2, 1))  # (N, K, K)
+        reg = ridge_alpha * torch.eye(K, device=dev).unsqueeze(0).expand(N, -1, -1)
+        Xtr = torch.bmm(X_t, r_t)                    # (N, K, 1)
+        beta_all = torch.linalg.solve(XtX + reg, Xtr).squeeze(2)  # (N, K)
+        # Clamp to non-negative (physical: these are conductances/amplitudes)
+        beta_all = beta_all.clamp(min=0)
+
+        # Robust summary: median across neurons
+        beta_median = beta_all.median(dim=0).values   # (K,)
+        beta_mean   = beta_all.mean(dim=0)             # (K,)
+        beta_q25    = beta_all.quantile(0.25, dim=0)
+        beta_q75    = beta_all.quantile(0.75, dim=0)
+
+        betas = [max(beta_median[i].item(), min_beta) for i in range(K)]
+        raw_rms = [patterns[i].pow(2).mean().sqrt().item() for i in range(K)]
+        rms_list = [raw_rms[i] * betas[i] for i in range(K)]
+
+        # Log per-neuron distribution
+        print(f"[init] network_scale (per_neuron_ridge, α={ridge_alpha:.1g}):")
         for i, name in enumerate(names):
-            b = betas[i] * scales[i]
-            cur = getattr(model, name)
-            if cur.numel() == 0:
-                continue
-            rms_after = final_rms_list[i]
-            frac = rms_after / rms_resid
-            if name == "G" and model.edge_specific_G:
-                from .model import _reparam_inv
-                model._G_raw.data.copy_(_reparam_inv(cur * b, model._G_lo, model._G_hi))
-            else:
-                model.set_param_constrained(name, cur * b)
-            print(f"[init]   {name}: \u03b2={b:.4f}, RMS={rms_after:.4f} ({frac:.0%} of AR1)")
+            print(f"[init]   {name} β distribution: "
+                  f"median={beta_median[i]:.4f}  mean={beta_mean[i]:.4f}  "
+                  f"IQR=[{beta_q25[i]:.4f}, {beta_q75[i]:.4f}]")
+
+        _apply_scales(model, names, betas, rms_list, rms_resid,
+                      "per_neuron_ridge")
+
+
+# ── Dispatch ────────────────────────────────────────────────────────────
+
+def init_network_scale(model: "Stage2ModelPT", u: torch.Tensor,
+                       cfg=None) -> None:
+    mode = str(getattr(cfg, "network_init_mode", "ols") or "ols").lower()
+    if mode == "per_neuron_ridge":
+        _init_network_scale_per_neuron_ridge(model, u)
+    elif mode == "ols":
+        _init_network_scale_ols(model, u)
+    else:
+        raise ValueError(f"Unknown network_init_mode={mode!r}; "
+                         f"expected 'ols' or 'per_neuron_ridge'")
+
 
 def init_all_from_data(model: "Stage2ModelPT", u: torch.Tensor, cfg=None):
     baseline = init_I0(model, u)
     init_reversals(model, u, baseline, cfg)
-    init_network_scale(model, u)
+    init_network_scale(model, u, cfg)

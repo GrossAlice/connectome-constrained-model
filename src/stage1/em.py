@@ -58,11 +58,7 @@ def kalman_smoother_pairwise(
     init_cov: np.ndarray,
     var_floor: float = 0.0,
 ) -> Tuple[float, np.ndarray, np.ndarray, np.ndarray]:
-    """Kalman filter + RTS smoother.
 
-    Returns (ll, sm_m[T,n], sm_P[T,n,n], pair_P[T,n,n]).
-    pair_P holds Cov[x_t, x_{t-1} | Y] for t=1..T-1.
-    """
     y = np.asarray(y, dtype=np.float64)
     T = y.shape[0]
     A = np.asarray(A, dtype=np.float64)

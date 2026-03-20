@@ -6,11 +6,19 @@ import h5py
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
 
+import matplotlib.colors as mcolors
+
 from .model import Stage2ModelPT
 from .evaluate import _pearson, _r2, run_full_evaluation
+from .worm_state import WormState
 from . import get_stage2_logger
 
-__all__ = ["generate_eval_loo_plots", "run_full_evaluation"]
+__all__ = [
+    "generate_eval_loo_plots",
+    "run_full_evaluation",
+    "generate_multi_worm_plots",
+    "plot_r2_three_metrics",
+]
 
 _COL_DATA = "#2166ac"
 _COL_RAW  = "#d62728"
@@ -103,13 +111,6 @@ def _compute_input_decomposition(
     model: Stage2ModelPT,
     data: Dict[str, Any],
 ) -> Tuple[Dict[str, float], np.ndarray]:
-    """Compute RMS of each dynamical term in the update equation.
-
-    Returns
-    -------
-    summary : dict  label → global RMS
-    per_neuron : ndarray (N, 4)  per-neuron RMS of [target_resid, gap, sv, dcv]
-    """
     device = next(model.parameters()).device
     u = data["u_stage1"].to(device)
     T, N = u.shape
@@ -190,7 +191,6 @@ def _compute_input_decomposition(
 
 
 def _residual_acf(residuals: np.ndarray, max_lag: int = 20) -> np.ndarray:
-    """Mean autocorrelation of one-step residuals across neurons."""
     T, N = residuals.shape
     acf = np.zeros(max_lag)
     for lag in range(1, max_lag + 1):
@@ -324,13 +324,6 @@ def plot_summary_slide(
     epoch_losses: Optional[list] = None,
     beh_all: Optional[Dict[str, Any]] = None,
 ):
-    """Comprehensive evaluation dashboard (plot 00).
-
-    3×4 grid — every panel is the same size.
-    Row 0: Training convergence | One-step R² | LOO R² | Free-run R²
-    Row 1: Behaviour decoding  | Multistep rollout | α_sv / α_dcv dist.     | Synaptic kernels
-    Row 2: Input decomposition | R²: one-step vs LOO | Residual autocorr.   | λ_u vs one-step R²
-    """
     import matplotlib.pyplot as plt
     from matplotlib.gridspec import GridSpec
 
@@ -341,7 +334,7 @@ def plot_summary_slide(
     u_np = data["u_stage1"].cpu().numpy()
     T, N = u_np.shape
 
-    fig = plt.figure(figsize=(24, 16))
+    fig = plt.figure(figsize=(24, 14))
     gs = GridSpec(3, 4, hspace=0.42, wspace=0.38)
 
     ax = fig.add_subplot(gs[0, 0])
@@ -377,29 +370,22 @@ def plot_summary_slide(
                                max(valid.max(), 1.0), 30)
             ax.hist(valid, bins=bins, color=color, **_hist_kw)
             ax.axvline(np.median(valid), color=_COL_RAW, lw=2, ls="--",
-                       label=f"med={np.median(valid):.3f}")
+                       label=f"{np.median(valid):.3f}")
             ax.legend(frameon=False, fontsize=11)
         _style(ax, xlabel=label, ylabel="Count", title=title)
 
     ax = fig.add_subplot(gs[1, 0])
     if beh_results is not None:
-        # All R² values are held-out / cross-validated via the frozen
-        # ridge-CV decoder path for fair comparison.
+        # All R² values are held-out / cross-validated (out-of-fold).
 
         # Red = ridge decoder on GT motor neurons (held-out CV)
-        r2_motor = beh_results.get("r2_gt_heldout")
-        if r2_motor is None or not np.any(np.isfinite(r2_motor)):
-            r2_motor = beh_results.get("r2_gt", np.full(6, np.nan))
+        r2_motor = beh_results.get("r2_gt", np.full(6, np.nan))
 
         # Orange = AR(1) baseline on motor neurons (held-out CV)
         r2_ar1 = beh_results.get("r2_ar1", np.full(6, np.nan))
 
         # Green = ridge decoder on model-predicted motor neurons (held-out CV)
-        r2_model = beh_results.get("r2_model_heldout")
-        if r2_model is None or not np.any(np.isfinite(r2_model)):
-            r2_model = beh_results.get("r2_model")
-        if r2_model is None:
-            r2_model = np.full_like(r2_motor, np.nan)
+        r2_model = beh_results.get("r2_model", np.full(6, np.nan))
 
         n_modes = min(len(r2_model), len(r2_motor), 5)
         x = np.arange(n_modes)
@@ -513,7 +499,7 @@ def plot_summary_slide(
             box_data.append(col if col.size > 0 else np.array([0.0]))
             tau_r = float(tau_arr[ri]) if ri < len(tau_arr) else 0
             med = float(np.median(col)) if col.size > 0 else 0
-            tick_labels.append(f"R{ri+1}\nτ={tau_r:.1f}s\nmed={med:.2e}")
+            tick_labels.append(f"τ={tau_r:.1f}s\n{med:.2e}")
         for ri, col in enumerate(box_data, start=1):
             if col.size == 0:
                 continue
@@ -529,7 +515,6 @@ def plot_summary_slide(
             )
             q25, med, q75 = np.percentile(col, [25, 50, 75])
             ax.vlines(ri, q25, q75, color="0.15", lw=4.0, zorder=3)
-            ax.hlines(med, ri - 0.22, ri + 0.22, color="0.05", lw=2.2, zorder=4)
 
         finite_positive = np.concatenate([col[col > 0] for col in box_data if np.any(col > 0)]) if box_data else np.array([])
         if finite_positive.size > 0:
@@ -545,10 +530,9 @@ def plot_summary_slide(
         ax.set_xticks(range(1, r + 1))
         ax.set_xticklabels(tick_labels, fontsize=9)
         ax.tick_params(axis="y", labelsize=10)
-        panel_letter = "G" if panel_i == 0 else "H"
         ylabel = "α (log)" if finite_positive.size > 0 and np.max(finite_positive) > np.min(finite_positive) else "α"
-        _style(ax, xlabel="", ylabel=ylabel,
-               title=f"{panel_letter}. {syn_label} Kernel Amplitudes")
+        title_str = "G. Kernel Amplitudes" if panel_i == 0 else ""
+        _style(ax, xlabel="", ylabel=f"{syn_label}  {ylabel}", title=title_str)
 
     with torch.no_grad():
         lam = model.lambda_u.cpu().numpy().ravel()
@@ -654,8 +638,8 @@ def plot_summary_slide(
     n_loo = int(np.isfinite(r2_loo).sum())
     n_ep = len(epoch_losses)
     fr_med = np.nanmedian(r2_fr[np.isfinite(r2_fr)]) if np.any(np.isfinite(r2_fr)) else float("nan")
-    alpha_sv_txt = f"  α_sv med={a_sv_med:.3g}" if np.isfinite(a_sv_med) else ""
-    alpha_dcv_txt = f"  α_dcv med={a_dcv_med:.3g}" if np.isfinite(a_dcv_med) else ""
+    alpha_sv_txt = f"  α_sv={a_sv_med:.3g}" if np.isfinite(a_sv_med) else ""
+    alpha_dcv_txt = f"  α_dcv={a_dcv_med:.3g}" if np.isfinite(a_dcv_med) else ""
     info = (f"N={N}  T={T}  dt={dt:.3f}s  G={G_txt}  "
             f"LOO={n_loo}  epochs={n_ep}  "
             f"free-run med R\u00b2={fr_med:.3f}{alpha_sv_txt}{alpha_dcv_txt}")
@@ -677,9 +661,6 @@ def plot_parameter_trajectories(
     save_dir: str,
     cfg=None,
 ):
-    """Dedicated multi-panel figure showing how every tracked parameter
-    evolves across training epochs.  Saved as ``param_trajectories.png``.
-    """
     import matplotlib.pyplot as plt
     from matplotlib.gridspec import GridSpec
 
@@ -828,14 +809,6 @@ def plot_prediction_traces(
     preds_loo = loo["pred"]
     r2_fr = free_run["r2"]
     u_free = free_run["u_free"]
-    motor_idx = np.asarray(free_run.get("motor_idx", []), dtype=int)
-    free_run_mode = str(free_run.get("mode", "autonomous"))
-    motor_free_spectrum = None
-    if free_run_mode == "motor_conditioned" and motor_idx.size > 0:
-        motor_free_mean = np.nanmean(u_free[:, motor_idx], axis=1)
-        mf_freqs, mf_power = _compute_power_spectrum(motor_free_mean, dt)
-        if mf_freqs is not None and mf_power is not None and len(mf_freqs) > 1:
-            motor_free_spectrum = (mf_freqs[1:], np.maximum(mf_power[1:], 1e-12))
 
     pick = sorted(preds_loo.keys())
     if len(pick) == 0:
@@ -850,17 +823,6 @@ def plot_prediction_traces(
         _plot_partner_panel(ax_net, data, labels, idx)
 
         ax = fig.add_subplot(gs[row, 1])
-        if free_run_mode == "motor_conditioned" and motor_idx.size > 0:
-            for mi, midx in enumerate(motor_idx):
-                ax.plot(
-                    time,
-                    u_free[:, midx],
-                    color=_COL_FR,
-                    lw=0.8,
-                    alpha=0.12,
-                    zorder=1,
-                    label="Motor free-run" if row == 0 and mi == 0 else None,
-                )
         ax.plot(time, u_np[:, idx], color=_COL_DATA,
                 lw=2.0, alpha=0.45, label="Data", zorder=2)
         ax.plot(time, mu_os[:, idx], color=_COL_RAW,
@@ -870,17 +832,13 @@ def plot_prediction_traces(
             ax.plot(time, preds_loo[idx], color=_COL_CV,
                     lw=2.2, ls="--", alpha=0.9,
                     label=f"LOO (R\u00b2={r2_loo[idx]:.3f})", zorder=4)
-        show_free_run = np.isfinite(r2_fr[idx]) and (
-            free_run_mode != "motor_conditioned" or np.any(motor_idx == idx)
-        )
-        if show_free_run:
+        if np.isfinite(r2_fr[idx]):
             ax.plot(time, u_free[:, idx], color=_COL_FR,
                     lw=1.8, ls="-.", alpha=0.85,
                     label=f"Free-run (R\u00b2={r2_fr[idx]:.3f})", zorder=5)
         lbl = _label_for_idx(labels, idx)
         _style(ax, ylabel=lbl)
-        if row == 0:
-            ax.legend(loc="upper right", frameon=False, fontsize=15, ncol=2)
+        ax.legend(loc="upper right", frameon=False, fontsize=13, ncol=2)
         if row < len(pick) - 1:
             ax.set_xticklabels([])
         ax_ps = fig.add_subplot(gs[row, 2])
@@ -893,17 +851,6 @@ def plot_prediction_traces(
         if np.isfinite(r2_fr[idx]):
             spectra.append((u_free[:, idx], _COL_FR, "Free-run"))
         any_ps = False
-        if motor_free_spectrum is not None:
-            ax_ps.loglog(
-                motor_free_spectrum[0],
-                motor_free_spectrum[1],
-                color=_COL_FR,
-                lw=1.0,
-                alpha=0.22,
-                ls=":",
-                label="Motor free-run PSD" if row == 0 else None,
-            )
-            any_ps = True
         for series, color, label in spectra:
             freqs, power = _compute_power_spectrum(series, dt)
             if freqs is None or power is None or len(freqs) <= 1:
@@ -928,129 +875,6 @@ def plot_prediction_traces(
                  fontsize=24, fontweight="bold", y=1.01)
     _save_png(fig, save_dir, "02_prediction_traces.png", bbox_inches="tight")
     plt.close(fig)
-def plot_free_run_statistics(
-    data: Dict[str, Any],
-    free_run: Dict[str, Any],
-    save_dir: str,
-):
-    import matplotlib.pyplot as plt
-    from matplotlib.gridspec import GridSpec
-
-    u_np = data["u_stage1"].cpu().numpy()
-    u_free = free_run["u_free"]
-    r2 = free_run["r2"]
-    mode = str(free_run.get("mode", "autonomous"))
-    T, N = u_np.shape
-    dt = data["dt"]
-    time = np.arange(T) * dt
-    labels = _get_labels(data)
-
-    finite_mask = np.isfinite(r2)
-    if not np.any(finite_mask):
-        return
-    r2_finite = r2[finite_mask]
-    idx_finite = np.where(finite_mask)[0]
-    order = np.argsort(r2_finite)[::-1]
-
-    idx_best = idx_finite[order[0]]
-    idx_median = idx_finite[order[len(order) // 2]]
-    idx_worst = idx_finite[order[-1]]
-    picks = [("Best", idx_best), ("Median", idx_median), ("Worst", idx_worst)]
-
-    fig = plt.figure(figsize=(20, 16))
-    gs = GridSpec(3, 2, hspace=0.38, wspace=0.30)
-
-    ax_traces = fig.add_subplot(gs[0, :])
-    trace_cols = (_COL_RAW, _COL_CV, _COL_DATA)
-    for i, (tag, idx) in enumerate(picks):
-        lbl = labels[idx] if labels is not None else f"Neuron {idx}"
-        offset = i * 6
-        ax_traces.plot(time, u_np[:, idx] + offset,
-                       color=_COL_DATA, lw=0.8, alpha=0.7)
-        ax_traces.plot(time, u_free[:, idx] + offset,
-                       color=trace_cols[i], ls="-", lw=0.8, alpha=0.8,
-                       label=f"{tag}: {lbl} (R\u00b2={r2[idx]:.3f})")
-    ax_traces.legend(loc="upper right", frameon=False, fontsize=15, ncol=1)
-    trace_title = ("A  Motor-neuron traces conditioned on the rest"
-                   if mode == "motor_conditioned"
-                   else "A  Free-run example traces")
-    _style(ax_traces, xlabel="Time (s)", ylabel="Activity (offset)",
-           title=trace_title)
-
-    ax_hist = fig.add_subplot(gs[1, 0])
-    bins = np.linspace(min(-1, np.nanmin(r2_finite)),
-                       max(1, np.nanmax(r2_finite)), 40)
-    ax_hist.hist(r2_finite, bins=bins, color=_COL_CV, alpha=0.7,
-                 edgecolor="white", label=f"median = {np.nanmedian(r2_finite):.3f}")
-    ax_hist.axvline(np.nanmedian(r2_finite), color=_COL_RAW, lw=2.5, ls="--")
-    ax_hist.axvline(0, color="gray", lw=1, ls=":")
-    ax_hist.legend(frameon=False, fontsize=13)
-    _style(ax_hist, xlabel="R\u00b2", ylabel="Count",
-           title="B  R\u00b2 distribution")
-
-    ax_rmse = fig.add_subplot(gs[1, 1])
-    err2 = (u_np - u_free) ** 2
-    rmse_t = np.sqrt(np.nanmean(err2, axis=1))
-    win = min(100, T // 10)
-    corr_t = np.full(T, np.nan)
-    for t in range(win, T):
-        seg_true = u_np[t - win:t].ravel()
-        seg_free = u_free[t - win:t].ravel()
-        m = np.isfinite(seg_true) & np.isfinite(seg_free)
-        if m.sum() > 10:
-            corr_t[t] = _pearson(seg_true[m], seg_free[m])
-    ax_rmse_twin = ax_rmse.twinx()
-    ax_rmse.plot(time, rmse_t, color=_COL_RAW, ls="-", lw=1.5, alpha=0.8,
-                 label="RMSE")
-    ax_rmse_twin.plot(time[win:], corr_t[win:], color=_COL_DATA, ls="-",
-                      lw=1.2, alpha=0.6, label="Windowed corr.")
-    ax_rmse.set_xlabel("")
-    _style(ax_rmse, xlabel="Time (s)", ylabel="RMSE",
-           title="C  Error accumulation over time")
-    ax_rmse_twin.set_ylabel("Correlation", fontsize=16)
-    ax_rmse_twin.tick_params(labelsize=13)
-    h1, l1 = ax_rmse.get_legend_handles_labels()
-    h2, l2 = ax_rmse_twin.get_legend_handles_labels()
-    ax_rmse.legend(h1 + h2, l1 + l2, loc="upper left", frameon=False,
-                   fontsize=15)
-
-    ax_scatter = fig.add_subplot(gs[2, 0])
-    var_per = np.nanvar(u_np, axis=0)
-    ax_scatter.scatter(var_per[finite_mask], r2_finite, s=18, alpha=0.6,
-                       c=_COL_CV, edgecolors="none")
-    ax_scatter.axhline(0, color="gray", lw=0.8, ls=":")
-    ax_scatter.set_xscale("log")
-    _style(ax_scatter, xlabel="Neuron variance (log scale)",
-           ylabel="Free-run R\u00b2", title="D  R\u00b2 vs signal variance")
-
-    ax_bottom = fig.add_subplot(gs[2, 1])
-    from numpy.fft import rfft, rfftfreq
-    n_fft = T
-    freqs = rfftfreq(n_fft, d=dt)
-    ps_true = np.abs(rfft(u_np[:, idx_best]
-                           - np.nanmean(u_np[:, idx_best]))) ** 2
-    ps_free = np.abs(rfft(u_free[:, idx_best]
-                           - np.nanmean(u_free[:, idx_best]))) ** 2
-    k_smooth = max(1, len(freqs) // 100)
-    ps_true_s = _smooth_1d(ps_true, k_smooth)
-    ps_free_s = _smooth_1d(ps_free, k_smooth)
-    lbl_best = (labels[idx_best] if labels is not None
-                else f"Neuron {idx_best}")
-    ax_bottom.loglog(freqs[1:], ps_true_s[1:], color=_COL_DATA, lw=1.5,
-                     alpha=0.7, label="Data")
-    ax_bottom.loglog(freqs[1:], ps_free_s[1:], color=_COL_CV, lw=1.5,
-                     alpha=0.7, label="Free run")
-    ax_bottom.legend(frameon=False, fontsize=15)
-    _style(ax_bottom, xlabel="Frequency (Hz)", ylabel="Power",
-           title=f"E  Power spectrum \u2014 {lbl_best}")
-
-    fig.suptitle("Motor-Conditioned Rollout Diagnostics (CV-reg)"
-                 if mode == "motor_conditioned"
-                 else "Free-Run Diagnostics (CV-reg)",
-                 fontsize=26, fontweight="bold", y=1.01)
-    _save_png(fig, save_dir, "11b_free_run_statistics.png",
-              bbox_inches="tight", dpi=150)
-    plt.close(fig)
 
 
 # =====================================================================
@@ -1062,9 +886,6 @@ def _run_alpha_cv_for_diagnostics(
     data: Dict[str, Any],
     cfg,
 ) -> Optional[Dict[str, Any]]:
-    """Re-run the alpha ridge-CV solver to collect per-neuron diagnostics."""
-    if int(getattr(cfg, "alpha_cv_every", 0) or 0) <= 0:
-        return None
     try:
         from .train import ridge_cv_solve_alpha
         result = ridge_cv_solve_alpha(model, data, cfg)
@@ -1083,17 +904,6 @@ def plot_ridge_cv_diagnostics(
     save_dir: str,
     cfg=None,
 ) -> None:
-    """3×4 comprehensive ridge-CV diagnostics figure.
-
-    Row 0 — Best ridge-α summaries:
-        A. Best-α histogram   B. Behaviour best-α   C. Per-neuron fit R²   D. Coefficient heatmap
-
-    Row 1 — Behaviour decoder CV:
-        E. GT decoder CV-MSE   F. Model decoder CV-MSE   G. Decoder CV-MSE at best α   H. Alpha CV-MSE curves
-
-    Row 2 — Free-run & alpha diagnostics:
-        I. Variance vs Free-run R²   J. One-step R² vs Free-run R²   K. Boundary hits   L. Ridge α vs One-step R²
-    """
     import matplotlib.pyplot as plt
     from matplotlib.gridspec import GridSpec
 
@@ -1507,7 +1317,6 @@ def generate_eval_loo_plots(
                        beh_all=beh_all)
     plot_parameter_trajectories(epoch_losses, save_dir, cfg=cfg)
     plot_prediction_traces(data, onestep, loo, free_run, save_dir)
-    plot_free_run_statistics(data, free_run, save_dir)
 
     if include_ridge_diagnostics:
         plot_ridge_cv_diagnostics(model, data, onestep, free_run, beh, save_dir, cfg=cfg)
@@ -1516,3 +1325,394 @@ def generate_eval_loo_plots(
         "beh": beh,
         "beh_r2_model": results.get("beh_r2_model"),
     }
+
+
+# ======================================================================= #
+#  Multi-worm summary plots  (merged from plot_eval_multi.py)             #
+# ======================================================================= #
+
+_COL_OS    = "#2166ac"   # one-step
+_COL_LOO   = "#d6604d"   # LOO
+_COL_OBS   = "#1a9641"   # observed
+_COL_UNOBS = "#d4d4d4"   # unobserved
+_COL_WORM  = "#756bb1"   # per-worm accent
+
+
+def _plot_per_worm_r2(
+    eval_results: Dict[str, Any],
+    fig,
+    axes: list,
+) -> None:
+    """Axes[0]: sorted one-step R² bars.  Axes[1]: sorted LOO R² bars.
+    Axes[2]: overlaid histograms for both metrics."""
+    per_worm   = eval_results["per_worm"]
+    worm_ids   = list(per_worm.keys())
+
+    r2_os  = np.array([per_worm[w]["r2_onestep_median"] for w in worm_ids])
+    r2_loo = np.array([per_worm[w]["r2_loo_median"]     for w in worm_ids])
+    n_obs  = np.array([per_worm[w]["N_obs"]             for w in worm_ids])
+
+    order = np.argsort(r2_os)[::-1]
+    worm_ids_s = [worm_ids[i] for i in order]
+    r2_os_s    = r2_os[order]
+    r2_loo_s   = r2_loo[order]
+    n_obs_s    = n_obs[order]
+
+    x = np.arange(len(worm_ids_s))
+
+    ax0 = axes[0]
+    ax0.bar(x, r2_os_s, color=_COL_OS, alpha=0.85, width=0.7)
+    ax0.axhline(float(np.nanmedian(r2_os)), ls="--", lw=1.2, color="k",
+                label=f"median={np.nanmedian(r2_os):.3f}")
+    ax0.set_xticks(x)
+    ax0.set_xticklabels(worm_ids_s, rotation=90, fontsize=6)
+    ax0.set_ylim(min(0.0, float(np.nanmin(r2_os_s)) - 0.05),
+                 min(1.0, float(np.nanmax(r2_os_s)) + 0.05))
+    _style(ax0, "Worm", "Median R²", "One-step R² (val)")
+    ax0.legend(fontsize=7)
+
+    for xi, ni in zip(x, n_obs_s):
+        ax0.text(xi, ax0.get_ylim()[0] + 0.01, str(ni),
+                 ha="center", va="bottom", fontsize=5, color="grey")
+
+    ax1 = axes[1]
+    ax1.bar(x, r2_loo_s, color=_COL_LOO, alpha=0.85, width=0.7)
+    ax1.axhline(float(np.nanmedian(r2_loo)), ls="--", lw=1.2, color="k",
+                label=f"median={np.nanmedian(r2_loo):.3f}")
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(worm_ids_s, rotation=90, fontsize=6)
+    ax1.set_ylim(min(0.0, float(np.nanmin(r2_loo_s)) - 0.05),
+                 min(1.0, float(np.nanmax(r2_loo_s)) + 0.05))
+    _style(ax1, "Worm", "Median R²", "LOO R² (val)")
+    ax1.legend(fontsize=7)
+
+    ax2 = axes[2]
+    bins  = np.linspace(min(np.nanmin(r2_os), np.nanmin(r2_loo)) - 0.05,
+                        min(1.01, max(np.nanmax(r2_os), np.nanmax(r2_loo)) + 0.05),
+                        25)
+    ax2.hist(r2_os[np.isfinite(r2_os)],   bins=bins, color=_COL_OS,  alpha=0.6,
+             label="one-step")
+    ax2.hist(r2_loo[np.isfinite(r2_loo)], bins=bins, color=_COL_LOO, alpha=0.6,
+             label="LOO")
+    _style(ax2, "Median R² per worm", "Count", "R² distribution")
+    ax2.legend(fontsize=7)
+
+
+def _plot_coverage_heatmap(
+    eval_results:  Dict[str, Any],
+    worm_states:   list,
+    atlas_labels:  Optional[list],
+    ax,
+    max_neurons:   int = 60,
+) -> None:
+    """Binary heatmap: rows = neurons (top-covered), cols = worms."""
+    summary  = eval_results["summary"]
+    cov_mat  = summary["coverage_matrix"]
+    obs_cnt  = summary["neuron_obs_count"]
+    worm_ids = summary["worm_ids"]
+
+    order_n  = np.argsort(obs_cnt)[::-1][:max_neurons]
+    cov_sub  = cov_mat[order_n, :]
+    cnt_sub  = obs_cnt[order_n]
+
+    ylabels = (
+        [atlas_labels[i] for i in order_n]
+        if atlas_labels is not None
+        else [str(i) for i in order_n]
+    )
+    xlabels = worm_ids
+
+    cmap = mcolors.ListedColormap([_COL_UNOBS, _COL_OBS])
+    ax.imshow(cov_sub.astype(float), aspect="auto", cmap=cmap,
+              vmin=0, vmax=1, interpolation="none")
+
+    ax.set_yticks(np.arange(len(ylabels)))
+    ax.set_yticklabels(ylabels, fontsize=5)
+    ax.set_xticks(np.arange(len(xlabels)))
+    ax.set_xticklabels(xlabels, rotation=90, fontsize=5)
+    ax.set_xlabel("Worm", fontsize=8)
+    ax.set_ylabel("Neuron (top by coverage)", fontsize=8)
+    ax.set_title(
+        f"Coverage matrix  (top {len(order_n)} neurons × {len(worm_ids)} worms)",
+        fontsize=8,
+    )
+
+    ax2 = ax.twinx()
+    ax2.set_ylim(ax.get_ylim())
+    ax2.set_yticks(np.arange(len(cnt_sub)))
+    ax2.set_yticklabels([str(c) for c in cnt_sub], fontsize=4)
+    ax2.set_ylabel("# worms observed", fontsize=6)
+
+
+def _plot_per_neuron_r2_vs_coverage(
+    eval_results: Dict[str, Any],
+    atlas_labels: Optional[list],
+    ax,
+) -> None:
+    summary = eval_results["summary"]
+    obs_cnt = summary["neuron_obs_count"]
+    r2_os   = summary["neuron_r2_onestep"]
+    r2_loo  = summary["neuron_r2_loo"]
+
+    valid_os  = np.isfinite(r2_os)
+    valid_loo = np.isfinite(r2_loo)
+
+    ax.scatter(obs_cnt[valid_os], r2_os[valid_os], s=15, alpha=0.7,
+               color=_COL_OS, label="one-step", zorder=3)
+    ax.scatter(obs_cnt[valid_loo], r2_loo[valid_loo], s=15, alpha=0.5,
+               color=_COL_LOO, label="LOO", zorder=2)
+
+    if atlas_labels is not None:
+        top_k = np.argsort(obs_cnt)[::-1][:10]
+        for i in top_k:
+            if valid_os[i]:
+                ax.annotate(atlas_labels[i], (obs_cnt[i], r2_os[i]),
+                            fontsize=4, ha="left", va="bottom")
+
+    ax.axhline(0, ls="--", lw=0.8, color="k", alpha=0.3)
+    _style(ax, "# worms observing neuron", "Mean R² (val)", "Per-neuron R² vs coverage")
+    ax.legend(fontsize=7)
+
+
+def _plot_lambda_u_distributions(
+    eval_results: Dict[str, Any],
+    worm_states:  list,
+    ax,
+) -> None:
+    """Boxplot of per-neuron λ_u values, one box per worm."""
+    per_worm = eval_results["per_worm"]
+    worm_ids = list(per_worm.keys())
+
+    data_boxes = []
+    labels_b   = []
+    for wid in worm_ids:
+        lam_w = per_worm[wid]["lambda_u"]
+        obs   = per_worm[wid]["onestep"]["obs_idx"]
+        data_boxes.append(lam_w[obs])
+        labels_b.append(wid)
+
+    ax.boxplot(
+        data_boxes,
+        labels=labels_b,
+        patch_artist=True,
+        medianprops=dict(color="k", lw=1.5),
+        boxprops=dict(facecolor=_COL_WORM, alpha=0.6),
+        flierprops=dict(marker=".", markersize=2, alpha=0.4),
+        whiskerprops=dict(lw=0.8),
+        capprops=dict(lw=0.8),
+    )
+    import matplotlib.pyplot as plt
+    plt.setp(ax.get_xticklabels(), rotation=90, fontsize=6)
+    _style(ax, "Worm", "λ_u (observed neurons)", "Per-worm λ_u distributions")
+
+
+def _plot_per_worm_Gvalues(
+    eval_results: Dict[str, Any],
+    ax,
+) -> None:
+    """Bar chart of per-worm G scalar (only if per_worm_G is active)."""
+    per_worm = eval_results["per_worm"]
+    worm_ids = list(per_worm.keys())
+    G_vals   = [per_worm[w]["G_worm"] for w in worm_ids]
+
+    if all(g is None for g in G_vals):
+        ax.text(0.5, 0.5, "per-worm G not enabled",
+                ha="center", va="center", transform=ax.transAxes, fontsize=10)
+        _style(ax, "", "", "Per-worm G")
+        return
+
+    G_arr = np.array([g if g is not None else np.nan for g in G_vals])
+    x     = np.arange(len(worm_ids))
+    ax.bar(x, G_arr, color=_COL_WORM, alpha=0.8, width=0.7)
+    ax.axhline(1.0, ls="--", lw=1, color="k", alpha=0.4, label="G=1 (shared)")
+    ax.set_xticks(x)
+    ax.set_xticklabels(worm_ids, rotation=90, fontsize=6)
+    _style(ax, "Worm", "G scalar", "Per-worm G")
+    ax.legend(fontsize=7)
+
+
+def plot_multi_worm_r2(
+    eval_results: Dict[str, Any],
+    worm_states:  list,
+    atlas_labels: Optional[list],
+    save_dir:     str,
+    show:         bool = False,
+) -> None:
+    """Save ``01_multi_worm_r2.png``."""
+    import matplotlib.pyplot as plt
+
+    setup_plot_style()
+    n_worms = len(eval_results["per_worm"])
+
+    fig_w  = max(10, n_worms * 0.4 + 3)
+    fig, axes = plt.subplots(1, 3, figsize=(fig_w, 4),
+                             gridspec_kw={"width_ratios": [2, 2, 1]})
+    fig.suptitle(f"Multi-worm R²  ({n_worms} worms)", fontsize=10, fontweight="bold")
+
+    _plot_per_worm_r2(eval_results, fig, list(axes))
+    fig.tight_layout()
+    _save_png(fig, save_dir, "01_multi_worm_r2.png")
+    if show:
+        plt.show()
+    plt.close(fig)
+
+
+def plot_coverage_heatmap(
+    eval_results: Dict[str, Any],
+    worm_states:  list,
+    atlas_labels: Optional[list],
+    save_dir:     str,
+    show:         bool = False,
+    max_neurons:  int  = 60,
+) -> None:
+    """Save ``02_coverage_heatmap.png``."""
+    import matplotlib.pyplot as plt
+
+    setup_plot_style()
+    n_worms  = len(worm_states)
+    fig_w    = max(8, n_worms * 0.35 + 3)
+    fig_h    = max(8, min(max_neurons * 0.18, 20))
+    fig, ax  = plt.subplots(1, 1, figsize=(fig_w, fig_h))
+    fig.suptitle("Neuron coverage across worms", fontsize=10, fontweight="bold")
+
+    _plot_coverage_heatmap(eval_results, worm_states, atlas_labels, ax,
+                           max_neurons=max_neurons)
+    fig.tight_layout()
+    _save_png(fig, save_dir, "02_coverage_heatmap.png")
+    if show:
+        plt.show()
+    plt.close(fig)
+
+
+def plot_per_neuron_analysis(
+    eval_results: Dict[str, Any],
+    worm_states:  list,
+    atlas_labels: Optional[list],
+    save_dir:     str,
+    show:         bool = False,
+) -> None:
+    """Save ``03_per_neuron_analysis.png``."""
+    import matplotlib.pyplot as plt
+
+    setup_plot_style()
+    n_worms = len(worm_states)
+    fig_w   = max(12, n_worms * 0.4 + 4)
+    fig, axes = plt.subplots(1, 3, figsize=(fig_w, 4))
+    fig.suptitle("Per-neuron analysis", fontsize=10, fontweight="bold")
+
+    _plot_per_neuron_r2_vs_coverage(eval_results, atlas_labels, axes[0])
+    _plot_lambda_u_distributions(eval_results, worm_states, axes[1])
+    _plot_per_worm_Gvalues(eval_results, axes[2])
+
+    fig.tight_layout()
+    _save_png(fig, save_dir, "03_per_neuron_analysis.png")
+    if show:
+        plt.show()
+    plt.close(fig)
+
+
+def plot_r2_three_metrics(
+    eval_results: Dict[str, Any],
+    save_dir: Optional[str] = None,
+    show: bool = False,
+) -> None:
+    """Summary figure: per-worm per-neuron R² distributions for one-step, LOO,
+    and free-run side-by-side as boxplots + median markers."""
+    import matplotlib.pyplot as plt
+
+    setup_plot_style()
+
+    per_worm  = eval_results["per_worm"]
+    worm_ids  = list(per_worm.keys())
+    n_worms   = len(worm_ids)
+
+    metrics = [
+        ("onestep",  "One-step R²",  _COL_OS),
+        ("loo",      "LOO R²",        _COL_LOO),
+        ("freerun",  "Free-run R²",   "#4dac26"),
+    ]
+
+    fig, axes = plt.subplots(1, 3, figsize=(max(10, 3.5 * n_worms), 6),
+                             sharey=False)
+    fig.suptitle(f"R² across metrics  ({n_worms} worms, val set)",
+                 fontsize=18, fontweight="bold", y=1.02)
+
+    for ax, (key, title, color) in zip(axes, metrics):
+        x_pos = np.arange(n_worms)
+        for xi, wid in enumerate(worm_ids):
+            obs_arr = per_worm[wid][key]["obs_idx"]
+            r2_vals = per_worm[wid][key]["r2"][obs_arr]
+            r2_vals = r2_vals[np.isfinite(r2_vals)]
+            if r2_vals.size == 0:
+                continue
+            jitter = np.random.default_rng(42).uniform(-0.18, 0.18, r2_vals.size)
+            ax.scatter(xi + jitter, r2_vals,
+                       s=12, color=color, alpha=0.25, linewidths=0, zorder=2)
+            q25, med, q75 = np.percentile(r2_vals, [25, 50, 75])
+            ax.vlines(xi, q25, q75, color="0.15", lw=5, zorder=3)
+            ax.scatter([xi], [med], s=60, color="white",
+                       edgecolors="0.15", linewidths=1.5, zorder=4)
+            ax.text(xi, q25 - 0.03, f"{med:.2f}",
+                    ha="center", va="top", fontsize=9, color="0.3")
+
+        ax.axhline(0, color="gray", lw=0.8, ls=":")
+        short_ids = [w.replace("-", "\u2011") for w in worm_ids]
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels(short_ids, rotation=45, ha="right", fontsize=9)
+        ax.set_xlim(-0.6, n_worms - 0.4)
+        _style(ax, ylabel="R² (val)", title=title)
+
+    plt.tight_layout()
+    if save_dir is not None:
+        _save_png(fig, save_dir, "00_r2_summary.png", bbox_inches="tight")
+    if show:
+        plt.show()
+    plt.close(fig)
+
+
+def generate_multi_worm_plots(
+    model:        Stage2ModelPT,
+    worm_states:  list,
+    eval_results: Dict[str, Any],
+    cfg           = None,
+    atlas_labels: Optional[list] = None,
+    save_dir:     Optional[str] = None,
+    show:         bool = False,
+) -> None:
+    """Generate and save all multi-worm diagnostic plots."""
+    if not eval_results:
+        print("[MultiWorm Plots] eval_results is empty; skipping.")
+        return
+
+    if save_dir is not None:
+        Path(save_dir).mkdir(parents=True, exist_ok=True)
+
+    if atlas_labels is None:
+        atlas_labels = eval_results.get("atlas_labels", None)
+
+    n_worms = len(worm_states)
+    print(f"[MultiWorm Plots] Generating plots for {n_worms} worms …")
+
+    try:
+        plot_multi_worm_r2(eval_results, worm_states, atlas_labels,
+                           save_dir=save_dir, show=show)
+        print("[MultiWorm Plots] 01_multi_worm_r2.png  ✓")
+    except Exception as exc:
+        print(f"[MultiWorm Plots] 01 FAILED: {exc}")
+
+    try:
+        plot_coverage_heatmap(eval_results, worm_states, atlas_labels,
+                              save_dir=save_dir, show=show)
+        print("[MultiWorm Plots] 02_coverage_heatmap.png  ✓")
+    except Exception as exc:
+        print(f"[MultiWorm Plots] 02 FAILED: {exc}")
+
+    try:
+        plot_per_neuron_analysis(eval_results, worm_states, atlas_labels,
+                                 save_dir=save_dir, show=show)
+        print("[MultiWorm Plots] 03_per_neuron_analysis.png  ✓")
+    except Exception as exc:
+        print(f"[MultiWorm Plots] 03 FAILED: {exc}")
+
+    if save_dir is not None:
+        print(f"[MultiWorm Plots] All plots saved to {save_dir}")

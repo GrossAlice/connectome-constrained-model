@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from typing import Dict, Any, Optional, Tuple, List
 
-from .behavior import (
+from .behavior_decoder_eval import (
     behaviour_all_neurons_prediction,
     evaluate_training_decoder,
 )
@@ -241,7 +241,10 @@ def run_loo_all(
 
     pred_full = np.column_stack([preds.get(i, u_np[:, i]) for i in range(u.shape[1])])
     r2, corr, rmse = _per_neuron_metrics(u_np[1:], pred_full[1:], indices)
-    return {"pred": preds, "r2": r2, "corr": corr, "rmse": rmse}
+
+    return {
+        "pred": preds, "r2": r2, "corr": corr, "rmse": rmse,
+    }
 
 
 def choose_loo_subset(
@@ -261,6 +264,23 @@ def choose_loo_subset(
         return None
 
     mode = str(subset_mode).strip().lower()
+
+    # Resolve candidate pool: motor neurons only for motor* modes, else all
+    candidates = None
+    if mode.startswith("motor"):
+        cfg = data.get("_cfg")
+        if cfg is not None and getattr(cfg, "motor_neurons", None) is not None:
+            candidates = sorted({int(i) for i in cfg.motor_neurons if 0 <= int(i) < N})
+        if not candidates:
+            candidates = list(range(N))  # fallback
+
+    if mode == "motor_best_onestep":
+        r2 = np.asarray(onestep["r2"], dtype=float)
+        scores = np.where(np.isfinite(r2), r2, -np.inf)
+        ranked = sorted(candidates, key=lambda i: scores[i], reverse=True)
+        return ranked[:k]
+    if mode == "motor":
+        return candidates[:k]
     if mode == "variance":
         return [int(i) for i in np.argsort(np.nanvar(u_np, axis=0))[::-1][:k]]
     if mode in ("worst_onestep", "best_onestep"):
@@ -388,10 +408,9 @@ def run_full_evaluation(
 
     r2_model_mean = None
     if beh is not None:
-        r2 = beh.get("r2_model_heldout")
-        if r2 is None or not np.any(np.isfinite(r2)):
-            r2 = beh["r2_model"]
-        r2_model_mean = float(np.nanmean(r2))
+        r2 = beh.get("r2_model")
+        if r2 is not None and np.any(np.isfinite(r2)):
+            r2_model_mean = float(np.nanmean(r2))
 
     return {
         "onestep": onestep, "loo": loo, "currents": currents,

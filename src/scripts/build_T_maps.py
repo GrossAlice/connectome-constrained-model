@@ -3,61 +3,30 @@
 build_connectome.py
 ===================
 
-Build connectivity matrices for the C. elegans nervous system.
+Build connectivity matrices and neurotransmitter sign matrix for C. elegans.
 
-This script produces three connectivity matrices:
-- T_sv.npy: Synaptic vesicle (fast chemical synapses)
-- T_dcv.npy: Dense core vesicle (slow neuromodulation)  
-- T_e.npy: Electrical (gap junction) connections
+Outputs (302×302 atlas):
+  - T_sv.npy:  synaptic vesicle (fast chemical synapses)    [Moza 2025]
+  - T_dcv.npy: dense core vesicle (monoamine+neuropeptide)  [Bentley 2016]
+  - T_e.npy:   electrical (gap junctions)                   [Moza 2025]
+  - neurotransmitter_sign.npy: per-edge sign (+1/−1/0)      [Fenyves 2020]
 
-USAGE
------
+Usage::
 
-Run with default paths (assumes data files in src/data/):
-
-```bash
-python build_connectome.py
-```
-
-This uses:
-  - src/data/chem_adj.pkl
-  - src/data/gapjn_symm_adj.pkl (or data/moza (2025)/gapjn_symm_adj.pkl)
-  - src/data/NPP_GPCR_networks_long_range_model_2.csv
-  - src/data/26012022_num_neuronID.txt
-
-And produces:
-  - T_sv.npy (chemical synapses)
-  - T_dcv.npy (neuropeptide modulation)
-  - T_e.npy (gap junctions)
-
-Custom paths (optional):
-
-```bash
-python build_connectome.py \
-  --chem_adj /path/to/chem_adj.pkl \
-  --gap_adj /path/to/gapjn_symm_adj.pkl \
-  --peptide_adj /path/to/NPP_GPCR_networks_long_range_model_2.csv \
-  --peptide_map /path/to/26012022_num_neuronID.txt
-```
-
-OUTPUTS
--------
-- T_sv.npy: (N×N) All chemical synapses from anatomical connectome
-- T_dcv.npy: (N×N) Neuropeptide modulation
-- T_e.npy: (N×N) Gap junction electrical connections
-
-where N is the total number of neurons.
+    python -m scripts.build_connectome
+    python -m scripts.build_connectome --out_dir data/used/masks+motor\\ neurons
 """
 
 import argparse
+import re
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, List, Tuple
 import pickle
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
 import matplotlib
-matplotlib.use('Agg')  # Non-interactive backend for saving
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 
 # -----------------------------------------------------------------------------
@@ -79,17 +48,17 @@ def load_gap_adj(path: str) -> Dict[str, Dict[str, Dict[str, float]]]:
 def build_neuron_index(
     chem_adj: Dict,
     gap_adj: Dict,
-    extra_neurons: List[str] = None,
 ) -> Tuple[List[str], Dict[str, int]]:
-    """Create sorted list of neuron names and name→index mapping."""
+    """Create sorted list of neuron names and name→index mapping.
+
+    Uses only neurons present in the anatomical connectome (chem + gap).
+    """
     neuron_set = set(chem_adj.keys())
     for posts in chem_adj.values():
         neuron_set.update(posts.keys())
     neuron_set.update(gap_adj.keys())
     for posts in gap_adj.values():
         neuron_set.update(posts.keys())
-    if extra_neurons:
-        neuron_set.update(extra_neurons)
     neurons = sorted(neuron_set)
     return neurons, {n: i for i, n in enumerate(neurons)}
 
@@ -97,22 +66,13 @@ def build_neuron_index(
 def load_bentley_data(
     monoamine_path: str, neuropeptide_path: str
 ) -> Tuple[Dict[str, Dict[str, int]], Dict[str, Dict[str, int]]]:
-    """Load Bentley et al. 2016 monoamine and neuropeptide connectivity.
-    
-    Converts neuron names to match anatomical convention (AS1 → AS01, etc.)
-    
-    Returns
-    -------
-    monoamine_adj : Dict[str, Dict[str, int]]
-        Monoamine connections: {pre_neuron: {post_neuron: count}}
-    neuropeptide_adj : Dict[str, Dict[str, int]]
-        Neuropeptide connections: {pre_neuron: {post_neuron: count}}
+    """Load Bentley 2016 monoamine + neuropeptide CSVs.
+
+    Standardises neuron names (AS1→AS01, I03→I3) to match the 302 atlas.
+    Returns {pre: {post: count}} dicts for monoamines and neuropeptides.
     """
     def standardize_neuron_name(name: str) -> str:
-        """Convert AS1 → AS01, DA2 → DA02, etc. to match anatomical naming.
-        Also handles I03 → I3, M01 → M1 for pharyngeal neurons that don't use padding."""
-        import re
-        # Match pattern: letters followed by one or two digits
+        """AS1 → AS01, DA2 → DA02, etc.  Pharyngeal: I03 → I3, M01 → M1."""
         match = re.match(r'^([A-Z]+)(\d{1,2})$', name)
         if match:
             prefix, digits = match.groups()
@@ -161,11 +121,7 @@ def construct_t_sv(
     chem_adj: Dict,
     neuron_index: Dict[str, int],
 ) -> np.ndarray:
-    """Construct synaptic vesicle (fast chemical synapse) matrix.
-    
-    Directly copies all chemical synapse weights from chem_adj.pkl
-    without filtering by neurotransmitter type or receptor expression.
-    """
+    """Build T_sv (fast chemical synapse) matrix from chem_adj weights."""
     n = len(neuron_index)
     t_sv = np.zeros((n, n), dtype=float)
     
@@ -194,10 +150,7 @@ def construct_t_dcv_bentley(
     neuropeptide_adj: Dict[str, Dict[str, int]],
     neuron_index: Dict[str, int],
 ) -> np.ndarray:
-    """Construct DCV matrix from Bentley et al. 2016 monoamine and neuropeptide data.
-    
-    Combines monoamine and neuropeptide connections by summing their connection counts.
-    """
+    """Build T_dcv by summing Bentley 2016 monoamine + neuropeptide counts."""
     n = len(neuron_index)
     t_dcv = np.zeros((n, n), dtype=float)
     
@@ -249,6 +202,33 @@ def construct_t_e(
     return t_e
 
 
+def construct_nt_sign(
+    xls_path: Path,
+    neuron_index: Dict[str, int],
+) -> np.ndarray:
+    """Build neurotransmitter sign matrix from Fenyves 2020 elegansign.xls.
+
+    Maps the Sign column: '+' → +1, '−' → −1, 'complex'/'no pred' → 0.
+    Returns (N, N) float32 array with values in {−1, 0, +1}.
+    """
+    df = pd.read_excel(xls_path)
+    n = len(neuron_index)
+    sign = np.zeros((n, n), dtype=np.float32)
+    sign_map = {"+": 1.0, "-": -1.0}
+
+    for _, row in df.iterrows():
+        src = str(row["Source"]).strip()
+        tgt = str(row["Target"]).strip()
+        s = str(row["Sign"]).strip()
+        si = neuron_index.get(src)
+        ti = neuron_index.get(tgt)
+        if si is None or ti is None:
+            continue
+        sign[ti, si] = sign_map.get(s, 0.0)
+
+    return sign
+
+
 # -----------------------------------------------------------------------------
 # Plotting functions
 # -----------------------------------------------------------------------------
@@ -262,25 +242,7 @@ def plot_connectivity_matrix(
     log_scale: bool = False,
     max_labels: int = 50,
 ):
-    """Plot connectivity matrix as heatmap with neuron labels.
-    
-    Parameters
-    ----------
-    matrix : np.ndarray
-        (N, N) connectivity matrix
-    neuron_names : List[str]
-        List of neuron names (length N)
-    title : str
-        Plot title
-    save_path : Path
-        Where to save the plot
-    cmap : str
-        Colormap name
-    log_scale : bool
-        Use log scale for colormap
-    max_labels : int
-        Maximum number of axis labels to show (for readability)
-    """
+    """Plot (N,N) connectivity heatmap with neuron labels."""
     fig, ax = plt.subplots(figsize=(12, 10))
     
     # Apply log scale if requested
@@ -340,7 +302,7 @@ def plot_connectivity_summary(
     neuron_names: List[str],
     save_dir: Path,
 ):
-    """Create summary plots for all three connectivity types."""
+    """Heatmaps + degree distributions for T_sv, T_dcv, T_e."""
     save_dir.mkdir(parents=True, exist_ok=True)
     
     print("\nGenerating connectivity plots...")
@@ -441,10 +403,10 @@ def plot_connectivity_summary(
 
 def main() -> None:
     script_dir = Path(__file__).parent
-    data_dir = script_dir / "data"
+    data_dir = script_dir.parent / "data"
     
     parser = argparse.ArgumentParser(
-        description="Build T_sv, T_dcv, and T_e connectivity matrices for C. elegans."
+        description="Build T_sv, T_dcv, T_e and neurotransmitter_sign matrices."
     )
     parser.add_argument(
         "--chem_adj",
@@ -466,13 +428,17 @@ def main() -> None:
         default=str(data_dir / "raw" / "bentley (2016)" / "esconnectome_neuropeptides_Bentley_2016.csv"),
         help="Path to Bentley 2016 neuropeptide connectivity CSV",
     )
-    parser.add_argument("--out_sv", default="T_sv.npy", help="Output file for T_sv")
-    parser.add_argument("--out_dcv", default="T_dcv.npy", help="Output file for T_dcv")
-    parser.add_argument("--out_e", default="T_e.npy", help="Output file for T_e")
+    parser.add_argument("--out_dir", default=str(data_dir / "used" / "masks+motor neurons"),
+                        help="Output directory for .npy files")
+    parser.add_argument(
+        "--sign_xls",
+        default=str(data_dir / "raw" / "fenyves (2020)" / "elegansign.xls"),
+        help="Path to Fenyves 2020 elegansign.xls (neurotransmitter sign)",
+    )
     parser.add_argument(
         "--plot_dir",
-        default="connectome_plots",
-        help="Directory to save connectivity plots (default: connectome_plots)",
+        default=str(Path("output_plots") / "connectome_plots"),
+        help="Directory to save connectivity plots",
     )
     parser.add_argument(
         "--no_plot",
@@ -498,12 +464,8 @@ def main() -> None:
     else:
         print(f"  ⚠ Bentley 2016 files not found (skipping)")
     
-    extra_neurons = []
-
-    # Build neuron index (include neurons from all data sources)
-    if monoamine_adj and neuropeptide_adj:
-        extra_neurons = list(set(monoamine_adj.keys()) | set(neuropeptide_adj.keys()))
-    neurons, neuron_index = build_neuron_index(chem_adj, gap_adj, extra_neurons)
+    # Build neuron index from anatomical connectome only (302 neurons)
+    neurons, neuron_index = build_neuron_index(chem_adj, gap_adj)
     print(f"\nTotal neurons: {len(neurons)}")
 
     # Build matrices
@@ -546,12 +508,25 @@ def main() -> None:
     print("\n" + "="*60)
     print("Saving matrices...")
     print("="*60)
-    np.save(args.out_sv, t_sv)
-    print(f"  ✓ {args.out_sv}")
-    np.save(args.out_dcv, t_dcv)
-    print(f"  ✓ {args.out_dcv}")
-    np.save(args.out_e, t_e)
-    print(f"  ✓ {args.out_e}")
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    for name, arr in [("T_sv.npy", t_sv), ("T_dcv.npy", t_dcv), ("T_e.npy", t_e)]:
+        p = out_dir / name
+        np.save(p, arr)
+        print(f"  ✓ {p}")
+
+    # Build and save neurotransmitter sign matrix
+    sign_path = Path(args.sign_xls)
+    if sign_path.exists():
+        nt_sign = construct_nt_sign(sign_path, neuron_index)
+        p = out_dir / "neurotransmitter_sign.npy"
+        np.save(p, nt_sign)
+        n_exc = int((nt_sign == 1).sum())
+        n_inh = int((nt_sign == -1).sum())
+        print(f"  ✓ {p}  (excitatory={n_exc}, inhibitory={n_inh})")
+    else:
+        print(f"  ⚠ {sign_path} not found — skipping NT sign matrix")
     
     # Generate plots
     if not args.no_plot:
