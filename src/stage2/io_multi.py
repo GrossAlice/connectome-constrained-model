@@ -11,7 +11,6 @@ import torch
 
 from .config import Stage2PTConfig
 from . import get_stage2_logger
-# Re-use label-matching utilities from the single-worm loader
 from .io_h5 import (
     _match_single_label,
     _recover_labels_to_atlas,
@@ -49,19 +48,14 @@ def _match_labels_to_atlas(
     file_labels: List[str],
     full_labels: List[str],
 ) -> Tuple[List[str], np.ndarray]:
-    """Match file labels to atlas, returning (matched_labels, atlas_indices).
-
-    Only labels that resolve to a unique atlas entry are kept.  Returns
-    parallel lists: ``matched_labels[i]`` is the atlas name and
-    ``atlas_indices[i]`` is its position in the 302-vector.
-    """
+    """Match file labels to atlas; returns (matched_labels, atlas_indices)."""
     recovered = _recover_labels_to_atlas(file_labels, full_labels)
     indices = []
     for lab in recovered:
         try:
             indices.append(full_labels.index(lab))
         except ValueError:
-            pass  # should not happen after recovery, but be safe
+            pass
     return recovered, np.array(indices, dtype=np.int64)
 
 
@@ -76,10 +70,7 @@ def _has_stage1(f: h5py.File, u_dataset: str = "stage1/u_mean") -> bool:
 
 
 def scan_h5(h5_path: str, full_labels: List[str]) -> Optional[Dict[str, Any]]:
-    """Read metadata from one H5 file without loading heavy arrays.
-
-    Returns ``None`` if the file cannot be opened or has no neuron labels.
-    """
+    """Read metadata from one H5 file. Returns None if unusable."""
     path = Path(h5_path)
     if not path.exists():
         _log.warning("file_not_found", path=str(h5_path))
@@ -96,14 +87,12 @@ def scan_h5(h5_path: str, full_labels: List[str]) -> Optional[Dict[str, Any]]:
             ds_type = _detect_dataset_type(f)
             has_s1 = _has_stage1(f)
 
-            # Trace shape
             trace_ds = "stage1/u_mean" if has_s1 else "gcamp/trace_array_original"
             if trace_ds not in f:
                 trace_ds = "gcamp/trace_array_original"
             shape = f[trace_ds].shape
-            T_raw = max(shape)  # handles (T,N) or (N,T)
+            T_raw = max(shape)
 
-            # Sample rate
             sample_rate_hz = None
             if has_s1 and "stage1/params" in f:
                 sample_rate_hz = f["stage1/params"].attrs.get("sample_rate_hz", None)
@@ -116,7 +105,7 @@ def scan_h5(h5_path: str, full_labels: List[str]) -> Optional[Dict[str, Any]]:
                 "h5_path": str(path),
                 "raw_labels": raw_labels,
                 "matched_labels": matched,
-                "atlas_idx": atlas_idx,       # into the full 302
+                "atlas_idx": atlas_idx,
                 "n_neurons": len(matched),
                 "T_raw": T_raw,
                 "dataset_type": ds_type,
@@ -133,23 +122,9 @@ def _build_atlas(
     full_labels: List[str],
     min_count: int = 0,
 ) -> Tuple[np.ndarray, List[str], np.ndarray]:
-    """Build the multi-worm atlas from scanned file infos.
+    """Build multi-worm atlas. Returns (atlas_idx, atlas_labels, coverage).
 
-    Parameters
-    ----------
-    min_count : int
-        Minimum number of worms a neuron must appear in.
-        0 → include all 302 neurons (full atlas).
-        1 → include only neurons observed in at least one worm.
-
-    Returns
-    -------
-    atlas_idx : ndarray (N_atlas,) int
-        Indices into the full 302 atlas.
-    atlas_labels : list[str]
-        Neuron names in atlas order.
-    coverage : ndarray (N_atlas,) int
-        Number of worms observing each atlas neuron.
+    min_count: 0 = full 302 atlas, ≥1 = only neurons in that many worms.
     """
     N_full = len(full_labels)
     count = np.zeros(N_full, dtype=np.int64)
@@ -158,7 +133,6 @@ def _build_atlas(
             count[idx] += 1
 
     if min_count <= 0:
-        # Full 302 atlas
         atlas_idx = np.arange(N_full, dtype=np.int64)
     else:
         atlas_idx = np.where(count >= min_count)[0]
@@ -232,16 +206,7 @@ def _atlas_embedding_indices(
     worm_atlas_idx: np.ndarray,
     global_atlas_idx: np.ndarray,
 ) -> np.ndarray:
-    """Map per-worm atlas indices to positions in the multi-worm atlas.
-
-    ``worm_atlas_idx[i]``  = index into the full 302 for worm neuron *i*.
-    ``global_atlas_idx[j]`` = index into the full 302 for atlas neuron *j*.
-
-    Returns ``embed_idx`` such that atlas position ``embed_idx[i]`` corresponds
-    to worm neuron *i*.  Neurons not in the atlas are dropped (should not
-    happen if atlas ⊇ union of all worms).
-    """
-    # Build reverse map: full_302_idx → atlas_position
+    """Map per-worm atlas indices to positions in the multi-worm atlas."""
     rev = {int(g): j for j, g in enumerate(global_atlas_idx)}
     embed = []
     keep = []
@@ -262,14 +227,12 @@ def _load_neural_data_stage1(
     u = _ensure_TN(np.array(f[u_dataset], dtype=np.float64))
     T, N_file = u.shape
 
-    # u_var
     u_var = None
     if "stage1/u_var" in f:
         u_var = _ensure_TN(np.array(f["stage1/u_var"], dtype=np.float64))
         if u_var.shape != (T, N_file):
             u_var = None
 
-    # sigma_u, lambda_u from stage1 params
     sigma_u = None
     lambda_u = None
     if "stage1/params" in f:
@@ -290,7 +253,6 @@ def _load_neural_data_raw(
 ) -> np.ndarray:
     """Load raw GCaMP traces and z-score per neuron (fallback when no stage1)."""
     raw = _ensure_TN(np.array(f[trace_dataset], dtype=np.float64))
-    # Per-neuron z-score
     mu = np.nanmean(raw, axis=0, keepdims=True)
     std = np.nanstd(raw, axis=0, keepdims=True)
     std = np.where(std > 1e-8, std, 1.0)
@@ -332,7 +294,6 @@ def _resample_1d(x: np.ndarray, T_old: int, T_new: int) -> np.ndarray:
     new_t = np.linspace(0, 1, T_new)
     if x.ndim == 1:
         return np.interp(new_t, old_t, x)
-    # Multi-column: interpolate each column
     out = np.empty((T_new, x.shape[1]), dtype=x.dtype)
     for j in range(x.shape[1]):
         out[:, j] = np.interp(new_t, old_t, x[:, j])
@@ -345,10 +306,7 @@ def _maybe_resample(
     target_dt: float,
     T_original: int,
 ) -> Tuple[Dict[str, Optional[np.ndarray]], int]:
-    """Resample arrays if ``original_dt`` differs from ``target_dt`` by > 5%.
-
-    Returns (resampled_arrays, T_new).
-    """
+    """Resample arrays if dt differs by > 5%. Returns (resampled_arrays, T_new)."""
     if original_dt <= 0 or target_dt <= 0:
         return arrays, T_original
     ratio = original_dt / target_dt
@@ -365,7 +323,7 @@ def _maybe_resample(
         elif arr.ndim >= 1 and arr.shape[0] == T_original:
             out[k] = _resample_1d(arr, T_original, T_new)
         else:
-            out[k] = arr  # not time-indexed (e.g. per-neuron vectors)
+            out[k] = arr
     return out, T_new
 
 
@@ -388,10 +346,7 @@ def _load_optogenetic_stimulus(
     T: int,
     N_file: int,
 ) -> Optional[np.ndarray]:
-    """Load the optogenetic stim_matrix from a Randi file.
-
-    Returns (T, N_file) float array where 1.0 = stimulated.
-    """
+    """Load optogenetic stim_matrix from a Randi file. Returns (T, N_file)."""
     ds = "optogenetics/stim_matrix"
     if ds not in f:
         return None
@@ -407,11 +362,7 @@ def _load_optogenetic_stimulus(
 
 
 def _build_val_mask(T: int, val_frac: float) -> np.ndarray:
-    """Create boolean mask: True = held out (last ``val_frac`` of time).
-
-    Uses contiguous tail split for temporal evaluation (no data leakage
-    from future-to-past).
-    """
+    """Boolean mask: True for last val_frac of time (contiguous tail split)."""
     n_val = max(1, int(round(T * val_frac)))
     mask = np.zeros(T, dtype=bool)
     mask[-n_val:] = True
@@ -429,10 +380,7 @@ def _load_worm(
     cfg: Stage2PTConfig,
     device: torch.device,
 ) -> Dict[str, Any]:
-    """Load one worm's data and embed into atlas coordinates.
-
-    Returns a dict with all per-worm tensors on *device*.
-    """
+    """Load one worm's data and embed into atlas coordinates."""
     h5_path = info["h5_path"]
     ds_type = info["dataset_type"]
     has_s1 = info["has_stage1"]
@@ -461,14 +409,9 @@ def _load_worm(
 
         T_raw, N_file = u_raw.shape
 
-        # Drop neurons that didn't match the atlas (keep_mask alignment)
-        # keep_mask indexes into the *matched* neurons; we need to handle
-        # the case where N_file > len(matched) because of unmatched labels.
+        # Trim to matched neurons only
         n_matched = info["n_neurons"]
         if N_file > n_matched:
-            # The file has more neurons than matched.  We keep only the
-            # first n_matched columns (they correspond to matched labels
-            # from _recover_labels_to_atlas which preserves order).
             u_raw = u_raw[:, :n_matched]
             if u_var_raw is not None:
                 u_var_raw = u_var_raw[:, :n_matched]
@@ -478,7 +421,7 @@ def _load_worm(
                 lambda_u_raw = lambda_u_raw[:n_matched]
             N_file = n_matched
 
-        original_dt = common_dt  # fallback
+        original_dt = common_dt
         if info["sample_rate_hz"] is not None and info["sample_rate_hz"] > 0:
             original_dt = 1.0 / info["sample_rate_hz"]
 
@@ -521,9 +464,7 @@ def _load_worm(
         embed_idx, keep_mask, N_atlas, fill_value=unobs_sigma,
     )
 
-    # lambda_u_init: observed from stage1 OLS, unobserved = population median
-    # Typical OLS-derived values are 0.02–0.15; 0.5 is far too fast and
-    # makes a poor initialisation when stage1 rho is absent.
+    # lambda_u_init: observed from stage1, unobserved = population median
     _lam_fallback = 0.1
     if lambda_u_raw is not None:
         obs_median_lam = float(np.median(lambda_u_raw[np.isfinite(lambda_u_raw)]))
@@ -539,14 +480,10 @@ def _load_worm(
     if stim_raw is not None:
         stim_atlas = _embed_in_atlas(stim_raw, embed_idx, keep_mask, T, N_atlas)
 
-    # Gating: 1 everywhere (no silencing in these datasets)
     gating_atlas = np.ones((T, N_atlas), dtype=np.float64)
 
-    # obs_mask
     obs_mask = np.zeros(N_atlas, dtype=bool)
     obs_mask[embed_idx] = True
-
-    # val_mask (temporal hold-out)
     val_mask = _build_val_mask(T, val_frac)
 
     def _t(x, dtype=torch.float32):
@@ -559,33 +496,24 @@ def _load_worm(
         "h5_path": h5_path,
         "dataset_type": ds_type,
         "has_stage1": has_s1,
-        # Neural activity
         "u": _t(u_atlas),                        # (T, N_atlas)
         "u_var": _t(u_var_atlas) if u_var_atlas is not None else None,
         "sigma_u": _t(sigma_u_atlas),             # (N_atlas,)
         "lambda_u_init": _t(lambda_u_atlas),       # (N_atlas,)
-        # Masks
         "obs_mask": _t(obs_mask, dtype=torch.bool),  # (N_atlas,)
         "obs_idx": _t(embed_idx, dtype=torch.long),   # (N_obs,)
         "unobs_idx": _t(
             np.setdiff1d(np.arange(N_atlas), embed_idx),
             dtype=torch.long,
         ),                                            # (N_unobs,)
-        # Timing
         "T": T,
         "dt": common_dt,
         "dt_original": original_dt,
-        # Behaviour (Atanas only)
         "behaviour": _t(behaviour) if behaviour is not None else None,
-        # Stimulus (Randi only, atlas-embedded)
         "stim": _t(stim_atlas) if stim_atlas is not None else None,
-        # Gating
         "gating": _t(gating_atlas),              # (T, N_atlas)
-        # Evaluation
         "val_mask": _t(val_mask, dtype=torch.bool),  # (T,)
-        # Display labels (full atlas)
         "neuron_labels": atlas_labels,
-        # Bookkeeping
         "N_obs": int(N_worm),
         "N_unobs": int(N_atlas - N_worm),
     }
@@ -599,10 +527,7 @@ def _assign_worm_weights(
 ) -> None:
     """Compute and store ``weight`` in each worm dict.
 
-    Modes:
-      ``"equal"``       – 1/W per worm.
-      ``"by_observed"`` – weight ∝ N_obs / Σ N_obs (worms observing more
-                          neurons contribute proportionally more).
+    Modes: "equal" (1/W) or "by_observed" (∝ N_obs).
     """
     W = len(worms)
     if W == 0:
@@ -616,7 +541,6 @@ def _assign_worm_weights(
         else:
             weights = np.full(W, 1.0 / W)
     else:
-        # Default: equal
         weights = np.full(W, 1.0 / W)
 
     for w, wt in zip(worms, weights):
@@ -625,25 +549,7 @@ def _assign_worm_weights(
 
 
 def load_multi_worm_data(cfg: Stage2PTConfig) -> Dict[str, Any]:
-    """Load data from multiple worms and build a shared atlas.
-
-    Parameters
-    ----------
-    cfg : Stage2PTConfig
-        Must have ``multi.multi_worm = True`` and ``multi.h5_paths`` set.
-
-    Returns
-    -------
-    dict with keys:
-        atlas_labels  : list[str]           – N_atlas neuron names
-        atlas_size    : int                 – N_atlas
-        atlas_idx     : ndarray (N_atlas,)  – indices into the full 302
-        T_e, T_sv, T_dcv : Tensor (N_atlas, N_atlas)
-        sign_t        : Tensor | None
-        worms         : list[dict]          – per-worm data
-        coverage      : ndarray (N_atlas,)  – worms observing each neuron
-        full_labels   : list[str]           – the full 302 atlas
-    """
+    """Load data from multiple worms and build a shared atlas."""
     device = torch.device(cfg.device)
     full_labels = _load_full_atlas()
 

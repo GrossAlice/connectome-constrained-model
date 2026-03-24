@@ -215,6 +215,19 @@ def _load_stage1(
         u = u[:, keep]
         if u_var is not None:
             u_var = u_var[:, keep]
+
+    # Forward-fill sporadic NaN within kept neurons to prevent
+    # NaN propagation through the Laplacian (L @ u_prev).
+    _nan_count = int(np.sum(~np.isfinite(u)))
+    if _nan_count > 0:
+        for j in range(u.shape[1]):
+            col = u[:, j]
+            nans = ~np.isfinite(col)
+            if nans.any() and not nans.all():
+                good = np.where(~nans)[0]
+                u[:, j] = np.interp(np.arange(len(col)), good, col[good])
+        _io_logger.info("nan_interpolated", n_values=_nan_count)
+
     T, N = u.shape
 
     if cfg.stage1_params_group not in f:
@@ -265,6 +278,7 @@ def _load_stimulus(
     ds = cfg.stim_dataset
     if ds is None:
         candidates = [
+            "optogenetics/stim_matrix",
             "stimulus/regressor", "stim/regressor",
             "stimulus/external_drive", "external_drive", "regressor",
         ]
@@ -313,10 +327,10 @@ def _load_behaviour(
         behavior_ds = "behaviour/eigenworms_stephens"
 
     if behavior_ds not in f:
-        raise KeyError(
-            f"behaviour dataset '{behavior_ds}' not found. "
-            "Stage 2 now requires precomputed eigenworm amplitudes (e.g. /behaviour/eigenworms_stephens)."
-        )
+        _io_logger.warning("behaviour_dataset_missing",
+                           dataset=behavior_ds,
+                           msg="No behaviour data found; behaviour loss will be disabled.")
+        return result
     b_np = _ensure_TN(np.array(f[behavior_ds], dtype=float))
     if b_np.shape[0] != T:
         raise ValueError(f"behaviour T={b_np.shape[0]}, expected {T}")

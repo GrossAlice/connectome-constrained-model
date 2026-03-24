@@ -383,25 +383,7 @@ def compute_behaviour_loss(prior_mu: torch.Tensor, decoder: Dict[str, Any]) -> t
 	b_true_v = b_actual[valid].to(device)
 	return nn.functional.mse_loss(b_pred_v, b_true_v)
 
-
-def _r2(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-	mask = np.isfinite(y_true) & np.isfinite(y_pred)
-	if mask.sum() < 3:
-		return float("nan")
-	yt, yp = y_true[mask].astype(np.float64), y_pred[mask].astype(np.float64)
-	ss_tot = np.sum((yt - yt.mean()) ** 2)
-	if ss_tot < 1e-12:
-		return float("nan")
-	return float(1.0 - np.sum((yt - yp) ** 2) / ss_tot)
-
-
-def _cfg_val(cfg, attr: str, default, cast=float):
-	if cfg is None:
-		return cast(default)
-	value = getattr(cfg, attr, default)
-	if value is None:
-		value = default
-	return cast(value)
+from ._utils import _r2, _cfg_val
 
 
 def _extract_beh_data(data: Dict[str, Any]):

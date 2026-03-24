@@ -176,21 +176,14 @@ def main() -> None:
         cfg.motor_neurons = tuple(resolved_motor) if resolved_motor else None
         print(f"[PostHoc] Resolved {len(resolved_motor)} motor neurons from atlas")
 
-    # ── 7. Save original shared-model lambda_u / I0 ──────────────────────────
-    orig_lambda_u_raw = model._lambda_u_raw.data.clone()
-    orig_I0 = model.I0.data.clone()
-
     # ── 7. Per-worm single-worm plots ─────────────────────────────────────────
+    # lambda_u and I0 are shared on the model (not per-worm), so no
+    # per-worm swap is needed — just use the model as-is.
     for ws in worm_states:
         worm_save = save_dir / ws.worm_id
         worm_save.mkdir(parents=True, exist_ok=True)
         print(f"\n[PostHoc] Generating plots for {ws.worm_id} → {worm_save}")
         try:
-            # Patch shared model with this worm's per-worm lambda_u / I0
-            with torch.no_grad():
-                model._lambda_u_raw.data.copy_(ws._lambda_u_raw.data)
-                model.I0.data.copy_(ws.I0.data)
-
             beh_t = ws.behaviour
             worm_data = {
                 "u_stage1":      ws.assemble_detached().detach(),
@@ -212,11 +205,6 @@ def main() -> None:
             import traceback
             print(f"[PostHoc]   FAILED for {ws.worm_id}: {exc}")
             traceback.print_exc()
-        finally:
-            # Always restore original shared-model params
-            with torch.no_grad():
-                model._lambda_u_raw.data.copy_(orig_lambda_u_raw)
-                model.I0.data.copy_(orig_I0)
 
     print(f"\n[PostHoc] All per-worm plots saved under {save_dir}")
 

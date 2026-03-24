@@ -18,6 +18,7 @@ __all__ = [
     "run_full_evaluation",
     "generate_multi_worm_plots",
     "plot_r2_three_metrics",
+    "plot_merged_summary_slide",
 ]
 
 _COL_DATA = "#2166ac"
@@ -177,16 +178,22 @@ def _compute_input_decomposition(
             _rms_per(dcv_all),
         ])
 
+    rms_gap = _rms(gap_all)
+    rms_sv = _rms(sv_all)
+    rms_dcv = _rms(dcv_all)
+    rms_net = float(np.sqrt(rms_gap**2 + rms_sv**2 + rms_dcv**2))
+
     summary = {
-        "Target\nresidual": _rms(target_resid),
-        "$\\lambda I_{gap}$": _rms(gap_all),
-        "$\\lambda I_{sv}$": _rms(sv_all),
-        "$\\lambda I_{dcv}$": _rms(dcv_all),
+        "AR(1) residual\n(network should explain)": _rms(target_resid),
+        "$\\lambda I_{gap}$": rms_gap,
+        "$\\lambda I_{sv}$": rms_sv,
+        "$\\lambda I_{dcv}$": rms_dcv,
     }
     stim_rms = _rms(stim_all)
     if stim_rms > 1e-12:
         summary["$\\lambda I_{stim}$"] = stim_rms
-    summary["Unexplained"] = _rms(unexplained)
+    summary["Network total"] = rms_net
+    summary["Model error\n(predicted \u2212 actual)"] = _rms(unexplained)
     return summary, per_neuron
 
 
@@ -546,7 +553,7 @@ def plot_summary_slide(
     decomp, per_neuron_rms = _compute_input_decomposition(model, data)
     labels_d = list(decomp.keys())
     vals_d = [decomp[k] for k in labels_d]
-    colours_d = [_COL_RAW, _COL_DATA, _COL_CV, _COL_FR, "#ff7f0e", "0.55"]
+    colours_d = [_COL_RAW, _COL_DATA, _COL_CV, _COL_FR, "#ff7f0e", "#333333", "0.55"]
     y_pos = np.arange(len(labels_d))
     ax.barh(y_pos, vals_d, color=colours_d[:len(vals_d)], alpha=0.8,
             edgecolor="white", height=0.65)
@@ -554,7 +561,7 @@ def plot_summary_slide(
         ax.text(v + max(vals_d) * 0.02, i, f"{v:.4g}", va="center",
                 fontsize=10)
     ax.set_yticks(y_pos)
-    ax.set_yticklabels(labels_d, fontsize=12)
+    ax.set_yticklabels(labels_d, fontsize=11)
     ax.invert_yaxis()
     _style(ax, xlabel="RMS", ylabel="", title="I. Input Decomposition")
 
@@ -607,6 +614,11 @@ def plot_summary_slide(
            title="K. Residual Autocorrelation")
 
     # L. Per-neuron network balance
+    # Each neuron's "target" is its AR(1) residual RMS — the signal the
+    # network must reproduce.  "Network" is the combined RMS of gap +
+    # SV + DCV currents that the model actually produces.  Ratio < 1
+    # means the network under-drives that neuron (amplitude too low);
+    # ratio > 1 means it over-drives (potential instability).
     ax = fig.add_subplot(gs[2, 3])
     # per_neuron_rms columns: [target_resid, gap, sv, dcv]
     tgt_rms_pn = per_neuron_rms[:, 0]
@@ -616,17 +628,21 @@ def plot_summary_slide(
     colors_ratio = np.where(ratio[order] <= 1.0, _COL_CV, _COL_RAW)
     ax.barh(np.arange(N), ratio[order], color=colors_ratio, alpha=0.6,
             height=1.0, edgecolor="none")
-    ax.axvline(1.0, color="0.3", lw=1.5, ls="--", label="balanced")
+    ax.axvline(1.0, color="0.3", lw=1.5, ls="--", label="ratio = 1 (balanced)")
+    med_ratio = float(np.median(ratio))
     n_over = int((ratio > 1.0).sum())
+    n_under = int((ratio < 0.1).sum())
     ax.text(0.97, 0.97,
-            f"{n_over}/{N} neurons\nnetwork > target",
-            transform=ax.transAxes, ha="right", va="top", fontsize=10,
+            f"median ratio = {med_ratio:.2f}\n"
+            f"{n_over}/{N} over-driven (>1)\n"
+            f"{n_under}/{N} near-silent (<0.1)",
+            transform=ax.transAxes, ha="right", va="top", fontsize=9,
             bbox=dict(boxstyle="round", fc="#f7f7f7", alpha=0.85))
     ax.set_yticks([])
-    ax.legend(frameon=False, fontsize=10)
-    _style(ax, xlabel="Network RMS / Target RMS",
+    ax.legend(frameon=False, fontsize=10, loc="lower right")
+    _style(ax, xlabel="Network RMS / AR(1) residual RMS",
            ylabel="Neurons (sorted)",
-           title="L. Per-Neuron Network Balance")
+           title="L. Per-Neuron Network Gain")
 
     a_sv_flat = a_sv_arr.ravel(); a_sv_flat = a_sv_flat[np.isfinite(a_sv_flat)]
     a_dcv_flat = a_dcv_arr.ravel(); a_dcv_flat = a_dcv_flat[np.isfinite(a_dcv_flat)]
@@ -878,7 +894,7 @@ def plot_prediction_traces(
 
 
 # =====================================================================
-# Ridge-CV diagnostics (alpha, behaviour decoder, summary)
+# Ridge-CV diagnostics (alpha, backbone, behaviour decoder)
 # =====================================================================
 
 def _run_alpha_cv_for_diagnostics(
@@ -888,11 +904,107 @@ def _run_alpha_cv_for_diagnostics(
 ) -> Optional[Dict[str, Any]]:
     try:
         from .train import ridge_cv_solve_alpha
-        result = ridge_cv_solve_alpha(model, data, cfg)
-        return result
+        return ridge_cv_solve_alpha(model, data, cfg)
     except Exception as e:
         get_stage2_logger().warning("alpha_cv_diag_failed", error=str(e))
         return None
+
+
+def _run_backbone_cv_for_diagnostics(
+    model: Stage2ModelPT,
+    data: Dict[str, Any],
+    cfg,
+) -> Optional[Dict[str, Any]]:
+    try:
+        from .train import backbone_cv_solve
+        return backbone_cv_solve(model, data, cfg)
+    except Exception as e:
+        get_stage2_logger().warning("backbone_cv_diag_failed", error=str(e))
+        return None
+
+
+def _plot_best_lambda_hist(ax, lambdas, at_upper, xlabel, title, color=None):
+    """Histogram of best ridge λ across neurons."""
+    if color is None:
+        color = _COL_DATA
+    valid_lam = lambdas[np.isfinite(lambdas)]
+    if len(valid_lam) == 0:
+        ax.text(0.5, 0.5, "No data", ha="center", va="center",
+                fontsize=13, transform=ax.transAxes)
+        _style(ax, title=title)
+        return
+    log_lam = np.log10(np.maximum(valid_lam, 1e-12))
+    ax.hist(log_lam, bins=30, color=color, alpha=0.7, edgecolor="white")
+    med_log = float(np.median(log_lam))
+    ax.axvline(med_log, color=_COL_RAW, lw=2, ls="--",
+               label=f"median={10**med_log:.2g}")
+    n_upper = int(at_upper.sum()) if at_upper is not None else 0
+    n_total = int(np.isfinite(lambdas).sum())
+    # Lower boundary count
+    n_lo = int((log_lam <= log_lam.min() + 0.01).sum()) if len(log_lam) > 0 else 0
+    ax.text(0.97, 0.97,
+            f"{n_total} neurons\n{n_upper} upper / {n_lo} lower",
+            transform=ax.transAxes, ha="right", va="top", fontsize=10,
+            bbox=dict(boxstyle="round", fc="#f7f7f7", alpha=0.85))
+    ax.legend(frameon=False, fontsize=10)
+    _style(ax, xlabel=xlabel, ylabel="Count", title=title)
+
+
+def _plot_fit_r2_bars(ax, fit_r2, title):
+    """Horizontal bar chart of per-neuron fit R²."""
+    valid_r2 = np.isfinite(fit_r2)
+    if valid_r2.sum() == 0:
+        ax.text(0.5, 0.5, "No data", ha="center", va="center",
+                fontsize=13, transform=ax.transAxes)
+        _style(ax, title=title)
+        return
+    r2_vals = fit_r2[valid_r2]
+    order = np.argsort(r2_vals)
+    colors_r2 = np.where(r2_vals[order] >= 0, _COL_CV, _COL_RAW)
+    ax.barh(np.arange(len(order)), r2_vals[order],
+            color=colors_r2, alpha=0.6, height=1.0, edgecolor="none")
+    ax.axvline(0, color="0.3", lw=1)
+    med_r2 = float(np.median(r2_vals))
+    ax.axvline(med_r2, color=_COL_DATA, lw=1.5, ls="--")
+    ax.text(0.97, 0.97,
+            f"median R²={med_r2:.3f}\n{int((r2_vals > 0).sum())}/{len(r2_vals)} > 0",
+            transform=ax.transAxes, ha="right", va="top", fontsize=10,
+            bbox=dict(boxstyle="round", fc="#f7f7f7", alpha=0.85))
+    ax.set_yticks([])
+    _style(ax, xlabel="R²", ylabel="Neurons (sorted)", title=title)
+
+
+def _plot_cv_mse_curves(ax, cv_mse_all, ridge_grid, lambdas, title,
+                        n_sample=15, color_map="viridis"):
+    """Sample CV-MSE curves coloured by fit quality."""
+    import matplotlib.pyplot as plt
+    if cv_mse_all is None or ridge_grid is None:
+        ax.text(0.5, 0.5, "No CV curves", ha="center", va="center",
+                fontsize=13, transform=ax.transAxes)
+        _style(ax, title=title)
+        return
+    valid_neurons = np.where(np.isfinite(lambdas))[0]
+    if len(valid_neurons) == 0:
+        ax.text(0.5, 0.5, "No valid neurons", ha="center", va="center",
+                fontsize=13, transform=ax.transAxes)
+        _style(ax, title=title)
+        return
+    n_sample = min(n_sample, len(valid_neurons))
+    idx_sample = np.linspace(0, len(valid_neurons) - 1, n_sample, dtype=int)
+    sample = valid_neurons[idx_sample]
+    cmap = plt.cm.get_cmap(color_map)(np.linspace(0, 1, len(sample)))
+    for ci, ni in enumerate(sample):
+        curve = cv_mse_all[ni]
+        finite = np.isfinite(curve)
+        if finite.sum() > 2:
+            ax.plot(ridge_grid[finite], curve[finite],
+                    color=cmap[ci], alpha=0.6, lw=1.2)
+            best_idx = np.nanargmin(curve)
+            ax.plot(ridge_grid[best_idx], curve[best_idx],
+                    "o", color=cmap[ci], markersize=4, alpha=0.8)
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    _style(ax, xlabel="Ridge λ", ylabel="CV-MSE", title=title)
 
 
 def plot_ridge_cv_diagnostics(
@@ -904,16 +1016,17 @@ def plot_ridge_cv_diagnostics(
     save_dir: str,
     cfg=None,
 ) -> None:
+    """Three-row Ridge-CV diagnostics: Alpha · Backbone · Behaviour."""
     import matplotlib.pyplot as plt
     from matplotlib.gridspec import GridSpec
 
     u_np = data["u_stage1"].cpu().numpy()
     T, N = u_np.shape
 
-    # ---- Run alpha ridge-CV to get diagnostics ----
+    # ---- Run both ridge-CV solvers for diagnostics ----
     alpha_diag = _run_alpha_cv_for_diagnostics(model, data, cfg)
+    backbone_diag = _run_backbone_cv_for_diagnostics(model, data, cfg)
 
-    # ---- Extract behaviour decoder ridge-CV diagnostics ----
     beh_cv_model = None
     beh_cv_gt = None
     if beh_results is not None:
@@ -921,147 +1034,37 @@ def plot_ridge_cv_diagnostics(
         beh_cv_gt = beh_results.get("ridge_cv_gt")
 
     fig = plt.figure(figsize=(30, 20))
-    gs = GridSpec(3, 4, hspace=0.42, wspace=0.38)
-
-    def _plot_alpha_best_regularization(ax) -> None:
-        if alpha_diag is not None:
-            lambdas_a = alpha_diag["lambdas"]
-            valid_lam = lambdas_a[np.isfinite(lambdas_a)]
-            at_upper = alpha_diag.get("at_upper_flags", np.zeros(N, dtype=bool))
-            if len(valid_lam) > 0:
-                log_lam = np.log10(np.maximum(valid_lam, 1e-12))
-                ax.hist(log_lam, bins=30, color=_COL_DATA, alpha=0.7,
-                        edgecolor="white")
-                med_log = float(np.median(log_lam))
-                ax.axvline(med_log, color=_COL_RAW, lw=2, ls="--",
-                           label=f"median={10**med_log:.2g}")
-                n_upper = int(at_upper.sum())
-                n_total = int(np.isfinite(lambdas_a).sum())
-                ax.text(0.97, 0.97,
-                        f"{n_total} neurons solved\n{n_upper} at upper boundary",
-                        transform=ax.transAxes, ha="right", va="top", fontsize=11,
-                        bbox=dict(boxstyle="round", fc="#f7f7f7", alpha=0.85))
-                ax.legend(frameon=False, fontsize=10)
-        else:
-            ax.text(0.5, 0.5, "No alpha CV", ha="center", va="center",
-                    fontsize=13, transform=ax.transAxes)
-        _style(ax, xlabel=r"$\log_{10}(\alpha)$", ylabel="Count",
-               title="A. Alpha CV: Best Ridge α")
-
-    def _plot_behavior_best_regularization(ax) -> None:
-        has_gt = beh_cv_gt is not None and beh_cv_gt.get("best_lambdas") is not None
-        has_model = beh_cv_model is not None and beh_cv_model.get("best_lambdas") is not None
-        if has_gt and has_model:
-            lam_gt = np.asarray(beh_cv_gt["best_lambdas"])
-            lam_mod = np.asarray(beh_cv_model["best_lambdas"])
-            n_modes = min(len(lam_gt), len(lam_mod))
-            x = np.arange(n_modes)
-            ax.plot(x - 0.1, np.maximum(lam_gt[:n_modes], 1e-12), marker="s", ls="none",
-                    label="GT", color=_COL_DATA, alpha=0.9)
-            ax.plot(x + 0.1, np.maximum(lam_mod[:n_modes], 1e-12), marker="o", ls="none",
-                    label="Model", color=_COL_CV, alpha=0.9)
-            ax.set_yscale("log")
-            ax.set_xticks(x)
-            ax.set_xticklabels([f"EW{i+1}" for i in range(n_modes)], fontsize=11)
-            ax.legend(frameon=False, fontsize=11)
-            at_upper_gt = beh_cv_gt.get("at_upper")
-            at_upper_mod = beh_cv_model.get("at_upper")
-            n_up = 0
-            if at_upper_gt is not None:
-                n_up += int(np.sum(at_upper_gt[:n_modes]))
-            if at_upper_mod is not None:
-                n_up += int(np.sum(at_upper_mod[:n_modes]))
-            if n_up > 0:
-                ax.text(0.97, 0.03, f"{n_up} at upper bound",
-                        transform=ax.transAxes, ha="right", va="bottom",
-                        fontsize=10, color=_COL_RAW)
-        elif has_model:
-            lam_mod = np.asarray(beh_cv_model["best_lambdas"])
-            n_modes = len(lam_mod)
-            x = np.arange(n_modes)
-            ax.plot(x, np.maximum(lam_mod, 1e-12), marker="o", ls="none",
-                    label="Model", color=_COL_CV, alpha=0.9)
-            ax.set_yscale("log")
-            ax.set_xticks(x)
-            ax.set_xticklabels([f"EW{i+1}" for i in range(n_modes)], fontsize=11)
-            ax.legend(frameon=False, fontsize=11)
-        else:
-            ax.text(0.5, 0.5, "No decoder data", ha="center", va="center",
-                    fontsize=13, transform=ax.transAxes)
-        _style(ax, xlabel="Eigenworm mode", ylabel="Best α",
-               title="B. Behaviour Decoder: Best Ridge α")
-
-    def _plot_alpha_cv_curves(ax) -> None:
-        if alpha_diag is not None and alpha_diag.get("cv_mse_all") is not None:
-            cv_mse_all = alpha_diag["cv_mse_all"]
-            ridge_grid = alpha_diag["ridge_grid"]
-            lambdas_a = alpha_diag["lambdas"]
-            valid_neurons = np.where(np.isfinite(lambdas_a))[0]
-            if len(valid_neurons) > 0:
-                fit_r2_a = alpha_diag["fit_r2"]
-                r2_valid = fit_r2_a[valid_neurons]
-                order_r2 = valid_neurons[np.argsort(r2_valid)]
-                n_sample = min(15, len(order_r2))
-                idx_sample = np.linspace(0, len(order_r2) - 1, n_sample, dtype=int)
-                sample_neurons = order_r2[idx_sample]
-                cmap = plt.cm.viridis(np.linspace(0, 1, len(sample_neurons)))
-                for ci, ni in enumerate(sample_neurons):
-                    curve = cv_mse_all[ni]
-                    finite = np.isfinite(curve)
-                    if finite.sum() > 2:
-                        ax.plot(ridge_grid[finite], curve[finite],
-                                color=cmap[ci], alpha=0.6, lw=1.2)
-                        best_idx = np.nanargmin(curve)
-                        ax.plot(ridge_grid[best_idx], curve[best_idx],
-                                "o", color=cmap[ci], markersize=4, alpha=0.8)
-                ax.set_xscale("log")
-                ax.set_yscale("log")
-        else:
-            ax.text(0.5, 0.5, "No alpha CV data\n(alpha_per_neuron off?)",
-                    ha="center", va="center", fontsize=13, transform=ax.transAxes)
-        _style(ax, xlabel="Ridge α", ylabel="CV-MSE",
-               title="H. Alpha CV: MSE Curves (sample neurons)")
+    gs = GridSpec(3, 4, hspace=0.45, wspace=0.38)
 
     # ================================================================
-    # Row 0: Best ridge-α summaries
+    # Row 0 – Alpha-CV  (synaptic amplitudes a_sv, a_dcv)
     # ================================================================
 
-    # ---- A. Best-α histogram across neurons --------------------------
+    # A. Best Ridge α histogram
     ax = fig.add_subplot(gs[0, 0])
-    _plot_alpha_best_regularization(ax)
-
-    # ---- B. Best-α comparison: behaviour decoder ----------------------
-    ax = fig.add_subplot(gs[0, 1])
-    _plot_behavior_best_regularization(ax)
-
-    # ---- C. Per-neuron fit R² -----------------------------------------
-    ax = fig.add_subplot(gs[0, 2])
-    if alpha_diag is not None and alpha_diag.get("fit_r2") is not None:
-        fit_r2_a = alpha_diag["fit_r2"]
-        valid_r2 = np.isfinite(fit_r2_a)
-        if valid_r2.sum() > 0:
-            r2_vals = fit_r2_a[valid_r2]
-            order = np.argsort(r2_vals)
-            colors_r2 = np.where(r2_vals[order] >= 0, _COL_CV, _COL_RAW)
-            ax.barh(np.arange(len(order)), r2_vals[order],
-                    color=colors_r2, alpha=0.6, height=1.0, edgecolor="none")
-            ax.axvline(0, color="0.3", lw=1)
-            med_r2 = float(np.median(r2_vals))
-            ax.axvline(med_r2, color=_COL_DATA, lw=1.5, ls="--")
-            ax.text(0.97, 0.97,
-                    f"median R²={med_r2:.3f}\n{int((r2_vals>0).sum())}/{len(r2_vals)} > 0",
-                    transform=ax.transAxes, ha="right", va="top", fontsize=11,
-                    bbox=dict(boxstyle="round", fc="#f7f7f7", alpha=0.85))
-            ax.set_yticks([])
+    if alpha_diag is not None:
+        _plot_best_lambda_hist(
+            ax, alpha_diag["lambdas"],
+            alpha_diag.get("at_upper_flags"),
+            xlabel=r"$\log_{10}(\alpha)$",
+            title="A. Alpha CV: Best Ridge α")
     else:
         ax.text(0.5, 0.5, "No alpha CV", ha="center", va="center",
                 fontsize=13, transform=ax.transAxes)
-    _style(ax, xlabel="R² (ridge fit → synaptic target)",
-           ylabel="Neurons (sorted)",
-           title="C. Alpha CV: Per-Neuron Fit Quality")
+        _style(ax, title="A. Alpha CV: Best Ridge α")
 
-    # ---- D. Coefficient heatmap (neurons × ranks) --------------------
-    ax = fig.add_subplot(gs[0, 3])
+    # B. Per-Neuron Fit R²
+    ax = fig.add_subplot(gs[0, 1])
+    if alpha_diag is not None and alpha_diag.get("fit_r2") is not None:
+        _plot_fit_r2_bars(ax, alpha_diag["fit_r2"],
+                          "B. Alpha CV: Per-Neuron Fit R²")
+    else:
+        ax.text(0.5, 0.5, "No alpha CV", ha="center", va="center",
+                fontsize=13, transform=ax.transAxes)
+        _style(ax, title="B. Alpha CV: Per-Neuron Fit R²")
+
+    # C. Coefficient heatmap (neurons × ranks)
+    ax = fig.add_subplot(gs[0, 2])
     if alpha_diag is not None:
         r_sv = model.r_sv
         r_dcv = model.r_dcv
@@ -1072,19 +1075,13 @@ def plot_ridge_cv_diagnostics(
             a_sv_np = np.tile(a_sv_np, (N, 1))
         if a_dcv_np.ndim == 1:
             a_dcv_np = np.tile(a_dcv_np, (N, 1))
-        # Combine SV and DCV side by side
-        combined = np.concatenate([a_sv_np, a_dcv_np], axis=1)  # (N, r_sv+r_dcv)
-        # Sort neurons by total amplitude
+        combined = np.concatenate([a_sv_np, a_dcv_np], axis=1)
         neuron_order = np.argsort(combined.sum(axis=1))[::-1]
         combined_sorted = combined[neuron_order]
-
         vmax = np.percentile(combined[combined > 0], 95) if (combined > 0).any() else 1.0
         im = ax.imshow(combined_sorted, aspect="auto", cmap="YlOrRd",
                        vmin=0, vmax=vmax, interpolation="nearest")
         ax.axvline(r_sv - 0.5, color="white", lw=2, ls="--")
-        ax.set_xlabel("Rank", fontsize=16)
-        ax.set_ylabel(f"Neurons (sorted, N={N})", fontsize=16)
-        # Label ranks
         rank_labels = [f"SV{i}" for i in range(r_sv)] + [f"DCV{i}" for i in range(r_dcv)]
         ax.set_xticks(np.arange(len(rank_labels)))
         ax.set_xticklabels(rank_labels, fontsize=9, rotation=45)
@@ -1092,14 +1089,92 @@ def plot_ridge_cv_diagnostics(
     else:
         ax.text(0.5, 0.5, "No alpha data", ha="center", va="center",
                 fontsize=13, transform=ax.transAxes)
-    _style(ax, xlabel="", ylabel="", title="D. Alpha Coefficients (sorted)")
+    _style(ax, xlabel="", ylabel=f"Neurons (sorted, N={N})",
+           title="C. Alpha Coefficients (sorted)")
+
+    # D. Alpha CV-MSE curves (sample neurons)
+    ax = fig.add_subplot(gs[0, 3])
+    if alpha_diag is not None:
+        _plot_cv_mse_curves(
+            ax, alpha_diag.get("cv_mse_all"), alpha_diag.get("ridge_grid"),
+            alpha_diag["lambdas"], "D. Alpha CV: MSE Curves",
+            color_map="viridis")
+    else:
+        ax.text(0.5, 0.5, "No alpha CV", ha="center", va="center",
+                fontsize=13, transform=ax.transAxes)
+        _style(ax, title="D. Alpha CV: MSE Curves")
 
     # ================================================================
-    # Row 1: Behaviour decoder CV
+    # Row 1 – Backbone-CV  (I0 + G scale)
+    # ================================================================
+
+    # E. Best Ridge λ histogram
+    ax = fig.add_subplot(gs[1, 0])
+    if backbone_diag is not None:
+        _plot_best_lambda_hist(
+            ax, backbone_diag["lambdas"],
+            backbone_diag.get("at_upper_flags"),
+            xlabel=r"$\log_{10}(\lambda)$",
+            title="E. Backbone CV: Best Ridge λ",
+            color="#2ca02c")
+    else:
+        ax.text(0.5, 0.5, "No backbone CV", ha="center", va="center",
+                fontsize=13, transform=ax.transAxes)
+        _style(ax, title="E. Backbone CV: Best Ridge λ")
+
+    # F. Backbone Per-Neuron Fit R²
+    ax = fig.add_subplot(gs[1, 1])
+    if backbone_diag is not None and backbone_diag.get("fit_r2") is not None:
+        _plot_fit_r2_bars(ax, backbone_diag["fit_r2"],
+                          "F. Backbone CV: Per-Neuron Fit R²")
+    else:
+        ax.text(0.5, 0.5, "No backbone CV", ha="center", va="center",
+                fontsize=13, transform=ax.transAxes)
+        _style(ax, title="F. Backbone CV: Per-Neuron Fit R²")
+
+    # G. Gap scales distribution
+    ax = fig.add_subplot(gs[1, 2])
+    if backbone_diag is not None and backbone_diag.get("gap_scales") is not None:
+        gs_vals = backbone_diag["gap_scales"]
+        valid_gs = gs_vals[np.isfinite(gs_vals)]
+        G_scale = backbone_diag.get("G_scale", np.nan)
+        if len(valid_gs) > 0:
+            ax.hist(valid_gs, bins=30, color="#2ca02c", alpha=0.7,
+                    edgecolor="white")
+            ax.axvline(G_scale, color=_COL_RAW, lw=2, ls="--",
+                       label=f"G median={G_scale:.4f}")
+            n_zero = int((valid_gs <= 1e-8).sum())
+            ax.text(0.97, 0.97,
+                    f"N={len(valid_gs)}\n{n_zero} near zero",
+                    transform=ax.transAxes, ha="right", va="top", fontsize=10,
+                    bbox=dict(boxstyle="round", fc="#f7f7f7", alpha=0.85))
+            ax.legend(frameon=False, fontsize=10)
+        else:
+            ax.text(0.5, 0.5, "All NaN", ha="center", va="center",
+                    fontsize=13, transform=ax.transAxes)
+    else:
+        ax.text(0.5, 0.5, "No backbone CV", ha="center", va="center",
+                fontsize=13, transform=ax.transAxes)
+    _style(ax, xlabel="Per-neuron gap scale", ylabel="Count",
+           title="G. Backbone CV: Gap Scales")
+
+    # H. Backbone CV-MSE curves (sample neurons)
+    ax = fig.add_subplot(gs[1, 3])
+    if backbone_diag is not None:
+        _plot_cv_mse_curves(
+            ax, backbone_diag.get("cv_mse_all"), backbone_diag.get("ridge_grid"),
+            backbone_diag["lambdas"], "H. Backbone CV: MSE Curves",
+            color_map="copper")
+    else:
+        ax.text(0.5, 0.5, "No backbone CV", ha="center", va="center",
+                fontsize=13, transform=ax.transAxes)
+        _style(ax, title="H. Backbone CV: MSE Curves")
+
+    # ================================================================
+    # Row 2 – Behaviour Decoder Ridge-CV
     # ================================================================
 
     def _plot_beh_cv_curves(ax, cv_dict, title_str):
-        """Plot CV-MSE curves for each eigenworm mode."""
         if cv_dict is None:
             ax.text(0.5, 0.5, "No decoder data", ha="center", va="center",
                     fontsize=13, transform=ax.transAxes)
@@ -1131,16 +1206,52 @@ def plot_ridge_cv_diagnostics(
         ax.legend(frameon=False, fontsize=9, ncol=2)
         _style(ax, xlabel="Ridge λ", ylabel="CV-MSE", title=title_str)
 
-    # ---- E. GT decoder CV-MSE -----------------------------------------
-    ax = fig.add_subplot(gs[1, 0])
-    _plot_beh_cv_curves(ax, beh_cv_gt, "E. GT Decoder CV-MSE")
+    # I. Best-α comparison: GT vs Model decoder
+    ax = fig.add_subplot(gs[2, 0])
+    has_gt = beh_cv_gt is not None and beh_cv_gt.get("best_lambdas") is not None
+    has_model = beh_cv_model is not None and beh_cv_model.get("best_lambdas") is not None
+    if has_gt or has_model:
+        if has_gt and has_model:
+            lam_gt = np.asarray(beh_cv_gt["best_lambdas"])
+            lam_mod = np.asarray(beh_cv_model["best_lambdas"])
+            n_modes = min(len(lam_gt), len(lam_mod))
+            x = np.arange(n_modes)
+            ax.plot(x - 0.1, np.maximum(lam_gt[:n_modes], 1e-12), marker="s",
+                    ls="none", label="GT", color=_COL_DATA, alpha=0.9)
+            ax.plot(x + 0.1, np.maximum(lam_mod[:n_modes], 1e-12), marker="o",
+                    ls="none", label="Model", color=_COL_CV, alpha=0.9)
+        elif has_model:
+            lam_mod = np.asarray(beh_cv_model["best_lambdas"])
+            n_modes = len(lam_mod)
+            x = np.arange(n_modes)
+            ax.plot(x, np.maximum(lam_mod, 1e-12), marker="o", ls="none",
+                    label="Model", color=_COL_CV, alpha=0.9)
+        else:
+            lam_gt = np.asarray(beh_cv_gt["best_lambdas"])
+            n_modes = len(lam_gt)
+            x = np.arange(n_modes)
+            ax.plot(x, np.maximum(lam_gt, 1e-12), marker="s", ls="none",
+                    label="GT", color=_COL_DATA, alpha=0.9)
+        ax.set_yscale("log")
+        ax.set_xticks(x)
+        ax.set_xticklabels([f"EW{i+1}" for i in range(n_modes)], fontsize=11)
+        ax.legend(frameon=False, fontsize=11)
+    else:
+        ax.text(0.5, 0.5, "No decoder data", ha="center", va="center",
+                fontsize=13, transform=ax.transAxes)
+    _style(ax, xlabel="Eigenworm mode", ylabel="Best α",
+           title="I. Decoder: Best Ridge α")
 
-    # ---- F. Model decoder CV-MSE --------------------------------------
-    ax = fig.add_subplot(gs[1, 1])
-    _plot_beh_cv_curves(ax, beh_cv_model, "F. Model Decoder CV-MSE")
+    # J. GT decoder CV-MSE
+    ax = fig.add_subplot(gs[2, 1])
+    _plot_beh_cv_curves(ax, beh_cv_gt, "J. GT Decoder CV-MSE")
 
-    # ---- G. Decoder CV-MSE at Best α (per mode) ----------------------
-    ax = fig.add_subplot(gs[1, 2])
+    # K. Model decoder CV-MSE
+    ax = fig.add_subplot(gs[2, 2])
+    _plot_beh_cv_curves(ax, beh_cv_model, "K. Model Decoder CV-MSE")
+
+    # L. Min CV-MSE at Best α (bar comparison)
+    ax = fig.add_subplot(gs[2, 3])
     has_gt_mse = beh_cv_gt is not None and beh_cv_gt.get("cv_mse_curves") is not None
     has_mod_mse = beh_cv_model is not None and beh_cv_model.get("cv_mse_curves") is not None
     if has_gt_mse or has_mod_mse:
@@ -1171,112 +1282,7 @@ def plot_ridge_cv_diagnostics(
         ax.text(0.5, 0.5, "No decoder CV data", ha="center", va="center",
                 fontsize=13, transform=ax.transAxes)
     _style(ax, xlabel="Eigenworm mode", ylabel="Min CV-MSE",
-           title="G. Decoder CV-MSE at Best α")
-
-    # ---- H. Sample alpha CV-MSE curves -------------------------------
-    ax = fig.add_subplot(gs[1, 3])
-    _plot_alpha_cv_curves(ax)
-
-    # ================================================================
-    # Row 2: Free Run Diagnostics
-    # ================================================================
-
-    r2_fr = free_run["r2"]
-    r2_os = onestep["r2"]
-    var_per = np.nanvar(u_np, axis=0)
-
-    from scipy.stats import spearmanr
-
-    # ---- I. Neuron Variance vs Free-run R² ----------------------
-    ax = fig.add_subplot(gs[2, 0])
-    valid = np.isfinite(var_per) & np.isfinite(r2_fr) & (var_per > 0)
-    if valid.sum() > 2:
-        ax.scatter(var_per[valid], r2_fr[valid], s=20, alpha=0.5, c=_COL_DATA, edgecolors="none")
-        ax.set_xscale("log")
-        ax.axhline(0, color="gray", lw=0.6, ls=":")
-        rho, pval = spearmanr(var_per[valid], r2_fr[valid])
-        ax.text(0.03, 0.97, f"ρ={rho:.2f}, p={pval:.2g}",
-                transform=ax.transAxes, ha="left", va="top", fontsize=11,
-                bbox=dict(boxstyle="round", fc="#f7f7f7", alpha=0.85))
-    _style(ax, xlabel="Neuron Variance (data)", ylabel="Free-run R²",
-           title="I. Variance vs Free-run R²")
-
-    # ---- J. One-step R² vs Free-run R² --------------------------------
-    ax = fig.add_subplot(gs[2, 1])
-    valid = np.isfinite(r2_os) & np.isfinite(r2_fr)
-    if valid.sum() > 2:
-        ax.scatter(r2_os[valid], r2_fr[valid], s=20, alpha=0.5, c=_COL_CV, edgecolors="none")
-        ax.axhline(0, color="gray", lw=0.6, ls=":")
-        ax.axvline(0, color="gray", lw=0.6, ls=":")
-        mn = min(np.nanmin(r2_os[valid]), np.nanmin(r2_fr[valid]))
-        mx = max(np.nanmax(r2_os[valid]), np.nanmax(r2_fr[valid]))
-        ax.plot([mn, mx], [mn, mx], "k--", alpha=0.3, zorder=-1)
-        rho, pval = spearmanr(r2_os[valid], r2_fr[valid])
-        ax.text(0.03, 0.97, f"ρ={rho:.2f}, p={pval:.2g}",
-                transform=ax.transAxes, ha="left", va="top", fontsize=11,
-                bbox=dict(boxstyle="round", fc="#f7f7f7", alpha=0.85))
-    _style(ax, xlabel="One-step R²", ylabel="Free-run R²",
-           title="J. One-step R² vs Free-run R²")
-
-    # ---- K. Boundary hit summary (stacked bar) -----------------------
-    ax = fig.add_subplot(gs[2, 2])
-    cv_types = []
-    n_interior_list, n_upper_list, n_zero_list = [], [], []
-
-    if alpha_diag is not None:
-        lam_a = alpha_diag["lambdas"]
-        at_up_a = alpha_diag.get("at_upper_flags", np.zeros(N, dtype=bool))
-        n_solved = int(np.isfinite(lam_a).sum())
-        n_up = int(at_up_a.sum())
-        # Check at lower boundary (λ = smallest grid value)
-        rg = alpha_diag.get("ridge_grid")
-        n_lo = 0
-        if rg is not None and n_solved > 0:
-            lo_thresh = float(rg[0]) * 1.01
-            n_lo = int((lam_a[np.isfinite(lam_a)] <= lo_thresh).sum())
-        n_interior = n_solved - n_up - n_lo
-        cv_types.append("Alpha\n(per-neuron)")
-        n_interior_list.append(max(n_interior, 0))
-        n_upper_list.append(n_up)
-        n_zero_list.append(n_lo)
-
-    if cv_types:
-        x_k = np.arange(len(cv_types))
-        w_k = 0.5
-        ax.bar(x_k, n_interior_list, w_k, label="Interior", color=_COL_CV, alpha=0.75)
-        ax.bar(x_k, n_upper_list, w_k, bottom=n_interior_list, label="At upper",
-               color=_COL_RAW, alpha=0.75)
-        bottoms = [a + b for a, b in zip(n_interior_list, n_upper_list)]
-        ax.bar(x_k, n_zero_list, w_k, bottom=bottoms, label="At lower",
-               color="0.6", alpha=0.75)
-        ax.set_xticks(x_k)
-        ax.set_xticklabels(cv_types, fontsize=10)
-        ax.legend(frameon=False, fontsize=9)
-    else:
-        ax.text(0.5, 0.5, "No boundary data", ha="center", va="center",
-                fontsize=13, transform=ax.transAxes)
-    _style(ax, xlabel="", ylabel="Neurons",
-           title="K. Boundary Hit Summary")
-
-    # ---- L. Alpha λ vs one-step prediction error -----------------------
-    ax = fig.add_subplot(gs[2, 3])
-    if alpha_diag is not None:
-        lam_a = alpha_diag["lambdas"]
-        valid_l = np.isfinite(lam_a) & np.isfinite(r2_os)
-        if valid_l.sum() > 2:
-            ax.scatter(np.log10(np.maximum(lam_a[valid_l], 1e-12)),
-                       r2_os[valid_l], s=20, alpha=0.5, c=_COL_DATA,
-                       edgecolors="none")
-            rho, pval = spearmanr(lam_a[valid_l], r2_os[valid_l])
-            ax.text(0.03, 0.97, f"ρ={rho:.2f}, p={pval:.2g}",
-                    transform=ax.transAxes, ha="left", va="top", fontsize=11,
-                    bbox=dict(boxstyle="round", fc="#f7f7f7", alpha=0.85))
-    else:
-        ax.text(0.5, 0.5, "No alpha data", ha="center", va="center",
-                fontsize=13, transform=ax.transAxes)
-    _style(ax, xlabel=r"$\log_{10}(\alpha)$", ylabel="One-step R²",
-           title="L. Ridge α vs One-step R²")
-
+           title="L. Decoder: Min CV-MSE at Best α")
 
     fig.suptitle("Ridge-CV Diagnostics", fontsize=28,
                  fontweight="bold", y=1.01)
@@ -1324,7 +1330,456 @@ def generate_eval_loo_plots(
     return {
         "beh": beh,
         "beh_r2_model": results.get("beh_r2_model"),
+        "onestep": onestep,
+        "loo": loo,
+        "free_run": free_run,
+        "beh_all": beh_all,
     }
+
+
+# ======================================================================= #
+#  Merged (all-worms) summary slide                                       #
+# ======================================================================= #
+
+def plot_merged_summary_slide(
+    model: Stage2ModelPT,
+    worm_entries: list,
+    epoch_losses: list,
+    save_dir: str,
+    cfg=None,
+    include_rollout: bool = True,
+) -> None:
+    """All-worms-merged 12-panel summary.
+
+    Pools per-neuron R² across worms into joint histograms, averages
+    behaviour decoding and input-decomposition, and overlays per-worm
+    multistep rollout curves.  Model-level panels (training convergence,
+    kernel amplitudes, network trajectories) are unchanged.
+
+    Parameters
+    ----------
+    worm_entries : list of (worm_id, worm_data, eval_results)
+        Each *eval_results* is the dict returned by
+        ``generate_eval_loo_plots`` (must contain ``onestep``, ``loo``,
+        ``free_run``, and optionally ``beh`` / ``beh_all``).
+    include_rollout : bool
+        If *True* (default), compute and overlay per-worm multistep
+        rollout curves (panel F).  Set to *False* to skip the
+        moderately-expensive rollout computation.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.gridspec import GridSpec
+
+    if not worm_entries:
+        return
+
+    setup_plot_style()
+    Path(save_dir).mkdir(parents=True, exist_ok=True)
+
+    n_worms = len(worm_entries)
+    worm_ids = [e[0] for e in worm_entries]
+    worm_cols = plt.cm.tab10(np.linspace(0, 0.9, max(n_worms, 2)))[:n_worms]
+
+    # Resolve per-worm R² -----------------------------------------------
+    _metric_keys = ("onestep", "loo", "free_run")
+    per_worm_r2 = {k: [] for k in _metric_keys}          # list-of-arrays
+    for _, _, res in worm_entries:
+        for k in _metric_keys:
+            per_worm_r2[k].append(res[k]["r2"])
+    pooled_r2 = {k: np.concatenate(per_worm_r2[k]) for k in _metric_keys}
+
+    # First worm's dt (should be identical across worms)
+    dt = float(worm_entries[0][1].get("dt", 0.6))
+
+    # -------------------------------------------------------------------
+    fig = plt.figure(figsize=(24, 14))
+    gs = GridSpec(3, 4, hspace=0.42, wspace=0.38)
+
+    # ── A. Training Convergence ────────────────────────────────────────
+    ax = fig.add_subplot(gs[0, 0])
+    _epoch_losses = epoch_losses or []
+    if _epoch_losses:
+        epochs = np.arange(1, len(_epoch_losses) + 1)
+        ax.plot(epochs, [e["dynamics"] for e in _epoch_losses],
+                color=_COL_DATA, lw=2.2, label="Dynamics")
+        ax.plot(epochs, [e["total"] for e in _epoch_losses],
+                color=_COL_RAW, lw=1.8, alpha=0.8, label="Total")
+        if any(e.get("behaviour_loss") is not None for e in _epoch_losses):
+            beh_loss = [e.get("behaviour_loss", np.nan) for e in _epoch_losses]
+            ax.plot(epochs, beh_loss, color=_COL_CV, lw=1.6, alpha=0.8,
+                    label="Behaviour")
+        ax.set_yscale("log")
+        _style(ax, xlabel="Epoch", ylabel="Loss",
+               title="A. Training Convergence")
+        ax.legend(frameon=False, fontsize=12, ncol=1)
+    else:
+        ax.axis("off")
+        ax.text(0.5, 0.5, "No training history",
+                ha="center", va="center", fontsize=14)
+
+    # ── B / C / D.  Pooled R² histograms ──────────────────────────────
+    _hist_meta = [
+        ("onestep",  _COL_DATA, "One-step R\u00b2", "B. One-step R\u00b2 (all worms)"),
+        ("loo",      _COL_CV,   "LOO R\u00b2",      "C. LOO R\u00b2 (all worms)"),
+        ("free_run", _COL_FR,   "Free-run R\u00b2",  "D. Free-run R\u00b2 (all worms)"),
+    ]
+    for col, (key, color, xlabel_txt, title_txt) in enumerate(_hist_meta, start=1):
+        ax = fig.add_subplot(gs[0, col])
+        all_valid = pooled_r2[key][np.isfinite(pooled_r2[key])]
+        if all_valid.size > 0:
+            bins = np.linspace(min(all_valid.min(), -0.1),
+                               max(all_valid.max(), 1.0), 30)
+            per_worm_vals = [
+                r2[np.isfinite(r2)] for r2 in per_worm_r2[key]
+            ]
+            ax.hist(per_worm_vals, bins=bins, stacked=True,
+                    color=worm_cols[:n_worms], alpha=0.75,
+                    edgecolor="white", label=worm_ids)
+            overall_med = float(np.nanmedian(all_valid))
+            ax.axvline(overall_med, color="k", lw=2, ls="--",
+                       label=f"median={overall_med:.3f}")
+            for wi, r2_w in enumerate(per_worm_vals):
+                if r2_w.size:
+                    ax.axvline(float(np.median(r2_w)),
+                               color=worm_cols[wi], lw=1.2, ls=":",
+                               alpha=0.8)
+            ncol = 1 if n_worms <= 4 else 2
+            ax.legend(frameon=False, fontsize=8, loc="upper left",
+                      ncol=ncol)
+        _style(ax, xlabel=xlabel_txt, ylabel="Count", title=title_txt)
+
+    # ── E. Behaviour Decoding (mean across worms) ─────────────────────
+    ax = fig.add_subplot(gs[1, 0])
+    beh_list = [(e[0], e[2].get("beh"), e[2].get("beh_all"))
+                for e in worm_entries]
+    has_any_beh = any(b is not None for _, b, _ in beh_list)
+    if has_any_beh:
+        n_modes = 5
+        all_r2_motor, all_r2_model, all_r2_ar1, all_r2_all = [], [], [], []
+        for _, beh, beh_all in beh_list:
+            if beh is None:
+                continue
+            all_r2_motor.append(beh.get("r2_gt",    np.full(6, np.nan))[:n_modes])
+            all_r2_model.append(beh.get("r2_model", np.full(6, np.nan))[:n_modes])
+            all_r2_ar1.append(beh.get("r2_ar1",   np.full(6, np.nan))[:n_modes])
+            if beh_all is not None and "r2_all_neurons" in beh_all:
+                all_r2_all.append(beh_all["r2_all_neurons"][:n_modes])
+        x = np.arange(n_modes)
+        has_all = len(all_r2_all) > 0
+        has_ar1 = (len(all_r2_ar1) > 0
+                   and any(np.any(np.isfinite(a)) for a in all_r2_ar1))
+        n_bars = 2 + int(has_all) + int(has_ar1)
+        w = 0.8 / n_bars
+        offsets = np.linspace(-(n_bars - 1) * w / 2,
+                              (n_bars - 1) * w / 2, n_bars)
+
+        def _ms(arrs):
+            return (np.nanmean(np.stack(arrs), axis=0) if arrs
+                    else np.full(n_modes, np.nan))
+
+        bi = 0
+        if has_all:
+            ax.bar(x + offsets[bi], _ms(all_r2_all), w,
+                   label="All neurons (GT)", color=_COL_DATA, alpha=0.75)
+            bi += 1
+        ax.bar(x + offsets[bi], _ms(all_r2_motor), w,
+               label="Motor neurons (GT)", color=_COL_RAW, alpha=0.75)
+        bi += 1
+        if has_ar1:
+            ax.bar(x + offsets[bi], _ms(all_r2_ar1), w,
+                   label="AR(1) baseline", color="orange", alpha=0.75)
+            bi += 1
+        ax.bar(x + offsets[bi], _ms(all_r2_model), w,
+               label=f"Model (mean, n={len(all_r2_model)})",
+               color=_COL_CV, alpha=0.75)
+        ax.set_xticks(x)
+        ax.set_xticklabels([f"EW{i+1}" for i in range(n_modes)],
+                           fontsize=10)
+        ax.legend(frameon=False, fontsize=9, loc="upper right")
+        _style(ax, xlabel="Eigenworm", ylabel="R\u00b2",
+               title="E. Behaviour Decoding (mean)")
+    else:
+        ax.axis("off")
+        ax.text(0.5, 0.5, "No behaviour",
+                ha="center", va="center", fontsize=14)
+
+    # ── F. Multistep Rollout (per-worm + average) ─────────────────────
+    ax = fig.add_subplot(gs[1, 1])
+    steps_list = (1, 5, 10, 20)
+    device = next(model.parameters()).device
+    N = model.N
+
+    if include_rollout:
+        worm_rollout_meds: list[list[float]] = []
+        for wi, (wid, wdata, _) in enumerate(worm_entries):
+            u = wdata["u_stage1"].to(device)
+            T_w = u.shape[0]
+            gating = wdata.get("gating")
+            stim_w = wdata.get("stim")
+            g_def = (torch.ones(N, device=device)
+                     if gating is None else None)
+            u_np = u.cpu().numpy()
+
+            with torch.no_grad():
+                s_sv_a = torch.zeros(T_w, N, model.r_sv, device=device)
+                s_dcv_a = torch.zeros(T_w, N, model.r_dcv, device=device)
+                s_sv_t = torch.zeros(N, model.r_sv, device=device)
+                s_dcv_t = torch.zeros(N, model.r_dcv, device=device)
+                for t in range(T_w):
+                    s_sv_a[t], s_dcv_a[t] = s_sv_t, s_dcv_t
+                    g = gating[t] if gating is not None else g_def
+                    s = stim_w[t] if stim_w is not None else None
+                    _, s_sv_t, s_dcv_t = model.prior_step(
+                        u[t], s_sv_t, s_dcv_t, g, s)
+
+            meds_w: list[float] = []
+            for K in steps_list:
+                stride = max(1, K // 2)
+                preds = np.zeros_like(u_np)
+                counts = np.zeros(T_w)
+                with torch.no_grad():
+                    for t0 in range(0, T_w - K, stride):
+                        u_t = u[t0]
+                        sv_r = s_sv_a[t0].clone()
+                        dcv_r = s_dcv_a[t0].clone()
+                        for k in range(1, K + 1):
+                            g = (gating[t0 + k - 1]
+                                 if gating is not None else g_def)
+                            s = (stim_w[t0 + k - 1]
+                                 if stim_w is not None else None)
+                            u_t, sv_r, dcv_r = model.prior_step(
+                                u_t, sv_r, dcv_r, g, s)
+                        preds[t0 + K] += u_t.cpu().numpy()
+                        counts[t0 + K] += 1
+                v = counts > 0
+                preds[v] /= counts[v, None]
+                r2_k = np.array([_r2(u_np[v, i], preds[v, i])
+                                 for i in range(N)])
+                meds_w.append(float(np.nanmedian(r2_k)))
+            worm_rollout_meds.append(meds_w)
+            ax.plot(steps_list, meds_w, color=worm_cols[wi], marker="o",
+                    ls="--", lw=1.2, markersize=4, alpha=0.65,
+                    label=wid)
+
+        avg_roll = np.nanmean(worm_rollout_meds, axis=0)
+        ax.plot(steps_list, avg_roll, color="k", marker="s", ls="-",
+                lw=2.5, markersize=7, label="Mean")
+    else:
+        ax.text(0.5, 0.5, "Rollout skipped",
+                ha="center", va="center", fontsize=14,
+                transform=ax.transAxes)
+    ax.axhline(0, color="gray", lw=0.8, ls=":")
+    ax.legend(frameon=False, fontsize=9)
+    _style(ax, xlabel="Horizon K (steps)", ylabel="Median R\u00b2",
+           title="F. Multistep Rollout (all worms)")
+
+    # ── G / H. Kernel Amplitudes (model-level) ────────────────────────
+    with torch.no_grad():
+        a_sv_arr = (model.a_sv.detach().cpu().numpy()
+                    if model.r_sv > 0 else np.empty((0, 0)))
+        a_dcv_arr = (model.a_dcv.detach().cpu().numpy()
+                     if model.r_dcv > 0 else np.empty((0, 0)))
+        tau_sv_arr = (model.tau_sv.detach().cpu().numpy()
+                      if model.r_sv > 0 else np.array([]))
+        tau_dcv_arr = (model.tau_dcv.detach().cpu().numpy()
+                       if model.r_dcv > 0 else np.array([]))
+    if a_sv_arr.ndim == 1:
+        a_sv_arr = a_sv_arr[np.newaxis, :]
+    if a_dcv_arr.ndim == 1:
+        a_dcv_arr = a_dcv_arr[np.newaxis, :]
+
+    gs_gh = gs[1, 2:].subgridspec(2, 1, hspace=0.50)
+    for panel_i, (a_arr, tau_arr, syn_lbl, syn_col) in enumerate([
+        (a_sv_arr, tau_sv_arr, "SV", _COL_DATA),
+        (a_dcv_arr, tau_dcv_arr, "DCV", _COL_CV),
+    ]):
+        ax = fig.add_subplot(gs_gh[panel_i, 0])
+        r = a_arr.shape[1] if a_arr.size else 0
+        if r == 0:
+            ax.text(0.5, 0.5, f"No {syn_lbl} ranks",
+                    ha="center", va="center",
+                    transform=ax.transAxes, fontsize=12)
+            ax.set_axis_off()
+            continue
+        for ri in range(r):
+            col_data = a_arr[:, ri]
+            col_data = col_data[np.isfinite(col_data)]
+            if col_data.size == 0:
+                continue
+            jit = (np.linspace(-0.16, 0.16, col_data.size)
+                   if col_data.size > 1 else np.array([0.0]))
+            ax.scatter(ri + 1 + jit, col_data, s=14, color=syn_col,
+                       alpha=0.28, linewidths=0, zorder=2)
+            q25, med, q75 = np.percentile(col_data, [25, 50, 75])
+            ax.vlines(ri + 1, q25, q75, color="0.15", lw=4.0, zorder=3)
+        fp = np.concatenate([
+            a_arr[:, ri][a_arr[:, ri] > 0]
+            for ri in range(r) if np.any(a_arr[:, ri] > 0)
+        ]) if r > 0 else np.array([])
+        if fp.size > 0 and fp.max() > fp.min():
+            ax.set_yscale("log")
+            ax.set_ylim(fp.min() / 1.35, fp.max() * 1.35)
+        ax.grid(axis="y", alpha=0.18, lw=0.8)
+        tick_labels = []
+        for ri in range(r):
+            tau_r = float(tau_arr[ri]) if ri < len(tau_arr) else 0
+            col_data = a_arr[:, ri]
+            col_data = col_data[np.isfinite(col_data)]
+            med_r = float(np.median(col_data)) if col_data.size else 0
+            tick_labels.append(f"\u03c4={tau_r:.1f}s\n{med_r:.2e}")
+        ax.set_xticks(range(1, r + 1))
+        ax.set_xticklabels(tick_labels, fontsize=9)
+        ylabel = ("\u03b1 (log)" if fp.size > 0 and fp.max() > fp.min()
+                  else "\u03b1")
+        title_str = "G. Kernel Amplitudes" if panel_i == 0 else ""
+        _style(ax, xlabel="", ylabel=f"{syn_lbl}  {ylabel}",
+               title=title_str)
+
+    # ── Row 2: per-worm averaged diagnostics ───────────────────────────
+
+    # Compute input-decomposition and residual data per worm
+    decomp_per_worm: list[Dict[str, float]] = []
+    pn_rms_per_worm: list[np.ndarray] = []
+    resid_per_worm: list[np.ndarray] = []
+    T_max = 0
+    for _, wdata, res in worm_entries:
+        decomp, pn_rms = _compute_input_decomposition(model, wdata)
+        decomp_per_worm.append(decomp)
+        pn_rms_per_worm.append(pn_rms)
+        mu_os = res["onestep"].get("prior_mu")
+        u_np = wdata["u_stage1"].cpu().numpy()
+        if mu_os is not None:
+            mu_np = (mu_os.cpu().numpy() if isinstance(mu_os, torch.Tensor)
+                     else mu_os)
+            resid_per_worm.append(u_np - mu_np)
+        T_max = max(T_max, u_np.shape[0])
+
+    # I. Input Decomposition (averaged RMS across worms)
+    ax = fig.add_subplot(gs[2, 0])
+    all_keys = list(decomp_per_worm[0].keys())
+    avg_vals = []
+    for key in all_keys:
+        vals = [d.get(key, 0.0) for d in decomp_per_worm]
+        avg_vals.append(float(np.mean(vals)))
+    colours_d = [_COL_RAW, _COL_DATA, _COL_CV, _COL_FR, "#ff7f0e", "#333333", "0.55"]
+    y_pos = np.arange(len(all_keys))
+    ax.barh(y_pos, avg_vals,
+            color=colours_d[:len(avg_vals)], alpha=0.8,
+            edgecolor="white", height=0.65)
+    for i, v in enumerate(avg_vals):
+        ax.text(v + max(avg_vals) * 0.02, i, f"{v:.4g}",
+                va="center", fontsize=10)
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(all_keys, fontsize=11)
+    ax.invert_yaxis()
+    _style(ax, xlabel="RMS (mean across worms)", ylabel="",
+           title="I. Input Decomposition")
+
+    # J. Network Strength Trajectories
+    ax = fig.add_subplot(gs[2, 1])
+    if _epoch_losses and "G" in _epoch_losses[0]:
+        ep_x = np.arange(1, len(_epoch_losses) + 1)
+        G_hist = np.asarray([e.get("G", np.nan) for e in _epoch_losses],
+                            dtype=float)
+        a_sv_h = np.asarray([e.get("a_sv_rms", np.nan)
+                             for e in _epoch_losses], dtype=float)
+        a_dcv_h = np.asarray([e.get("a_dcv_rms", np.nan)
+                              for e in _epoch_losses], dtype=float)
+        if np.any(np.isfinite(G_hist) & (G_hist > 0)):
+            ax.plot(ep_x, G_hist, color=_COL_RAW, lw=2.4, label="G")
+        if np.any(np.isfinite(a_sv_h) & (a_sv_h > 0)):
+            ax.plot(ep_x, a_sv_h, color=_COL_DATA, lw=2.2,
+                    label="\u03b1_sv RMS")
+        if np.any(np.isfinite(a_dcv_h) & (a_dcv_h > 0)):
+            ax.plot(ep_x, a_dcv_h, color=_COL_CV, lw=2.2,
+                    label="\u03b1_dcv RMS")
+        all_v = np.concatenate([G_hist, a_sv_h, a_dcv_h])
+        pos_v = all_v[np.isfinite(all_v) & (all_v > 0)]
+        if pos_v.size > 0:
+            ax.set_yscale("log")
+            ax.set_ylim(pos_v.min() / 1.5, pos_v.max() * 1.5)
+        ax.grid(axis="y", alpha=0.18, lw=0.8)
+        ax.legend(frameon=False, fontsize=9, loc="best")
+    else:
+        ax.text(0.5, 0.5, "No network history",
+                ha="center", va="center", fontsize=14,
+                transform=ax.transAxes)
+    _style(ax, xlabel="Epoch", ylabel="Strength (log)",
+           title="J. Network Strength Trajectories")
+
+    # K. Residual Autocorrelation (averaged across worms)
+    ax = fig.add_subplot(gs[2, 2])
+    if resid_per_worm:
+        acfs = [_residual_acf(r, max_lag=20) for r in resid_per_worm]
+        avg_acf = np.nanmean(acfs, axis=0)
+        lags = np.arange(1, len(avg_acf) + 1)
+        ax.bar(lags, avg_acf, color=_COL_DATA, alpha=0.7,
+               edgecolor="white")
+        ax.axhline(0, color="gray", lw=0.8, ls=":")
+        ci = 1.96 / np.sqrt(T_max)
+        ax.axhline(ci, color=_COL_RAW, lw=1, ls="--", alpha=0.5)
+        ax.axhline(-ci, color=_COL_RAW, lw=1, ls="--", alpha=0.5,
+                   label=f"95% CI")
+        ax.legend(frameon=False, fontsize=10)
+    _style(ax, xlabel="Lag (steps)", ylabel="Autocorrelation",
+           title="K. Residual ACF (mean)")
+
+    # L. Per-Neuron Network Gain (pooled across worms)
+    # Ratio < 1 = network under-drives neuron; > 1 = over-drives.
+    ax = fig.add_subplot(gs[2, 3])
+    pn_all = np.concatenate(pn_rms_per_worm, axis=0)
+    tgt_rms = pn_all[:, 0]
+    net_rms = pn_all[:, 1] + pn_all[:, 2] + pn_all[:, 3]
+    ratio = np.where(tgt_rms > 1e-12, net_rms / tgt_rms, 0.0)
+    order = np.argsort(ratio)
+    colors_ratio = np.where(ratio[order] <= 1.0, _COL_CV, _COL_RAW)
+    n_total = len(ratio)
+    ax.barh(np.arange(n_total), ratio[order], color=colors_ratio,
+            alpha=0.6, height=1.0, edgecolor="none")
+    ax.axvline(1.0, color="0.3", lw=1.5, ls="--", label="ratio = 1 (balanced)")
+    med_ratio = float(np.median(ratio))
+    n_over = int((ratio > 1.0).sum())
+    n_under = int((ratio < 0.1).sum())
+    ax.text(0.97, 0.97,
+            f"median ratio = {med_ratio:.2f}\n"
+            f"{n_over}/{n_total} over-driven (>1)\n"
+            f"{n_under}/{n_total} near-silent (<0.1)",
+            transform=ax.transAxes, ha="right", va="top", fontsize=9,
+            bbox=dict(boxstyle="round", fc="#f7f7f7", alpha=0.85))
+    ax.set_yticks([])
+    ax.legend(frameon=False, fontsize=10, loc="lower right")
+    _style(ax, xlabel="Network RMS / AR(1) residual RMS",
+           ylabel="Neurons (sorted, pooled)",
+           title="L. Per-Neuron Network Gain")
+
+    # ── Suptitle & info ribbon ─────────────────────────────────────────
+    with torch.no_grad():
+        G_raw = model.G.cpu().numpy()
+        G_val = (G_raw[model.T_e.cpu().numpy() > 0].mean()
+                 if G_raw.ndim > 0 and G_raw.size > 1
+                 else float(G_raw))
+    G_txt = (f"{float(G_val):.6g}" if np.ndim(G_val) == 0
+             else f"mean={np.mean(G_val):.4f}")
+    n_ep = len(_epoch_losses)
+    med_os  = float(np.nanmedian(
+        pooled_r2["onestep"][np.isfinite(pooled_r2["onestep"])]))
+    med_loo = float(np.nanmedian(
+        pooled_r2["loo"][np.isfinite(pooled_r2["loo"])]))
+    med_fr  = float(np.nanmedian(
+        pooled_r2["free_run"][np.isfinite(pooled_r2["free_run"])]))
+
+    info = (f"{n_worms} worms  N={N}  G={G_txt}  epochs={n_ep}  "
+            f"one-step={med_os:.3f}  LOO={med_loo:.3f}  "
+            f"free-run={med_fr:.3f}")
+    fig.text(0.99, 0.995, info, ha="right", va="top", fontsize=11,
+             bbox=dict(boxstyle="round", fc="#f0f0f0", alpha=0.8))
+    fig.suptitle("Stage 2 Merged Evaluation (all worms)",
+                 fontsize=26, fontweight="bold", y=1.01)
+
+    _save_png(fig, save_dir, "00_merged_summary.png", bbox_inches="tight")
+    import matplotlib.pyplot as plt
+    plt.close(fig)
+    print(f"[MultiWorm] 00_merged_summary.png  \u2713")
 
 
 # ======================================================================= #

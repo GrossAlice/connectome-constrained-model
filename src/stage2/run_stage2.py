@@ -18,6 +18,9 @@ def main(argv: list[str] | None = None) -> None:
                         help="torch device (default: from config, usually cuda)")
     parser.add_argument("--show", action="store_true",
                         help="Display plots interactively")
+    parser.add_argument("--set", nargs=2, action="append", metavar=("KEY", "VALUE"),
+                        default=[], dest="overrides",
+                        help="Override config key with value, e.g. --set stim_kernel_len 20")
     args = parser.parse_args(argv)
 
     h5_list = args.h5_path or []
@@ -29,6 +32,19 @@ def main(argv: list[str] | None = None) -> None:
     if is_multi:
         extra_kw["multi_worm"] = True
         extra_kw["h5_paths"] = tuple(h5_list)
+
+    # Parse --set overrides: attempt int, then float, then bool, else str
+    for key, val in args.overrides:
+        for converter in (int, float):
+            try:
+                val = converter(val)
+                break
+            except ValueError:
+                continue
+        else:
+            if val.lower() in ("true", "false"):
+                val = val.lower() == "true"
+        extra_kw[key] = val
 
     cfg = make_config(h5_list[0] if h5_list else "", **extra_kw)
 

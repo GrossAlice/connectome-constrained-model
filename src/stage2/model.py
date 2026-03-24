@@ -8,9 +8,8 @@ from typing import Optional
 _G_INIT = 0.01
 _G_MAX  = 2.0
 
-#    E overwritten by init_reversals, W starts at neutral 1.0) ───────────────────
-_A_SV_MAX  = 2.0
-_A_DCV_MAX = 2.0
+_A_SV_MAX  = 10.0
+_A_DCV_MAX = 10.0
 _W_SV_INIT = 1.0
 _W_DCV_INIT = 1.0
 _E_SV_EXC_INIT = 0.1
@@ -69,14 +68,16 @@ class Stage2ModelPT(nn.Module):
     def __init__(self, N: int, T_e: torch.Tensor, T_sv: torch.Tensor,
                  T_dcv: torch.Tensor, dt: float, cfg, device: torch.device,
                  d_ell: int = 0, lambda_u_init: Optional[torch.Tensor] = None,
-                 sign_t: Optional[torch.Tensor] = None, logger=None) -> None:
+                 sign_t: Optional[torch.Tensor] = None) -> None:
         super().__init__()
-        self.logger, self.N, self.dt, self.d_ell = logger, N, float(dt), d_ell
+        self.N, self.dt, self.d_ell = N, float(dt), d_ell
         self.r_sv  = len(cfg.tau_sv_init)  if hasattr(cfg, 'tau_sv_init')  else int(getattr(cfg, 'r_sv', 0))
         self.r_dcv = len(cfg.tau_dcv_init) if hasattr(cfg, 'tau_dcv_init') else int(getattr(cfg, 'r_dcv', 0))
         self.u_clip = (getattr(cfg, "u_next_clip_min", -35.0),
                        getattr(cfg, "u_next_clip_max", 35.0))
-        self.alpha_per_neuron = bool(getattr(cfg, "alpha_per_neuron", False))
+        self.alpha_per_neuron = bool(
+            getattr(cfg, "per_neuron_amplitudes",
+                    getattr(cfg, "alpha_per_neuron", False)))
 
         # Connectivity matrices
         self.register_buffer("T_e", T_e.to(device).float())
@@ -168,6 +169,18 @@ class Stage2ModelPT(nn.Module):
         else:
             self.register_buffer("b", torch.zeros((N, 1), device=device), persistent=False)
 
+        # Stimulus kernel: learnable causal impulse response
+        self.stim_kernel_len = int(getattr(cfg, "stim_kernel_len", 0))
+        if self.stim_kernel_len > 0 and d_ell > 0:
+            # Initialise as decaying exponential  h(k) = exp(-k*dt / tau)
+            tau_init = float(getattr(cfg, "stim_kernel_tau_init", 2.0))
+            k = torch.arange(self.stim_kernel_len, dtype=torch.float32, device=device)
+            h_init = torch.exp(-k * self.dt / max(tau_init, 1e-6))
+            h_init = h_init / h_init.sum().clamp(min=1e-8)  # normalise to sum=1
+            self.stim_kernel = nn.Parameter(h_init)          # (K,)
+        else:
+            self.stim_kernel = None
+
         # Synaptic amplitudes and time constants
         self._init_synaptic_params(cfg, device, N)
         # Reversal potentials
@@ -186,7 +199,9 @@ class Stage2ModelPT(nn.Module):
                 a_init = _match_rank(torch.tensor(getattr(cfg, f"a_{prefix}_init")), r).to(device)
                 if self.alpha_per_neuron:
                     a_init = a_init.unsqueeze(0).expand(N, -1).contiguous()
-                setattr(self, f"_a_{prefix}_raw", nn.Parameter(_reparam_inv(a_init, a_lo, a_hi)))
+                fix_a = bool(getattr(cfg, f"fix_a_{prefix}", False))
+                setattr(self, f"_a_{prefix}_raw", nn.Parameter(
+                    _reparam_inv(a_init, a_lo, a_hi), requires_grad=not fix_a))
                 tau_init = _match_rank(torch.tensor(getattr(cfg, f"tau_{prefix}_init")), r).to(device)
                 setattr(self, f"_tau_{prefix}_raw", nn.Parameter(
                     _reparam_inv(tau_init, tau_lo, tau_hi),
@@ -244,6 +259,32 @@ class Stage2ModelPT(nn.Module):
     def phi(self, u: torch.Tensor) -> torch.Tensor:
         return torch.sigmoid(u)
 
+    def convolve_stimulus(self, stim_raw: torch.Tensor) -> torch.Tensor:
+        """Convolve raw (delta-pulse) stimulus with the learnable causal kernel.
+
+        Parameters
+        ----------
+        stim_raw : (T, N) sparse stimulus matrix (e.g. optogenetics pulses)
+
+        Returns
+        -------
+        stim_conv : (T, N) — smoothed stimulus drive
+        """
+        if self.stim_kernel is None or self.stim_kernel_len <= 1:
+            return stim_raw
+        # Ensure non-negative kernel (softplus) and normalise
+        h = F.softplus(self.stim_kernel)  # (K,)
+        # Causal 1-D conv: kernel flipped for conv1d convention
+        # stim_raw is (T, N) → treat as batch of N channels
+        T, N = stim_raw.shape
+        # conv1d expects (batch, channels, length) → (N, 1, T)
+        x = stim_raw.t().unsqueeze(1)     # (N, 1, T)
+        w = h.flip(0).view(1, 1, -1)      # (1, 1, K)
+        # left-pad for causal conv (output length == T)
+        x_pad = F.pad(x, (self.stim_kernel_len - 1, 0))
+        out = F.conv1d(x_pad, w)           # (N, 1, T)
+        return out.squeeze(1).t()          # (T, N)
+
     def laplacian_with_G(self, G: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Gap-junction Laplacian, optionally overriding the shared conductance G.
 
@@ -275,7 +316,7 @@ class Stage2ModelPT(nn.Module):
         elif E.dim() == 1:
             I = (T_eff.t() @ (s_next * E.view(-1, 1)) * a_post).sum(1) - g * u_prev
         else:
-            I = (((T_eff * E).t() @ (s_next * a_post)).sum(1) - g * u_prev)
+            I = (((T_eff * E).t() @ s_next) * a_post).sum(1) - g * u_prev
         return I, s_next
 
     def prior_step(

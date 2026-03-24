@@ -9,6 +9,7 @@ from .behavior_decoder_eval import (
     evaluate_training_decoder,
 )
 from . import get_stage2_logger
+from ._utils import _r2, _cfg_val
 from .model import Stage2ModelPT
 
 __all__ = [
@@ -31,17 +32,6 @@ def _pearson(x: np.ndarray, y: np.ndarray) -> float:
     if np.std(xv) < 1e-12 or np.std(yv) < 1e-12:
         return float("nan")
     return float(np.corrcoef(xv, yv)[0, 1])
-
-
-def _r2(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    m = np.isfinite(y_true) & np.isfinite(y_pred)
-    if m.sum() < 3:
-        return float("nan")
-    yt, yp = y_true[m].astype(np.float64), y_pred[m].astype(np.float64)
-    ss_tot = np.sum((yt - yt.mean()) ** 2)
-    if ss_tot < 1e-12:
-        return float("nan")
-    return float(1.0 - np.sum((yt - yp) ** 2) / ss_tot)
 
 
 def _rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
@@ -82,19 +72,10 @@ def _clamp(x: torch.Tensor, lo: Optional[float], hi: Optional[float]) -> torch.T
     return x
 
 
-def _cfg_val(cfg, attr: str, default, cast=float):
-    return cast(getattr(cfg, attr, default) or default) if cfg is not None else cast(default)
-
-
 def _teacher_forced_prior(
     model: Stage2ModelPT, u: torch.Tensor, gating, stim,
 ) -> torch.Tensor:
-    """One-step teacher-forced prior: u(t-1) → u(t) with ground-truth input.
-
-    Despite being named ``_rollout_prior`` historically, this function
-    uses teacher forcing (ground-truth u at each step), **not** true
-    free-running rollout.  Renamed for clarity.
-    """
+    """One-step teacher-forced prior: u(t-1) → u(t) with ground-truth input."""
     T, N = u.shape
     device = u.device
     ones = torch.ones(N, device=device)
@@ -108,6 +89,48 @@ def _teacher_forced_prior(
             s = stim[t - 1]   if stim   is not None else None
             prior_mu[t], s_sv, s_dcv = model.prior_step(u[t - 1], s_sv, s_dcv, g, s)
     return prior_mu
+
+
+def _resolve_motor_indices(data: Dict[str, Any], N: int) -> list[int]:
+    """Return integer motor-neuron indices, resolving names if needed.
+
+    Priority:
+      1. ``data["motor_neurons"]`` – already mapped to ints by io_h5.
+      2. ``cfg.motor_neurons`` that are ints (or int-castable strings).
+      3. ``cfg.motor_neurons`` that are neuron *names* – resolved via
+         ``data["neuron_labels"]``.
+    """
+    # 1. Pre-resolved indices stored during data loading
+    pre = data.get("motor_neurons")
+    if pre is not None and len(pre) > 0:
+        return sorted({int(i) for i in pre if 0 <= int(i) < N})
+
+    cfg = data.get("_cfg")
+    if cfg is None or getattr(cfg, "motor_neurons", None) is None:
+        return []
+
+    motor = cfg.motor_neurons
+    idx: list[int] = []
+    unresolved: list[str] = []
+    for m in motor:
+        try:
+            v = int(m)
+            if 0 <= v < N:
+                idx.append(v)
+        except (ValueError, TypeError):
+            unresolved.append(str(m).strip())
+
+    # 3. Name-based resolution
+    if unresolved:
+        labels = data.get("neuron_labels", [])
+        if labels:
+            lbl_upper = [str(l).strip().upper() for l in labels[:N]]
+            for name in unresolved:
+                key = name.upper()
+                if key in lbl_upper:
+                    idx.append(lbl_upper.index(key))
+
+    return sorted(set(idx))
 
 
 def _ar1_smooth(u: torch.Tensor, lam: torch.Tensor, I0: torch.Tensor) -> np.ndarray:
@@ -150,14 +173,11 @@ def compute_free_run(model: Stage2ModelPT, data: Dict[str, Any]) -> Dict[str, An
     device = next(model.parameters()).device
     u0 = data["u_stage1"].to(device)
     T, N = u0.shape
-    cfg = data.get("_cfg")
     gating, stim = data.get("gating"), data.get("stim")
     lo, hi = _get_clip_bounds(model)
     ones = torch.ones(N, device=device)
 
-    motor_idx: list[int] = []
-    if cfg is not None and getattr(cfg, "motor_neurons", None) is not None:
-        motor_idx = [int(i) for i in cfg.motor_neurons if 0 <= int(i) < N]
+    motor_idx = _resolve_motor_indices(data, N)
     conditioned = 0 < len(motor_idx) < N
     motor_mask = torch.zeros(N, dtype=torch.bool, device=device)
     if motor_idx:
@@ -231,13 +251,16 @@ def run_loo_all(
     u_np = u.cpu().numpy()
 
     preds = {}
+    labels = data.get("neuron_labels", [])
     _logger = get_stage2_logger()
     _logger.info("loo_start", n_neurons=len(indices))
     for cnt, i in enumerate(indices):
         preds[i] = loo_forward_simulate(model, u, i, gating, stim)
-        if cnt == 0 or (cnt + 1) % 10 == 0:
+        lbl = labels[i] if i < len(labels) else f"#{i}"
+        r2_i = float(_r2(u_np[1:, i], preds[i][1:]))
+        if cnt == 0 or (cnt + 1) % 10 == 0 or len(indices) <= 10:
             _logger.info("loo_progress", done=cnt + 1, total=len(indices),
-                         neuron=int(i), r2=float(_r2(u_np[1:, i], preds[i][1:])))
+                         neuron=int(i), name=lbl, r2=r2_i)
 
     pred_full = np.column_stack([preds.get(i, u_np[:, i]) for i in range(u.shape[1])])
     r2, corr, rmse = _per_neuron_metrics(u_np[1:], pred_full[1:], indices)
@@ -268,9 +291,8 @@ def choose_loo_subset(
     # Resolve candidate pool: motor neurons only for motor* modes, else all
     candidates = None
     if mode.startswith("motor"):
-        cfg = data.get("_cfg")
-        if cfg is not None and getattr(cfg, "motor_neurons", None) is not None:
-            candidates = sorted({int(i) for i in cfg.motor_neurons if 0 <= int(i) < N})
+        _resolved = _resolve_motor_indices(data, N)
+        candidates = _resolved if _resolved else None
         if not candidates:
             candidates = list(range(N))  # fallback
 
@@ -289,6 +311,22 @@ def choose_loo_subset(
         score = np.where(np.isfinite(r2), r2, fill)
         order = np.argsort(score) if mode == "worst_onestep" else np.argsort(score)[::-1]
         return [int(i) for i in order[:k]]
+    if mode == "named":
+        # Look up neurons by name from cfg.eval_loo_subset_names
+        cfg = data.get("_cfg")
+        names = getattr(cfg, "eval_loo_subset_names", None) if cfg else None
+        if names:
+            labels = data.get("neuron_labels", [])
+            lbl_lower = [str(l).strip().lower() for l in labels]
+            found = []
+            for nm in names:
+                key = str(nm).strip().lower()
+                if key in lbl_lower:
+                    found.append(lbl_lower.index(key))
+            if found:
+                return sorted(set(found))
+        # fallback to all neurons if names not resolved
+        return None
 
     return sorted(int(i) for i in np.random.default_rng(seed).choice(N, size=k, replace=False))
 
@@ -349,17 +387,22 @@ def compute_current_decomposition(
                 E_param = term["E"]
                 s_state = gamma.view(1, -1) * s_state + phi_prev.unsqueeze(1)
                 a = a_param.unsqueeze(0) if a_param.dim() == 1 else a_param
-                sa = s_state * a
-                g_syn = torch.matmul(T_eff.t(), sa).sum(dim=1)
+                # Pool presynaptic states first, then apply postsynaptic amplitudes
+                # (sa = s_state * a is wrong when a is per-neuron: it mixes
+                # presynaptic index with postsynaptic amplitude).
+                pool = torch.matmul(T_eff.t(), s_state)           # (N_post, r)
+                g_syn = (pool * a).sum(dim=1)
 
                 E = E_param
                 if E.dim() == 0:
                     I_t = lam * g_syn * (E - u_prev)
                 elif E.dim() == 1:
-                    e_drive = torch.matmul(T_eff.t(), E.view(-1, 1) * sa).sum(dim=1)
+                    e_pool = torch.matmul(T_eff.t(), s_state * E.view(-1, 1))
+                    e_drive = (e_pool * a).sum(dim=1)
                     I_t = lam * (e_drive - g_syn * u_prev)
                 else:
-                    e_drive = torch.matmul((T_eff * E).t(), sa).sum(dim=1)
+                    e_pool = torch.matmul((T_eff * E).t(), s_state)
+                    e_drive = (e_pool * a).sum(dim=1)
                     I_t = lam * (e_drive - g_syn * u_prev)
                 out[prefix][t] = I_t.cpu().numpy()
 

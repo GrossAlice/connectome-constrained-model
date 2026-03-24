@@ -3,11 +3,19 @@ import sys
 from typing import Any
 
 
+class _CurrentStdout:
+    def write(self, msg: str) -> int:
+        return sys.stdout.write(msg)
+
+    def flush(self) -> None:
+        sys.stdout.flush()
+
+
 class Stage2Logger:
     def __init__(self, name: str = "stage2") -> None:
         logger = logging.getLogger(name)
         if not logger.handlers:
-            handler = logging.StreamHandler(sys.stdout)
+            handler = logging.StreamHandler(_CurrentStdout())
             handler.setFormatter(logging.Formatter("%(message)s"))
             logger.addHandler(handler)
         logger.setLevel(logging.INFO)

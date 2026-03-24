@@ -32,21 +32,27 @@ class WormState(nn.Module):
         self.N_obs: int = int(worm_dict["N_obs"])
         self.N_unobs: int = int(worm_dict["N_unobs"])
 
-        # Effective inference flag — no Parameters created when disabled
         self._infer_unobserved: bool = infer_unobserved and (self.N_unobs > 0)
 
         device = worm_dict["u"].device
 
         self.register_buffer("u_obs",     worm_dict["u"])           # (T, N)
-        self.register_buffer("sigma_u",   worm_dict["sigma_u"])     # (N,)
         self.register_buffer("obs_mask",  worm_dict["obs_mask"])    # (N,) bool
         self.register_buffer("obs_idx",   worm_dict["obs_idx"])     # (n_obs,) long
         self.register_buffer("unobs_idx", worm_dict["unobs_idx"])   # (n_unobs,) long
         self.register_buffer("val_mask",  worm_dict["val_mask"])    # (T,) bool
         self.register_buffer("gating",    worm_dict["gating"])      # (T, N)
 
-        # Optional buffers — stored as None when absent so ``hasattr`` checks
-        # are unnecessary; callers can just test ``worm.u_var is not None``.
+        self._learn_sigma_u: bool = bool(getattr(cfg, "learn_sigma_u", False))
+        _sigma_u_init = worm_dict["sigma_u"]
+        if self._learn_sigma_u:
+            self._log_sigma_u = nn.Parameter(
+                torch.log(_sigma_u_init.clamp(min=1e-6))
+            )
+        else:
+            self._log_sigma_u = None
+            self.register_buffer("_sigma_u_buf", _sigma_u_init)     # (N,)
+
         if worm_dict.get("u_var") is not None:
             self.register_buffer("u_var", worm_dict["u_var"])       # (T, N)
         else:
@@ -62,10 +68,7 @@ class WormState(nn.Module):
         else:
             self.stim: Optional[torch.Tensor] = None
 
-        # Initialised from stage1 OLS rho (or population median fallback).
-        # NOTE: lambda_u and I0 are shared on the model (same as single-worm),
-        # not per-worm.  Only G and b remain as per-worm parameters.
-
+        # Per-worm G (lambda_u and I0 are shared on the model)
         self._per_worm_G: bool = bool(getattr(cfg, "per_worm_G", False))
         self._G_lo: float = _G_LO
         from .model import _G_MAX, _G_INIT
@@ -79,21 +82,17 @@ class WormState(nn.Module):
                 _reparam_inv(G_init, self._G_lo, self._G_hi)
             )
         else:
-            self._G_raw = None  # not registered → absent from self.parameters()
+            self._G_raw = None
 
-        # One weight per atlas neuron; applied as I_stim = b * stim(t).
-        # Absent for Atanas worms (no optogenetic input).
+        # Stimulus weight (Randi only)
         if self.stim is not None:
             self.b: Optional[nn.Parameter] = nn.Parameter(
                 torch.zeros(N, device=device)
             )
         else:
-            self.b = None  # not registered
+            self.b = None
 
-        # Shape (T, n_unobs).  Initialised to zero; refined in Step 1
-        # (inner loop) of the two-level MAP optimisation.
-        # When inference is disabled or there are no unobserved neurons,
-        # self.u_unobs is None and assemble() returns u_obs directly.
+        # (T, n_unobs) — refined in Step 1 inner loop
         if self._infer_unobserved:
             self.u_unobs: Optional[nn.Parameter] = nn.Parameter(
                 torch.zeros(T, self.N_unobs, device=device)
@@ -109,36 +108,26 @@ class WormState(nn.Module):
             return None
         return _reparam_fwd(self._G_raw, self._G_lo, self._G_hi)
 
+    @property
+    def sigma_u(self) -> torch.Tensor:
+        """Per-neuron process-noise std (N,). Differentiable when learnable."""
+        if self._log_sigma_u is not None:
+            return torch.exp(self._log_sigma_u)
+        return self._sigma_u_buf
+
 
     def assemble(self) -> torch.Tensor:
-        """Full (T, N_atlas) trajectory, differentiable through ``u_unobs``.
-
-        ``u_obs`` has zeros at unobserved atlas positions (guaranteed by the
-        data loader).  ``u_unobs`` values are scattered into those positions
-        via :func:`torch.Tensor.index_copy`, which preserves the computation
-        graph so that gradients flow back through ``u_unobs``.
-
-        Use for **Step 1** (inner loop — trajectory inference).
-        """
+        """Full (T, N_atlas) trajectory, differentiable through u_unobs (Step 1)."""
         if not self._infer_unobserved:
             return self.u_obs
 
         T, N = self.T, self.N
-        # Start from a zero frame (no gradient required), then
-        # index_copy scatters u_unobs into the unobserved positions.
-        # The sum u_obs + scattered keeps the gradient through u_unobs.
         zeros = torch.zeros(T, N, device=self.u_unobs.device, dtype=torch.float32)
         u_unobs_full = zeros.index_copy(1, self.unobs_idx, self.u_unobs)
         return self.u_obs + u_unobs_full
 
     def assemble_detached(self) -> torch.Tensor:
-        """Full (T, N_atlas) trajectory with ``u_unobs`` detached.
-
-        Gradients do **not** flow through ``u_unobs``, treating the inferred
-        trajectory as fixed data.
-
-        Use for **Step 2** (outer step — model-parameter update).
-        """
+        """Full (T, N_atlas) trajectory with u_unobs detached (Step 2)."""
         if not self._infer_unobserved:
             return self.u_obs
 
@@ -149,14 +138,7 @@ class WormState(nn.Module):
 
 
     def smoothness_loss(self, weight: float = 1.0) -> torch.Tensor:
-        """Temporal L2-smoothness prior on the unobserved trajectory.
-
-        Penalises large first differences::
-
-            loss = weight * mean((u_unobs[t+1] - u_unobs[t]) ** 2)
-
-        Called during Step 1 alongside the dynamics prior.
-        """
+        """L2 temporal smoothness prior on u_unobs."""
         if not self._infer_unobserved or weight <= 0.0 or self.u_unobs is None:
             return torch.tensor(0.0, device=self.u_obs.device)
         diff = self.u_unobs[1:] - self.u_unobs[:-1]   # (T-1, n_unobs)
@@ -164,21 +146,14 @@ class WormState(nn.Module):
 
 
     def param_groups(self) -> Tuple[List[nn.Parameter], List[nn.Parameter]]:
-        """Split parameters into (psi_params, u_params) for optimizer setup.
-
-        Returns
-        -------
-        psi_params : list[nn.Parameter]
-            Per-worm model parameters: optionally ``_G_raw``, ``b``.
-            (``lambda_u`` and ``I0`` are shared on the model, not per-worm.)
-        u_params : list[nn.Parameter]
-            Trajectory free-variables: ``[u_unobs]`` if active, else ``[]``.
-        """
+        """Return (psi_params, u_params) for optimizer setup."""
         psi: List[nn.Parameter] = []
         if self._G_raw is not None:
             psi.append(self._G_raw)
         if self.b is not None:
             psi.append(self.b)
+        if self._log_sigma_u is not None:
+            psi.append(self._log_sigma_u)
 
         u: List[nn.Parameter] = []
         if self._infer_unobserved and self.u_unobs is not None:
@@ -204,21 +179,7 @@ def build_worm_states(
     data: Dict[str, Any],
     cfg: Stage2PTConfig,
 ) -> List[WormState]:
-    """Build :class:`WormState` objects from :func:`load_multi_worm_data` output.
-
-    Parameters
-    ----------
-    data : dict
-        The dict returned by :func:`stage2.io_multi.load_multi_worm_data`.
-    cfg : Stage2PTConfig
-        Full configuration.
-
-    Returns
-    -------
-    list[WormState]
-        One ``WormState`` per loaded worm, on the same device as the
-        tensors in *data*.
-    """
+    """Build WormState objects from load_multi_worm_data output."""
     infer = bool(getattr(cfg, "infer_unobserved", True))
     states: List[WormState] = []
     for worm_dict in data["worms"]:

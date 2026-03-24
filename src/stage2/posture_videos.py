@@ -50,16 +50,57 @@ def angles_to_xy(angles: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
 
 # Default Stephens eigenvectors path (relative to the file or project root).
 _STEPHENS_EIGVEC_NAME = "eigenvectors_stephens.npy"
+_STEPHENS_SHAPES_NAME = "shapes.csv"
+
+
+def _recompute_eigvecs_at_dim(d_target: int,
+                              h5_path: Optional[str] = None) -> np.ndarray:
+    """Recompute Stephens eigenvectors at *d_target* from ``shapes.csv``.
+
+    The eigenworm amplitudes stored in the H5 may have been projected
+    using a basis computed at a different body-angle dimensionality
+    (e.g. 49) than the saved ``.npy`` file (e.g. 100).  This helper
+    recomputes the basis on-the-fly so reconstruction is consistent.
+    """
+    candidates: list[Path] = []
+    if h5_path:
+        h5_dir = Path(h5_path).resolve().parent
+        for d in (h5_dir, h5_dir.parent, h5_dir.parent.parent):
+            candidates.append(d / _STEPHENS_SHAPES_NAME)
+            candidates.append(d / "stephens (2016)" / _STEPHENS_SHAPES_NAME)
+    for p in candidates:
+        if p.exists():
+            shapes_raw = np.loadtxt(str(p), delimiter=",")
+            if d_target != shapes_raw.shape[1]:
+                shapes = np.array([
+                    np.interp(np.linspace(0, 1, d_target),
+                              np.linspace(0, 1, shapes_raw.shape[1]), row)
+                    for row in shapes_raw
+                ])
+            else:
+                shapes = shapes_raw
+            Xc = shapes - shapes.mean(axis=0, keepdims=True)
+            eigvals, eigvecs = np.linalg.eigh((Xc.T @ Xc) / len(Xc))
+            order = np.argsort(eigvals)[::-1]
+            return eigvecs[:, order]  # (d_target, d_target)
+    raise FileNotFoundError(
+        f"Cannot find {_STEPHENS_SHAPES_NAME} to recompute eigenvectors "
+        f"at d_target={d_target}."
+    )
 
 
 def _load_eigenvectors(eigvec_npy: Optional[str] = None,
-                       h5_path: Optional[str] = None) -> np.ndarray:
+                       h5_path: Optional[str] = None,
+                       d_target: Optional[int] = None) -> np.ndarray:
     """Load Stephens eigenvectors from *eigvec_npy*.
 
     Search order (first match wins):
     1. Explicit *eigvec_npy* argument.
     2. ``eigenvectors_stephens.npy`` in the same folder as the H5 file.
     3. ``eigenvectors_stephens.npy`` in the parent / grandparent folders of the H5.
+
+    If *d_target* is given and differs from the loaded eigenvector
+    dimension, recompute from ``shapes.csv`` at the correct dimension.
     """
     candidates: list[Path] = []
     if eigvec_npy:
@@ -70,13 +111,22 @@ def _load_eigenvectors(eigvec_npy: Optional[str] = None,
             candidates.append(d / _STEPHENS_EIGVEC_NAME)
             # Also check sibling ``stephens (2016)`` folder.
             candidates.append(d / "stephens (2016)" / _STEPHENS_EIGVEC_NAME)
+    eigvecs = None
     for p in candidates:
         if p.exists():
-            return np.load(p)
-    raise FileNotFoundError(
-        f"Cannot find {_STEPHENS_EIGVEC_NAME}. "
-        "Run scripts/add_stephens_eigenworms.py first, or pass --eigvec_npy."
-    )
+            eigvecs = np.load(p)
+            break
+    if eigvecs is None:
+        raise FileNotFoundError(
+            f"Cannot find {_STEPHENS_EIGVEC_NAME}. "
+            "Run scripts/add_stephens_eigenworms.py first, or pass --eigvec_npy."
+        )
+    # Recompute if loaded dimension doesn't match required d_target
+    if d_target is not None and eigvecs.shape[0] != d_target:
+        print(f"[posture_video] Eigenvector dimension {eigvecs.shape[0]} != "
+              f"d_target {d_target}; recomputing from shapes.csv")
+        eigvecs = _recompute_eigvecs_at_dim(d_target, h5_path=h5_path)
+    return eigvecs
 
 
 def _make_colored_line(x, y, curvature, cmap, norm):
@@ -546,7 +596,16 @@ def make_posture_compare_video(
             "and ew_model_cv (motor model) eigenworm predictions."
         )
 
-    eigvecs_all = _load_eigenvectors(eigvec_npy=eigvec_npy, h5_path=h5_path)
+    # Read d_target from eigenworms metadata so we load the matching basis
+    _ew_d_target = None
+    with h5py.File(h5_path, "r") as f:
+        if "behaviour/eigenworms_stephens" in f:
+            _ew_d_target = f["behaviour/eigenworms_stephens"].attrs.get("d_target")
+            if _ew_d_target is not None:
+                _ew_d_target = int(_ew_d_target)
+
+    eigvecs_all = _load_eigenvectors(eigvec_npy=eigvec_npy, h5_path=h5_path,
+                                     d_target=_ew_d_target)
 
     with h5py.File(h5_path, "r") as f:
         for ba_key in ("behaviour/body_angle_dtarget",
@@ -611,7 +670,6 @@ def make_posture_compare_video(
                   ", ".join(f"m{i}={r:.3f}" for i, r in enumerate(r2_modes)))
 
     # ── convert to XY trajectories ───────────────────────────────────
-    # Raw body angles use d_seg; eigenworm reconstructions use d_recon.
     xy_raw = np.zeros((T, d_seg, 2), dtype=float)
     xy_raw_ew = np.zeros((T, d_recon, 2), dtype=float)
     xy_s1 = np.zeros((T, d_recon, 2), dtype=float)

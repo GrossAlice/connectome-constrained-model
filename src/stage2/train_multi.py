@@ -1,40 +1,3 @@
-"""Multi-worm two-level MAP training loop (Layer 5).
-
-Implements the EPFL two-level alternating optimisation::
-
-    Step 1 (inner, ``u_unobs_inner_steps`` gradient steps):
-        Fix θ, ψ  →  update u_U  (trajectory inference, opt_u only)
-
-    Step 2 (outer, 1 gradient step):
-        Fix u_U   →  update θ, ψ  (model learning, opt_theta + opt_psi)
-
-MAP loss per worm
------------------
-For a worm with observed set O and unobserved set U, both enter a **single**
-variance-normalised MSE::
-
-    J_w = Σ_t Σ_i (û_i(t) - μ_i(t))² / σ²_{u,i}
-
-where σ²_{u,i} is small for i∈O (stage-1 noise) and inflated by
-``sigma_u_unobs_scale`` for i∈U.  No mask is applied — the loss naturally
-weights unobserved neurons less, while still back-propagating through their
-trajectory free variables ``u_unobs``.
-
-Three Adam optimiser groups
----------------------------
-opt_theta : shared model params (all ``Stage2ModelPT`` parameters with
-    ``requires_grad=True``).  Includes ``_lambda_u_raw`` and ``I0``
-    (shared across worms, same as single-worm training).
-opt_psi   : per-worm model params (all worms):
-    optionally ``_G_raw``, ``b``
-    from ``WormState.param_groups()[0]``.  Also the behaviour decoder params.
-opt_u     : per-worm trajectory free variables (all worms):
-    ``u_unobs`` from ``WormState.param_groups()[1]``.
-
-Public API
-----------
-``train_multi_worm(cfg, save_dir, show)``
-"""
 from __future__ import annotations
 
 import json
@@ -648,6 +611,13 @@ def _train_multi_worm_inner(
     rep_u = torch.nan_to_num(rep_u, nan=0.0)
     init_all_from_data(model, rep_u, cfg)
 
+    # Snapshot OLS-init values for regularization
+    _lambda_u_init_target = model.lambda_u.detach().clone()
+    _I0_init_target       = model.I0.detach().clone()
+    _G_init_target        = model.G.detach().clone()
+    _tau_sv_init_target   = model.tau_sv.detach().clone()
+    _tau_dcv_init_target  = model.tau_dcv.detach().clone()
+
     # 4. Build WormState objects
     worm_states = build_worm_states(data, cfg)
     _log_multi_config(cfg, N_atlas, n_worms)
@@ -719,6 +689,10 @@ def _train_multi_worm_inner(
     smoothness_w       = float(mc.u_unobs_smoothness)
     infer_unobs        = bool(mc.infer_unobserved) and (opt_u is not None)
     interaction_l2     = float(getattr(cfg, "interaction_l2",    0.0) or 0.0)
+    lambda_u_reg       = float(getattr(cfg, "lambda_u_reg",      0.0) or 0.0)
+    I0_reg             = float(getattr(cfg, "I0_reg",            0.0) or 0.0)
+    G_reg              = float(getattr(cfg, "G_reg",             0.0) or 0.0)
+    tau_reg            = float(getattr(cfg, "tau_reg",           0.0) or 0.0)
     rollout_weight     = float(getattr(cfg, "rollout_weight",     0.0) or 0.0)
     rollout_steps      = int(getattr(cfg, "rollout_steps",        0)   or 0)
     rollout_starts     = int(getattr(cfg, "rollout_starts",       4)   or 4)
@@ -728,14 +702,66 @@ def _train_multi_worm_inner(
 
     if interaction_l2 > 0:
         print(f"[MultiWorm] Interaction L2 = {interaction_l2:.4g}")
+    if lambda_u_reg > 0:
+        print(f"[MultiWorm] Lambda-u regularization (logit space) = {lambda_u_reg:.4g}")
+    if I0_reg > 0:
+        print(f"[MultiWorm] I0 regularization = {I0_reg:.4g}")
+    if G_reg > 0:
+        print(f"[MultiWorm] G regularization = {G_reg:.4g}")
+    if tau_reg > 0:
+        print(f"[MultiWorm] tau regularization (log space) = {tau_reg:.4g}")
     if rollout_weight > 0:
         print(f"[MultiWorm] Rollout: K={rollout_steps} starts={rollout_starts} w={rollout_weight:.4g}")
     if infer_unobs:
         print(f"[MultiWorm] Trajectory inference: {inner_steps} inner steps / epoch")
 
+    # (neuron filter and learnable sigma_u removed — not in reverted train.py)
+
+    # ---- intermediate-plot config --------------------------------------------
+    plot_every = int(getattr(cfg, "plot_every", 0) or 0)
+
+    # Resolve cfg.motor_neurons from string names → atlas integer indices
+    # (needed by both intermediate and final per-worm plots)
+    motor_neurons_raw = getattr(cfg, "motor_neurons", None)
+    if motor_neurons_raw is not None:
+        lbl_lower = [str(l).strip().lower() for l in atlas_lbl]
+        resolved: list[int] = []
+        for mn in motor_neurons_raw:
+            try:
+                idx = int(mn)
+                if 0 <= idx < len(atlas_lbl):
+                    resolved.append(idx)
+            except (ValueError, TypeError):
+                key = str(mn).strip().lower()
+                if key in lbl_lower:
+                    resolved.append(lbl_lower.index(key))
+        cfg.motor_neurons = tuple(resolved) if resolved else None
+
+    def _build_worm_plot_data(ws: WormState) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+        """Build (worm_data, worm_decoder) for generate_eval_loo_plots."""
+        u_full = ws.assemble_detached().detach()
+        beh_t = ws.behaviour
+        worm_data = {
+            "u_stage1":      u_full,
+            "sigma_u":       ws.sigma_u,
+            "gating":        ws.gating,
+            "stim":          ws.stim,
+            "dt":            getattr(mc, "common_dt", 0.6),
+            "neuron_labels": atlas_lbl,
+            "b":      torch.nan_to_num(beh_t, nan=0.0) if beh_t is not None else None,
+            "b_mask": torch.isfinite(beh_t).float() if beh_t is not None else None,
+        }
+        worm_dec = None
+        if beh_decoder is not None and ws.behaviour is not None:
+            worm_dec = dict(beh_decoder)  # shallow copy
+            if "motor_atlas_idx" in worm_dec and "motor_idx" not in worm_dec:
+                worm_dec["motor_idx"] = worm_dec["motor_atlas_idx"]
+        return worm_data, worm_dec
+
     # 9. Training loop
-    best_val   = float("inf")
-    best_state = None
+    best_val      = float("inf")
+    best_state    = None
+    epoch_losses: List[dict] = []   # mirrors single-worm epoch_losses for plotting
 
     for epoch in range(num_epochs):
 
@@ -755,7 +781,9 @@ def _train_multi_worm_inner(
                     u_full  = worm.assemble()       # differentiable through u_unobs
                     pm      = _forward_pass_worm(model, worm, u_full)
                     tm      = worm.train_mask()     # (T,) bool
-                    dyn_w   = compute_dynamics_loss(u_full[tm], pm[tm], worm.sigma_u)
+                    dyn_w   = compute_dynamics_loss(
+                        u_full[tm], pm[tm], worm.sigma_u,
+                    )
                     smooth_w = worm.smoothness_loss(smoothness_w)
                     u_loss   = u_loss + worm.weight * (dyn_w + smooth_w)
 
@@ -781,7 +809,9 @@ def _train_multi_worm_inner(
             tm     = worm.train_mask()
             w      = worm.weight
 
-            worm_loss = compute_dynamics_loss(u_full[tm], pm[tm], worm.sigma_u)
+            worm_loss = compute_dynamics_loss(
+                u_full[tm], pm[tm], worm.sigma_u,
+            )
             tr_losses[worm.worm_id] = float(worm_loss.item())
 
             # Interaction L2: penalise network contribution beyond pure AR(1)
@@ -814,6 +844,37 @@ def _train_multi_worm_inner(
                 g_cons  = ((G_stack - G_mean) ** 2).mean()
                 total_loss = total_loss + G_cons_w * g_cons
 
+        # Regularize lambda_u toward OLS init (logit space for uniform prior on (0,1))
+        if lambda_u_reg > 0 and model._lambda_u_raw.requires_grad:
+            _eps = 1e-6
+            _logit_cur  = torch.log(model.lambda_u.clamp(_eps, 1 - _eps)
+                                    / (1 - model.lambda_u.clamp(_eps, 1 - _eps)))
+            _logit_init = torch.log(_lambda_u_init_target.clamp(_eps, 1 - _eps)
+                                    / (1 - _lambda_u_init_target.clamp(_eps, 1 - _eps)))
+            total_loss = total_loss + lambda_u_reg * (_logit_cur - _logit_init).pow(2).mean()
+
+        # Regularize I0 toward OLS init
+        if I0_reg > 0 and model.I0.requires_grad:
+            total_loss = total_loss + I0_reg * (model.I0 - _I0_init_target).pow(2).mean()
+
+        # Regularize G toward init (prevents G/alpha trading)
+        if G_reg > 0 and model._G_raw.requires_grad:
+            total_loss = total_loss + G_reg * (model.G - _G_init_target).pow(2).mean()
+
+        # Regularize tau in log space (keeps ranks separated)
+        if tau_reg > 0:
+            _tau_eps = 1e-6
+            if model.tau_sv.requires_grad and model.tau_sv.numel() > 0:
+                total_loss = total_loss + tau_reg * (
+                    torch.log(model.tau_sv.clamp(min=_tau_eps))
+                    - torch.log(_tau_sv_init_target.clamp(min=_tau_eps))
+                ).pow(2).mean()
+            if model.tau_dcv.requires_grad and model.tau_dcv.numel() > 0:
+                total_loss = total_loss + tau_reg * (
+                    torch.log(model.tau_dcv.clamp(min=_tau_eps))
+                    - torch.log(_tau_dcv_init_target.clamp(min=_tau_eps))
+                ).pow(2).mean()
+
         total_loss.backward()
 
         # Gradient clipping over all learnable params in Step 2
@@ -830,6 +891,45 @@ def _train_multi_worm_inner(
             epoch, float(total_loss.item()), step1_loss_val,
             val_losses, tr_losses, model, print_every
         )
+
+        # Record for plotting (same dict schema as single-worm train.py)
+        rec: dict = {"dynamics": float(total_loss.item()),
+                     "total":    float(total_loss.item())}
+        if step1_loss_val is not None:
+            rec["step1_loss"] = step1_loss_val
+        rec.update(_snapshot_params(model))
+        epoch_losses.append(rec)
+
+        # ---- intermediate per-worm checkpoint plots --------------------------
+        if (save_dir and plot_every > 0
+                and (epoch + 1) % plot_every == 0):
+            try:
+                from .plot_eval import generate_eval_loo_plots as _gen_plots
+                for ws in worm_states:
+                    epoch_dir = (
+                        Path(save_dir) / ws.worm_id
+                        / f"epoch_{epoch + 1:04d}"
+                    )
+                    epoch_dir.mkdir(parents=True, exist_ok=True)
+                    try:
+                        wd, wdec = _build_worm_plot_data(ws)
+                        _gen_plots(
+                            model, wd, cfg, epoch_losses,
+                            str(epoch_dir), show=False,
+                            decoder=wdec,
+                            include_ridge_diagnostics=False,
+                        )
+                        print(
+                            f"[MultiWorm] Plots saved to"
+                            f" {epoch_dir.relative_to(Path(save_dir))}/"
+                        )
+                    except Exception as exc:
+                        print(
+                            f"[MultiWorm][warn] plot failed"
+                            f" {ws.worm_id} ep {epoch + 1}: {exc}"
+                        )
+            except Exception as exc:
+                print(f"[MultiWorm][warn] intermediate plot import failed: {exc}")
 
         val_mean = float(np.nanmean(list(val_losses.values())))
         if val_mean < best_val:
@@ -896,66 +996,41 @@ def _train_multi_worm_inner(
         print(f"[MultiWorm] Evaluation failed (non-fatal): {exc}")
         eval_results = {}
 
-    # 14. Per-worm single-worm diagnostic plots
+    # 14. Per-worm single-worm diagnostic plots (final, with full ridge diagnostics)
+    #     + collect results for the merged summary slide.
+    merged_entries: list = []   # [(worm_id, worm_data, eval_results), ...]
     if save_dir is not None:
         try:
             from .plot_eval import generate_eval_loo_plots
             print("\n[MultiWorm] Generating per-worm single-worm diagnostic plots …")
-            # Resolve cfg.motor_neurons from string names → atlas integer indices
-            motor_neurons_raw = getattr(cfg, "motor_neurons", None)
-            if motor_neurons_raw is not None:
-                lbl_lower = [str(l).strip().lower() for l in atlas_lbl]
-                resolved: list[int] = []
-                for mn in motor_neurons_raw:
-                    try:
-                        idx = int(mn)
-                        if 0 <= idx < len(atlas_lbl):
-                            resolved.append(idx)
-                    except (ValueError, TypeError):
-                        key = str(mn).strip().lower()
-                        if key in lbl_lower:
-                            resolved.append(lbl_lower.index(key))
-                cfg.motor_neurons = tuple(resolved) if resolved else None
-            # Save original shared model parameters so we can restore them
-            orig_lambda_u_raw = model._lambda_u_raw.data.clone()
-            orig_I0 = model.I0.data.clone()
             for ws in worm_states:
                 worm_save = Path(save_dir) / ws.worm_id
                 worm_save.mkdir(parents=True, exist_ok=True)
                 try:
-                    # Temporarily patch shared model with this worm's per-worm params
-                    with torch.no_grad():
-                        model._lambda_u_raw.data.copy_(ws._lambda_u_raw.data)
-                        model.I0.data.copy_(ws.I0.data)
-
-                    # Build single-worm data dict compatible with run_full_evaluation
-                    u_full = ws.assemble_detached().detach()
-                    beh_t = ws.behaviour  # (T, n_modes) or None
-                    worm_data = {
-                        "u_stage1":     u_full,
-                        "sigma_u":      ws.sigma_u,
-                        "gating":       ws.gating,
-                        "stim":         ws.stim,
-                        "dt":           getattr(mc, "common_dt", 0.6),
-                        "neuron_labels": atlas_lbl,
-                        # Behaviour fields for Atanas worms
-                        "b":      torch.nan_to_num(beh_t, nan=0.0) if beh_t is not None else None,
-                        "b_mask": torch.isfinite(beh_t).float() if beh_t is not None else None,
-                    }
+                    worm_data, worm_decoder = _build_worm_plot_data(ws)
                     print(f"[MultiWorm]   Plotting {ws.worm_id} → {worm_save}")
-                    generate_eval_loo_plots(
-                        model, worm_data, cfg, [],
+                    plot_ret = generate_eval_loo_plots(
+                        model, worm_data, cfg, epoch_losses,
                         str(worm_save), show=False,
+                        decoder=worm_decoder,
                     )
+                    merged_entries.append((ws.worm_id, worm_data, plot_ret))
                 except Exception as exc:
                     print(f"[MultiWorm]   Single-worm plots failed for {ws.worm_id}: {exc}")
-                finally:
-                    # Always restore original shared model params
-                    with torch.no_grad():
-                        model._lambda_u_raw.data.copy_(orig_lambda_u_raw)
-                        model.I0.data.copy_(orig_I0)
         except Exception as exc:
             print(f"[MultiWorm] Per-worm plot generation failed (non-fatal): {exc}")
+
+    # 14b. Merged (all-worms) summary slide
+    if save_dir is not None and merged_entries:
+        try:
+            from .plot_eval import plot_merged_summary_slide
+            print("\n[MultiWorm] Generating merged (all-worms) summary slide …")
+            plot_merged_summary_slide(
+                model, merged_entries, epoch_losses,
+                save_dir=save_dir, cfg=cfg,
+            )
+        except Exception as exc:
+            print(f"[MultiWorm] Merged summary failed (non-fatal): {exc}")
 
     # 15. Cross-worm R² summary plot (one-step / LOO / free-run)
     if save_dir is not None and eval_results:

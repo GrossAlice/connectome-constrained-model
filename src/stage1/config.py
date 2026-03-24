@@ -84,8 +84,8 @@ class Stage1Config:
     em_tol_rel_ll: float = 1e-4
 
     # Parameter bounds
-    tau_u_clip_sec: Tuple[float, float]           = (0.5, 8.0)
-    tau_c_clip_sec: Tuple[float, float]           = (0.5, 20.0)
+    tau_u_clip_sec: Tuple[float, float]           = (0.3, 1.0)
+    tau_c_clip_sec: Tuple[float, float]           = (1.5, 20.0)
     rho_clip:       Optional[Tuple[float, float]] = None   # derived
     lambda_clip:    Optional[Tuple[float, float]] = None   # derived
     eps_var:        float                          = 1e-12

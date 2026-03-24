@@ -39,8 +39,8 @@ def _teacher_forced_prior_worm(
     s_dcv = torch.zeros(N, model.r_dcv, device=device, dtype=u.dtype)
 
     with torch.no_grad():
-        lam = ws.lambda_u.detach()
-        I0  = ws.I0.detach()
+        lam = model.lambda_u.detach()    # shared on model, not per-worm
+        I0  = model.I0.detach()          # shared on model, not per-worm
         G   = ws.G.detach() if ws.G is not None else None
         b   = ws.b.detach() if ws.b is not None else None
         for t in range(1, T):
@@ -64,8 +64,8 @@ def _loo_simulate_worm(
     device = u_all.device
     lo, hi = _get_clip_bounds(model)
 
-    lam = ws.lambda_u
-    I0  = ws.I0
+    lam = model.lambda_u   # shared on model, not per-worm
+    I0  = model.I0          # shared on model, not per-worm
     G   = ws.G
     b   = ws.b
 
@@ -231,8 +231,8 @@ def compute_freerun_worm(
     T, N   = u.shape
     lo, hi = _get_clip_bounds(model)
 
-    lam = ws.lambda_u.detach()
-    I0  = ws.I0.detach()
+    lam = model.lambda_u.detach()    # shared on model, not per-worm
+    I0  = model.I0.detach()          # shared on model, not per-worm
     G   = ws.G.detach() if ws.G is not None else None
     b   = ws.b.detach() if ws.b is not None else None
 
@@ -330,7 +330,7 @@ def run_multi_worm_evaluation(
 
         # Per-worm lambda_u and G for cross-worm comparison
         with torch.no_grad():
-            lam_w = ws.lambda_u.detach().cpu().numpy()          # (N_atlas,)
+            lam_w = model.lambda_u.detach().cpu().numpy()       # (N_atlas,) shared
             G_w   = float(ws.G.item()) if ws.G is not None else None
 
         per_worm[ws.worm_id] = {

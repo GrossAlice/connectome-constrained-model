@@ -32,7 +32,7 @@ def init_I0(model: "Stage2ModelPT", u: torch.Tensor) -> torch.Tensor:
     lam = model.lambda_u.detach()
     x, y = u[:-1].to(model.I0.device), u[1:].to(model.I0.device)
     b = y.mean(0) - (1 - lam) * x.mean(0)
-    I0_ols = b / lam
+    I0_ols = b / lam.clamp(min=0.01)
     with torch.no_grad():
         model.I0.data.copy_(I0_ols)
     print(f"[init] I0 (OLS): mean={I0_ols.mean():.4f}, "
@@ -119,23 +119,44 @@ def _apply_scales(
     rms_resid: float,
     label: str,
 ) -> None:
-    """Scale model parameters by *betas* and log diagnostics."""
+    """Scale model parameters by *betas* and log diagnostics.
+
+    For synaptic channels (a_sv, a_dcv) the scale is absorbed into W_sv / W_dcv
+    rather than into the per-rank amplitudes, so the user-specified rank
+    structure in a_sv_init / a_dcv_init is preserved and doesn't saturate the
+    sigmoid reparameterisation.
+    """
     total_rms = math.sqrt(sum(r ** 2 for r in rms_list))
     print(f"[init] network_scale ({label}): AR1_rms={rms_resid:.4f}"
           f"  net_rms={total_rms:.4f} ({total_rms / rms_resid:.0%})")
+    # Map synaptic amplitude name → weight matrix name
+    _AMP_TO_W = {"a_sv": "W_sv", "a_dcv": "W_dcv"}
     for i, name in enumerate(names):
         b = betas[i]
-        cur = getattr(model, name)
-        if cur.numel() == 0:
-            continue
         rms_after = rms_list[i]
         frac = rms_after / rms_resid
         if name == "G" and model.edge_specific_G:
+            cur = getattr(model, name)
+            if cur.numel() == 0:
+                continue
             from .model import _reparam_inv
             model._G_raw.data.copy_(_reparam_inv(cur * b, model._G_lo, model._G_hi))
+            print(f"[init]   G: \u03b2={b:.4f}, RMS={rms_after:.4f} ({frac:.0%} of AR1)")
+        elif name in _AMP_TO_W:
+            # Absorb the scale into W rather than collapsing a_sv/a_dcv
+            w_name = _AMP_TO_W[name]
+            cur_w = getattr(model, w_name)
+            if cur_w.numel() == 0:
+                continue
+            model.set_param_constrained(w_name, cur_w * b)
+            print(f"[init]   {name}: \u03b2={b:.4f} \u2192 applied to {w_name}, "
+                  f"RMS={rms_after:.4f} ({frac:.0%} of AR1)")
         else:
+            cur = getattr(model, name)
+            if cur.numel() == 0:
+                continue
             model.set_param_constrained(name, cur * b)
-        print(f"[init]   {name}: \u03b2={b:.4f}, RMS={rms_after:.4f} ({frac:.0%} of AR1)")
+            print(f"[init]   {name}: \u03b2={b:.4f}, RMS={rms_after:.4f} ({frac:.0%} of AR1)")
 
 
 # ── Global-OLS init (original) ──────────────────────────────────────────
@@ -259,13 +280,14 @@ def _init_network_scale_per_neuron_ridge(
 def init_network_scale(model: "Stage2ModelPT", u: torch.Tensor,
                        cfg=None) -> None:
     mode = str(getattr(cfg, "network_init_mode", "ols") or "ols").lower()
-    if mode == "per_neuron_ridge":
+    # support old names for backward compat
+    if mode in ("per_neuron", "per_neuron_ridge"):
         _init_network_scale_per_neuron_ridge(model, u)
-    elif mode == "ols":
+    elif mode in ("global", "ols"):
         _init_network_scale_ols(model, u)
     else:
         raise ValueError(f"Unknown network_init_mode={mode!r}; "
-                         f"expected 'ols' or 'per_neuron_ridge'")
+                         f"expected 'global'/'ols' or 'per_neuron'/'per_neuron_ridge'")
 
 
 def init_all_from_data(model: "Stage2ModelPT", u: torch.Tensor, cfg=None):
