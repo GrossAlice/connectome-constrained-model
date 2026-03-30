@@ -25,6 +25,7 @@ _COL_DATA = "#2166ac"
 _COL_RAW  = "#d62728"
 _COL_CV   = "#2ca02c"
 _COL_FR   = "#9467bd"
+_COL_CVREG = "#ff7f0e"   # orange – CV-reg blended prediction
 
 def setup_plot_style():
     import matplotlib
@@ -365,12 +366,30 @@ def plot_summary_slide(
                 ha="center", va="center", fontsize=14)
 
     _hist_kw = dict(alpha=0.75, edgecolor="white")
-    for col, (r2, color, label, title) in enumerate([
+    # Get CV-reg R² if available
+    cv_reg_info = onestep.get("cv_reg")
+    r2_cvreg_slide = cv_reg_info["r2"] if cv_reg_info is not None else None
+    hist_panels = [
         (r2_os, _COL_DATA, "One-step R\u00b2", "B. One-step R\u00b2"),
         (r2_loo, _COL_CV,  "LOO R\u00b2",      "C. LOO R\u00b2"),
         (r2_fr,  _COL_FR,  "Free-run R\u00b2",  "D. Free-run R\u00b2"),
-    ], start=1):
-        ax = fig.add_subplot(gs[0, col])
+    ]
+    if r2_cvreg_slide is not None:
+        hist_panels.append(
+            (r2_cvreg_slide, _COL_CVREG, "CV-reg R\u00b2", "E*. CV-reg R\u00b2"))
+    for col, (r2, color, label, title) in enumerate(hist_panels, start=1):
+        ax = fig.add_subplot(gs[0, min(col, 3)])
+        if col > 3:
+            # Overlay CV-reg on top of one-step histogram (panel B)
+            ax = fig.add_subplot(gs[0, 1])
+            valid = r2[np.isfinite(r2)]
+            if len(valid) > 0:
+                bins = np.linspace(min(valid.min(), -0.1),
+                                   max(valid.max(), 1.0), 30)
+                ax.hist(valid, bins=bins, color=color, alpha=0.35,
+                        edgecolor="none", label=f"CV-reg {np.median(valid):.3f}")
+                ax.legend(frameon=False, fontsize=10)
+            continue
         valid = r2[np.isfinite(r2)]
         if len(valid) > 0:
             bins = np.linspace(min(valid.min(), -0.1),
@@ -809,6 +828,7 @@ def plot_prediction_traces(
     loo: Dict[str, Any],
     free_run: Dict[str, Any],
     save_dir: str,
+    freerun_stoch: Optional[Dict[str, Any]] = None,
 ):
     import matplotlib.pyplot as plt
     from matplotlib.gridspec import GridSpec
@@ -826,6 +846,16 @@ def plot_prediction_traces(
     r2_fr = free_run["r2"]
     u_free = free_run["u_free"]
 
+    # Stochastic trajectory samples (may or may not be present)
+    loo_samples = loo.get("samples")  # dict idx -> (n_samples, T)
+    # Calibrated stochastic samples (empirical LOO residual σ)
+    loo_calibrated = loo.get("calibrated_samples")  # dict idx -> (n_samples, T)
+
+    # CV-reg blended prediction (may or may not be present)
+    cv_reg = onestep.get("cv_reg")
+    cv_reg_mu = cv_reg["cv_reg_mu"] if cv_reg is not None else None
+    r2_cvreg  = cv_reg["r2"] if cv_reg is not None else None
+
     pick = sorted(preds_loo.keys())
     if len(pick) == 0:
         return
@@ -834,11 +864,36 @@ def plot_prediction_traces(
     gs = GridSpec(len(pick), 3, width_ratios=[1.35, 5.2, 2.15],
                   hspace=0.35, wspace=0.20)
 
+    _COL_SAMPLE = "#9467bd"   # muted purple for stochastic trajectories
+
     for row, idx in enumerate(pick):
         ax_net = fig.add_subplot(gs[row, 0])
         _plot_partner_panel(ax_net, data, labels, idx)
 
         ax = fig.add_subplot(gs[row, 1])
+
+        # --- Stochastic samples: confidence band + thin lines ---
+        # Prefer calibrated samples (empirical LOO σ) over learned-σ samples
+        _samp_dict = loo_calibrated if loo_calibrated is not None else loo_samples
+        if _samp_dict is not None and idx in _samp_dict:
+            samp = _samp_dict[idx]                    # (n_samples, T)
+            n_samp = samp.shape[0]
+            samp_lo = np.percentile(samp, 2.5, axis=0)
+            samp_hi = np.percentile(samp, 97.5, axis=0)
+            _ci_label = "95% CI (calibrated)" if loo_calibrated is not None else "95% CI (samples)"
+            ax.fill_between(
+                time, samp_lo, samp_hi,
+                color=_COL_SAMPLE, alpha=0.12, zorder=1,
+                label=_ci_label,
+            )
+            n_show = min(n_samp, 5)
+            for k in range(n_show):
+                ax.plot(
+                    time, samp[k], color=_COL_SAMPLE,
+                    lw=0.7, alpha=0.35, zorder=1,
+                    label="Sample" if k == 0 else None,
+                )
+
         ax.plot(time, u_np[:, idx], color=_COL_DATA,
                 lw=2.0, alpha=0.45, label="Data", zorder=2)
         ax.plot(time, mu_os[:, idx], color=_COL_RAW,
@@ -852,6 +907,28 @@ def plot_prediction_traces(
             ax.plot(time, u_free[:, idx], color=_COL_FR,
                     lw=1.8, ls="-.", alpha=0.85,
                     label=f"Free-run (R\u00b2={r2_fr[idx]:.3f})", zorder=5)
+        # --- Full-brain stochastic free-run: CI band + thin samples ---
+        _COL_FRSTOCH = "#2ca02c"  # green, matching free-run hue
+        if freerun_stoch is not None:
+            fr_ci_lo = freerun_stoch["ci_lo"][:, idx]
+            fr_ci_hi = freerun_stoch["ci_hi"][:, idx]
+            ax.fill_between(
+                time, fr_ci_lo, fr_ci_hi,
+                color=_COL_FRSTOCH, alpha=0.10, zorder=1,
+                label="Free-run 95% CI",
+            )
+            fr_samp = freerun_stoch["samples"]  # (K, T, N)
+            n_show = min(fr_samp.shape[0], 5)
+            for kk in range(n_show):
+                ax.plot(
+                    time, fr_samp[kk, :, idx],
+                    color=_COL_FRSTOCH, lw=0.6, alpha=0.30, zorder=1,
+                    label="FR sample" if kk == 0 else None,
+                )
+        if cv_reg_mu is not None and r2_cvreg is not None:
+            ax.plot(time, cv_reg_mu[:, idx], color=_COL_CVREG,
+                    lw=2.0, ls="--", alpha=0.85,
+                    label=f"CV-reg (R\u00b2={r2_cvreg[idx]:.3f})", zorder=6)
         lbl = _label_for_idx(labels, idx)
         _style(ax, ylabel=lbl)
         ax.legend(loc="upper right", frameon=False, fontsize=13, ncol=2)
@@ -866,6 +943,8 @@ def plot_prediction_traces(
             spectra.append((preds_loo[idx], _COL_CV, "LOO"))
         if np.isfinite(r2_fr[idx]):
             spectra.append((u_free[:, idx], _COL_FR, "Free-run"))
+        if cv_reg_mu is not None:
+            spectra.append((cv_reg_mu[:, idx], _COL_CVREG, "CV-reg"))
         any_ps = False
         for series, color, label in spectra:
             freqs, power = _compute_power_spectrum(series, dt)
@@ -894,32 +973,19 @@ def plot_prediction_traces(
 
 
 # =====================================================================
-# Ridge-CV diagnostics (alpha, backbone, behaviour decoder)
+# Ridge-CV diagnostics (dynamics joint solve, behaviour decoder)
 # =====================================================================
 
-def _run_alpha_cv_for_diagnostics(
+def _run_dynamics_cv_for_diagnostics(
     model: Stage2ModelPT,
     data: Dict[str, Any],
     cfg,
 ) -> Optional[Dict[str, Any]]:
     try:
-        from .train import ridge_cv_solve_alpha
-        return ridge_cv_solve_alpha(model, data, cfg)
+        from .train import joint_cv_solve
+        return joint_cv_solve(model, data, cfg)
     except Exception as e:
-        get_stage2_logger().warning("alpha_cv_diag_failed", error=str(e))
-        return None
-
-
-def _run_backbone_cv_for_diagnostics(
-    model: Stage2ModelPT,
-    data: Dict[str, Any],
-    cfg,
-) -> Optional[Dict[str, Any]]:
-    try:
-        from .train import backbone_cv_solve
-        return backbone_cv_solve(model, data, cfg)
-    except Exception as e:
-        get_stage2_logger().warning("backbone_cv_diag_failed", error=str(e))
+        get_stage2_logger().warning("dynamics_cv_diag_failed", error=str(e))
         return None
 
 
@@ -1016,16 +1082,15 @@ def plot_ridge_cv_diagnostics(
     save_dir: str,
     cfg=None,
 ) -> None:
-    """Three-row Ridge-CV diagnostics: Alpha · Backbone · Behaviour."""
+    """Two-row Ridge-CV diagnostics: Dynamics (joint) · Behaviour."""
     import matplotlib.pyplot as plt
     from matplotlib.gridspec import GridSpec
 
     u_np = data["u_stage1"].cpu().numpy()
     T, N = u_np.shape
 
-    # ---- Run both ridge-CV solvers for diagnostics ----
-    alpha_diag = _run_alpha_cv_for_diagnostics(model, data, cfg)
-    backbone_diag = _run_backbone_cv_for_diagnostics(model, data, cfg)
+    # ---- Run joint dynamics-CV solver for diagnostics ----
+    dyn_diag = _run_dynamics_cv_for_diagnostics(model, data, cfg)
 
     beh_cv_model = None
     beh_cv_gt = None
@@ -1033,41 +1098,42 @@ def plot_ridge_cv_diagnostics(
         beh_cv_model = beh_results.get("ridge_cv_model")
         beh_cv_gt = beh_results.get("ridge_cv_gt")
 
-    fig = plt.figure(figsize=(30, 20))
-    gs = GridSpec(3, 4, hspace=0.45, wspace=0.38)
+    fig = plt.figure(figsize=(30, 14))
+    gs = GridSpec(2, 4, hspace=0.45, wspace=0.38)
 
     # ================================================================
-    # Row 0 – Alpha-CV  (synaptic amplitudes a_sv, a_dcv)
+    # Row 0 – Dynamics-CV  (joint I0 + G + a_sv + a_dcv)
     # ================================================================
 
-    # A. Best Ridge α histogram
+    # A. Best Ridge λ histogram
     ax = fig.add_subplot(gs[0, 0])
-    if alpha_diag is not None:
+    if dyn_diag is not None:
         _plot_best_lambda_hist(
-            ax, alpha_diag["lambdas"],
-            alpha_diag.get("at_upper_flags"),
-            xlabel=r"$\log_{10}(\alpha)$",
-            title="A. Alpha CV: Best Ridge α")
+            ax, dyn_diag["lambdas"],
+            dyn_diag.get("at_upper_flags"),
+            xlabel=r"$\log_{10}(\lambda)$",
+            title="A. Dynamics CV: Best Ridge λ")
     else:
-        ax.text(0.5, 0.5, "No alpha CV", ha="center", va="center",
+        ax.text(0.5, 0.5, "No dynamics CV", ha="center", va="center",
                 fontsize=13, transform=ax.transAxes)
-        _style(ax, title="A. Alpha CV: Best Ridge α")
+        _style(ax, title="A. Dynamics CV: Best Ridge λ")
 
     # B. Per-Neuron Fit R²
     ax = fig.add_subplot(gs[0, 1])
-    if alpha_diag is not None and alpha_diag.get("fit_r2") is not None:
-        _plot_fit_r2_bars(ax, alpha_diag["fit_r2"],
-                          "B. Alpha CV: Per-Neuron Fit R²")
+    if dyn_diag is not None and dyn_diag.get("fit_r2") is not None:
+        _plot_fit_r2_bars(ax, dyn_diag["fit_r2"],
+                          "B. Dynamics CV: Per-Neuron Fit R²")
     else:
-        ax.text(0.5, 0.5, "No alpha CV", ha="center", va="center",
+        ax.text(0.5, 0.5, "No dynamics CV", ha="center", va="center",
                 fontsize=13, transform=ax.transAxes)
-        _style(ax, title="B. Alpha CV: Per-Neuron Fit R²")
+        _style(ax, title="B. Dynamics CV: Per-Neuron Fit R²")
 
-    # C. Coefficient heatmap (neurons × ranks)
+    # C. Coefficient heatmap (gap + sv + dcv)
     ax = fig.add_subplot(gs[0, 2])
-    if alpha_diag is not None:
+    if dyn_diag is not None:
         r_sv = model.r_sv
         r_dcv = model.r_dcv
+        # Build combined coef from current model params
         with torch.no_grad():
             a_sv_np = model.a_sv.cpu().numpy()
             a_dcv_np = model.a_dcv.cpu().numpy()
@@ -1075,103 +1141,42 @@ def plot_ridge_cv_diagnostics(
             a_sv_np = np.tile(a_sv_np, (N, 1))
         if a_dcv_np.ndim == 1:
             a_dcv_np = np.tile(a_dcv_np, (N, 1))
-        combined = np.concatenate([a_sv_np, a_dcv_np], axis=1)
-        neuron_order = np.argsort(combined.sum(axis=1))[::-1]
+        G_coefs = dyn_diag.get("G_coefs", np.full(N, np.nan))
+        G_col = np.where(np.isfinite(G_coefs), G_coefs, 0.0).reshape(-1, 1)
+        combined = np.concatenate([G_col, a_sv_np, a_dcv_np], axis=1)
+        neuron_order = np.argsort(np.abs(combined).sum(axis=1))[::-1]
         combined_sorted = combined[neuron_order]
-        vmax = np.percentile(combined[combined > 0], 95) if (combined > 0).any() else 1.0
-        im = ax.imshow(combined_sorted, aspect="auto", cmap="YlOrRd",
-                       vmin=0, vmax=vmax, interpolation="nearest")
-        ax.axvline(r_sv - 0.5, color="white", lw=2, ls="--")
-        rank_labels = [f"SV{i}" for i in range(r_sv)] + [f"DCV{i}" for i in range(r_dcv)]
+        vmax = np.percentile(np.abs(combined[np.isfinite(combined)]), 95) if np.isfinite(combined).any() else 1.0
+        im = ax.imshow(combined_sorted, aspect="auto", cmap="RdBu_r",
+                       vmin=-vmax, vmax=vmax, interpolation="nearest")
+        # Mark boundaries
+        ax.axvline(0.5, color="black", lw=2, ls="--")
+        if r_sv > 0:
+            ax.axvline(0.5 + r_sv, color="white", lw=2, ls="--")
+        rank_labels = ["G"] + [f"SV{i}" for i in range(r_sv)] + [f"DCV{i}" for i in range(r_dcv)]
         ax.set_xticks(np.arange(len(rank_labels)))
         ax.set_xticklabels(rank_labels, fontsize=9, rotation=45)
-        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="α")
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="coeff")
     else:
-        ax.text(0.5, 0.5, "No alpha data", ha="center", va="center",
+        ax.text(0.5, 0.5, "No dynamics data", ha="center", va="center",
                 fontsize=13, transform=ax.transAxes)
     _style(ax, xlabel="", ylabel=f"Neurons (sorted, N={N})",
-           title="C. Alpha Coefficients (sorted)")
+           title="C. Joint Coefficients (sorted)")
 
-    # D. Alpha CV-MSE curves (sample neurons)
+    # D. Dynamics CV-MSE curves (sample neurons)
     ax = fig.add_subplot(gs[0, 3])
-    if alpha_diag is not None:
+    if dyn_diag is not None:
         _plot_cv_mse_curves(
-            ax, alpha_diag.get("cv_mse_all"), alpha_diag.get("ridge_grid"),
-            alpha_diag["lambdas"], "D. Alpha CV: MSE Curves",
+            ax, dyn_diag.get("cv_mse_all"), dyn_diag.get("ridge_grid"),
+            dyn_diag["lambdas"], "D. Dynamics CV: MSE Curves",
             color_map="viridis")
     else:
-        ax.text(0.5, 0.5, "No alpha CV", ha="center", va="center",
+        ax.text(0.5, 0.5, "No dynamics CV", ha="center", va="center",
                 fontsize=13, transform=ax.transAxes)
-        _style(ax, title="D. Alpha CV: MSE Curves")
+        _style(ax, title="D. Dynamics CV: MSE Curves")
 
     # ================================================================
-    # Row 1 – Backbone-CV  (I0 + G scale)
-    # ================================================================
-
-    # E. Best Ridge λ histogram
-    ax = fig.add_subplot(gs[1, 0])
-    if backbone_diag is not None:
-        _plot_best_lambda_hist(
-            ax, backbone_diag["lambdas"],
-            backbone_diag.get("at_upper_flags"),
-            xlabel=r"$\log_{10}(\lambda)$",
-            title="E. Backbone CV: Best Ridge λ",
-            color="#2ca02c")
-    else:
-        ax.text(0.5, 0.5, "No backbone CV", ha="center", va="center",
-                fontsize=13, transform=ax.transAxes)
-        _style(ax, title="E. Backbone CV: Best Ridge λ")
-
-    # F. Backbone Per-Neuron Fit R²
-    ax = fig.add_subplot(gs[1, 1])
-    if backbone_diag is not None and backbone_diag.get("fit_r2") is not None:
-        _plot_fit_r2_bars(ax, backbone_diag["fit_r2"],
-                          "F. Backbone CV: Per-Neuron Fit R²")
-    else:
-        ax.text(0.5, 0.5, "No backbone CV", ha="center", va="center",
-                fontsize=13, transform=ax.transAxes)
-        _style(ax, title="F. Backbone CV: Per-Neuron Fit R²")
-
-    # G. Gap scales distribution
-    ax = fig.add_subplot(gs[1, 2])
-    if backbone_diag is not None and backbone_diag.get("gap_scales") is not None:
-        gs_vals = backbone_diag["gap_scales"]
-        valid_gs = gs_vals[np.isfinite(gs_vals)]
-        G_scale = backbone_diag.get("G_scale", np.nan)
-        if len(valid_gs) > 0:
-            ax.hist(valid_gs, bins=30, color="#2ca02c", alpha=0.7,
-                    edgecolor="white")
-            ax.axvline(G_scale, color=_COL_RAW, lw=2, ls="--",
-                       label=f"G median={G_scale:.4f}")
-            n_zero = int((valid_gs <= 1e-8).sum())
-            ax.text(0.97, 0.97,
-                    f"N={len(valid_gs)}\n{n_zero} near zero",
-                    transform=ax.transAxes, ha="right", va="top", fontsize=10,
-                    bbox=dict(boxstyle="round", fc="#f7f7f7", alpha=0.85))
-            ax.legend(frameon=False, fontsize=10)
-        else:
-            ax.text(0.5, 0.5, "All NaN", ha="center", va="center",
-                    fontsize=13, transform=ax.transAxes)
-    else:
-        ax.text(0.5, 0.5, "No backbone CV", ha="center", va="center",
-                fontsize=13, transform=ax.transAxes)
-    _style(ax, xlabel="Per-neuron gap scale", ylabel="Count",
-           title="G. Backbone CV: Gap Scales")
-
-    # H. Backbone CV-MSE curves (sample neurons)
-    ax = fig.add_subplot(gs[1, 3])
-    if backbone_diag is not None:
-        _plot_cv_mse_curves(
-            ax, backbone_diag.get("cv_mse_all"), backbone_diag.get("ridge_grid"),
-            backbone_diag["lambdas"], "H. Backbone CV: MSE Curves",
-            color_map="copper")
-    else:
-        ax.text(0.5, 0.5, "No backbone CV", ha="center", va="center",
-                fontsize=13, transform=ax.transAxes)
-        _style(ax, title="H. Backbone CV: MSE Curves")
-
-    # ================================================================
-    # Row 2 – Behaviour Decoder Ridge-CV
+    # Row 1 – Behaviour Decoder Ridge-CV
     # ================================================================
 
     def _plot_beh_cv_curves(ax, cv_dict, title_str):
@@ -1206,8 +1211,8 @@ def plot_ridge_cv_diagnostics(
         ax.legend(frameon=False, fontsize=9, ncol=2)
         _style(ax, xlabel="Ridge λ", ylabel="CV-MSE", title=title_str)
 
-    # I. Best-α comparison: GT vs Model decoder
-    ax = fig.add_subplot(gs[2, 0])
+    # E. Best-α comparison: GT vs Model decoder
+    ax = fig.add_subplot(gs[1, 0])
     has_gt = beh_cv_gt is not None and beh_cv_gt.get("best_lambdas") is not None
     has_model = beh_cv_model is not None and beh_cv_model.get("best_lambdas") is not None
     if has_gt or has_model:
@@ -1240,18 +1245,18 @@ def plot_ridge_cv_diagnostics(
         ax.text(0.5, 0.5, "No decoder data", ha="center", va="center",
                 fontsize=13, transform=ax.transAxes)
     _style(ax, xlabel="Eigenworm mode", ylabel="Best α",
-           title="I. Decoder: Best Ridge α")
+           title="E. Decoder: Best Ridge α")
 
-    # J. GT decoder CV-MSE
-    ax = fig.add_subplot(gs[2, 1])
-    _plot_beh_cv_curves(ax, beh_cv_gt, "J. GT Decoder CV-MSE")
+    # F. GT decoder CV-MSE
+    ax = fig.add_subplot(gs[1, 1])
+    _plot_beh_cv_curves(ax, beh_cv_gt, "F. GT Decoder CV-MSE")
 
-    # K. Model decoder CV-MSE
-    ax = fig.add_subplot(gs[2, 2])
-    _plot_beh_cv_curves(ax, beh_cv_model, "K. Model Decoder CV-MSE")
+    # G. Model decoder CV-MSE
+    ax = fig.add_subplot(gs[1, 2])
+    _plot_beh_cv_curves(ax, beh_cv_model, "G. Model Decoder CV-MSE")
 
-    # L. Min CV-MSE at Best α (bar comparison)
-    ax = fig.add_subplot(gs[2, 3])
+    # H. Min CV-MSE at Best α (bar comparison)
+    ax = fig.add_subplot(gs[1, 3])
     has_gt_mse = beh_cv_gt is not None and beh_cv_gt.get("cv_mse_curves") is not None
     has_mod_mse = beh_cv_model is not None and beh_cv_model.get("cv_mse_curves") is not None
     if has_gt_mse or has_mod_mse:
@@ -1282,13 +1287,166 @@ def plot_ridge_cv_diagnostics(
         ax.text(0.5, 0.5, "No decoder CV data", ha="center", va="center",
                 fontsize=13, transform=ax.transAxes)
     _style(ax, xlabel="Eigenworm mode", ylabel="Min CV-MSE",
-           title="L. Decoder: Min CV-MSE at Best α")
+           title="H. Decoder: Min CV-MSE at Best α")
 
     fig.suptitle("Ridge-CV Diagnostics", fontsize=28,
                  fontweight="bold", y=1.01)
     _save_png(fig, save_dir, "ridge_cv_diagnostics.png",
               dpi=150, bbox_inches="tight")
     plt.close(fig)
+# ======================================================================= #
+#  CV-Reg diagnostics (per-neuron shrinkage α)                            #
+# ======================================================================= #
+
+def plot_cv_reg_diagnostics(
+    data: Dict[str, Any],
+    cv_reg: Dict[str, Any],
+    onestep: Dict[str, Any],
+    save_dir: str,
+) -> None:
+    """Four-panel CV-reg diagnostic figure.
+
+    A. Per-neuron α histogram  (0 = pure AR1, 1 = trust model)
+    B. R² scatter: raw model vs CV-reg, per neuron
+    C. CV-MSE landscape heatmap  (neurons × reg grid)
+    D. Example traces for 4 neurons: data, raw, AR1, CV-reg
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.gridspec import GridSpec
+
+    alpha    = cv_reg["alpha"]
+    r2_cv    = cv_reg["r2"]
+    r2_raw   = cv_reg["r2_raw"]
+    reg_grid = cv_reg["reg_grid"]
+    cv_mse   = cv_reg["cv_mse_all"]
+    cv_mu    = cv_reg["cv_reg_mu"]
+    N        = len(alpha)
+
+    u_np  = data["u_stage1"].cpu().numpy()
+    T     = u_np.shape[0]
+    dt    = float(data["dt"])
+    time  = np.arange(T) * dt
+    labels = _get_labels(data)
+    mu_os = onestep["prior_mu"]
+    ar1_mu = onestep.get("ar1_mu")
+
+    fig = plt.figure(figsize=(26, 16))
+    gs = GridSpec(2, 2, hspace=0.38, wspace=0.32)
+
+    # ---- A. Alpha histogram ----
+    ax = fig.add_subplot(gs[0, 0])
+    ax.hist(alpha, bins=min(40, max(10, N // 3)), color=_COL_CVREG,
+            alpha=0.75, edgecolor="white")
+    med = float(np.median(alpha))
+    ax.axvline(med, color=_COL_RAW, lw=2, ls="--",
+               label=f"median α = {med:.3f}")
+    ax.axvline(0.0, color="0.5", lw=1, ls=":")
+    ax.axvline(1.0, color="0.5", lw=1, ls=":")
+    n_shrunk = int((alpha < 0.5).sum())
+    ax.text(0.97, 0.97,
+            f"N = {N}\n{n_shrunk} shrunk (α < 0.5)",
+            transform=ax.transAxes, ha="right", va="top", fontsize=11,
+            bbox=dict(boxstyle="round", fc="#f7f7f7", alpha=0.85))
+    ax.legend(frameon=False, fontsize=12)
+    _style(ax, xlabel="α  (0 = AR1, 1 = model)", ylabel="Count",
+           title="A. Per-Neuron Shrinkage α")
+
+    # ---- B. R² scatter: raw model vs CV-reg ----
+    ax = fig.add_subplot(gs[0, 1])
+    valid = np.isfinite(r2_raw) & np.isfinite(r2_cv)
+    if valid.sum() > 0:
+        ax.scatter(r2_raw[valid], r2_cv[valid], s=20, alpha=0.6,
+                   color=_COL_CVREG, edgecolors="none")
+        lo = min(r2_raw[valid].min(), r2_cv[valid].min(), 0)
+        hi = max(r2_raw[valid].max(), r2_cv[valid].max(), 1)
+        ax.plot([lo, hi], [lo, hi], "k--", lw=1, alpha=0.5, label="y = x")
+        n_improved = int((r2_cv[valid] > r2_raw[valid]).sum())
+        med_improve = float(np.nanmedian(r2_cv[valid] - r2_raw[valid]))
+        ax.text(0.03, 0.97,
+                f"{n_improved}/{valid.sum()} improved\n"
+                f"median ΔR² = {med_improve:+.4f}",
+                transform=ax.transAxes, ha="left", va="top", fontsize=11,
+                bbox=dict(boxstyle="round", fc="#f7f7f7", alpha=0.85))
+        ax.legend(frameon=False, fontsize=11, loc="lower right")
+    _style(ax, xlabel="R² (raw model)", ylabel="R² (CV-reg)",
+           title="B. Model Fit: Raw vs CV-Regularised")
+
+    # ---- C. CV-MSE heatmap ----
+    ax = fig.add_subplot(gs[1, 0])
+    # Sort neurons by best alpha for cleaner visual
+    order = np.argsort(alpha)
+    mse_sorted = cv_mse[order]
+    # Log-scale for visualisation
+    with np.errstate(divide="ignore", invalid="ignore"):
+        log_mse = np.log10(np.where(np.isfinite(mse_sorted) & (mse_sorted > 0),
+                                     mse_sorted, np.nan))
+    vmin = np.nanpercentile(log_mse, 2) if np.any(np.isfinite(log_mse)) else -3
+    vmax = np.nanpercentile(log_mse, 98) if np.any(np.isfinite(log_mse)) else 0
+    im = ax.imshow(log_mse, aspect="auto", cmap="viridis",
+                   vmin=vmin, vmax=vmax, interpolation="nearest",
+                   extent=[np.log10(reg_grid[0]), np.log10(reg_grid[-1]),
+                           N - 0.5, -0.5])
+    # Mark best reg per neuron
+    best_reg = cv_reg["best_reg"]
+    for row_i, ni in enumerate(order):
+        if np.isfinite(best_reg[ni]) and best_reg[ni] > 0:
+            ax.plot(np.log10(best_reg[ni]), row_i, "w.", markersize=2, alpha=0.6)
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label=r"$\log_{10}$(CV-MSE)")
+    _style(ax, xlabel=r"$\log_{10}$(reg)", ylabel=r"Neurons (sorted by $\alpha$)",
+           title="C. CV-MSE Landscape")
+
+    # ---- D. Example traces ----
+    ax = fig.add_subplot(gs[1, 1])
+    # Pick 4 neurons: best improvement, worst improvement, median, most shrunk
+    improvement = r2_cv - r2_raw
+    finite_imp = np.isfinite(improvement)
+    if finite_imp.sum() >= 4:
+        candidates = np.where(finite_imp)[0]
+        imp_sorted = candidates[np.argsort(improvement[candidates])]
+        picks = [
+            imp_sorted[-1],                          # best improvement
+            imp_sorted[len(imp_sorted) // 2],        # median
+            imp_sorted[0],                           # worst improvement
+            candidates[np.argmin(alpha[candidates])], # most shrunk
+        ]
+        picks = list(dict.fromkeys(picks))[:4]  # deduplicate, keep order
+    elif finite_imp.sum() > 0:
+        picks = list(np.where(finite_imp)[0][:4])
+    else:
+        picks = list(range(min(4, N)))
+
+    colors_trace = ["#e41a1c", "#377eb8", "#4daf4a", "#984ea3"]
+    for ti, idx in enumerate(picks):
+        offset = ti * 1.8
+        lbl = _label_for_idx(labels, idx)
+        # Normalise for stacked display
+        sig = u_np[:, idx]
+        sig_std = max(np.nanstd(sig), 1e-8)
+        sig_n = (sig - np.nanmean(sig)) / sig_std
+
+        ax.plot(time, sig_n + offset, color="0.5", lw=1.0, alpha=0.4)
+        ax.plot(time, (mu_os[:, idx] - np.nanmean(sig)) / sig_std + offset,
+                color=colors_trace[ti], lw=1.2, alpha=0.5, ls="-")
+        ax.plot(time, (cv_mu[:, idx] - np.nanmean(sig)) / sig_std + offset,
+                color=colors_trace[ti], lw=2.0, alpha=0.9, ls="--")
+        ax.text(time[-1] * 1.01, offset,
+                f"{lbl}  α={alpha[idx]:.2f}  ΔR²={improvement[idx]:+.3f}",
+                fontsize=9, va="center")
+    # Legend entries
+    ax.plot([], [], color="0.5", lw=1.0, alpha=0.4, label="Data")
+    ax.plot([], [], color="0.4", lw=1.2, ls="-", label="Raw model")
+    ax.plot([], [], color="0.4", lw=2.0, ls="--", label="CV-reg")
+    ax.legend(frameon=False, fontsize=11, loc="upper left")
+    ax.set_yticks([])
+    _style(ax, xlabel="Time (s)", title="D. Example Traces: Raw vs CV-Reg")
+
+    fig.suptitle("Cross-Validated Regularisation (Per-Neuron Shrinkage)",
+                 fontsize=26, fontweight="bold", y=1.01)
+    _save_png(fig, save_dir, "cv_reg_diagnostics.png",
+              dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def generate_eval_loo_plots(
     model,
     data: Dict[str, Any],
@@ -1322,9 +1480,15 @@ def generate_eval_loo_plots(
                        save_dir, epoch_losses=epoch_losses,
                        beh_all=beh_all)
     plot_parameter_trajectories(epoch_losses, save_dir, cfg=cfg)
-    plot_prediction_traces(data, onestep, loo, free_run, save_dir)
+    plot_prediction_traces(data, onestep, loo, free_run, save_dir,
+                           freerun_stoch=results.get("freerun_stoch"))
 
-    if include_ridge_diagnostics:
+    cv_reg = results.get("cv_reg")
+    if cv_reg is not None:
+        plot_cv_reg_diagnostics(data, cv_reg, onestep, save_dir)
+
+    _dynamics_cv_on = bool(getattr(cfg, "include_dynamics_cv_diagnostics", True))
+    if include_ridge_diagnostics and _dynamics_cv_on:
         plot_ridge_cv_diagnostics(model, data, onestep, free_run, beh, save_dir, cfg=cfg)
 
     return {
@@ -1333,6 +1497,7 @@ def generate_eval_loo_plots(
         "onestep": onestep,
         "loo": loo,
         "free_run": free_run,
+        "freerun_stoch": results.get("freerun_stoch"),
         "beh_all": beh_all,
     }
 

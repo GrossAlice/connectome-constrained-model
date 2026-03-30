@@ -7,6 +7,28 @@ if TYPE_CHECKING:
     from .model import Stage2ModelPT
 
 
+
+def _build_per_source_reversals(T_sv, sign_t, e_exc, e_inh):
+    """Per-neuron reversal: weighted average of E_exc / E_inh by input sign."""
+    mask = T_sv > 0
+    total = mask.sum(1).float().clamp(min=1)
+    E = (((sign_t > 0) & mask).sum(1).float() / total * e_exc
+         + ((sign_t < 0) & mask).sum(1).float() / total * e_inh)
+    return torch.where(total <= 1, torch.zeros_like(E), E)
+
+
+def _build_edge_specific_reversals(T_sv, sign_t, e_exc, e_inh):
+    """Per-edge reversal: E_exc for excitatory, E_inh for inhibitory edges."""
+    mask = T_sv > 0
+    E = torch.where(
+        sign_t > 0,
+        torch.full_like(sign_t, float(e_exc)),
+        torch.where(sign_t < 0, torch.full_like(sign_t, float(e_inh)),
+                     torch.zeros_like(sign_t)),
+    )
+    return E * mask.float()
+
+
 def _ols_lambda_u(u: torch.Tensor, lo: float, hi: float) -> torch.Tensor:
     x, y = u[:-1], u[1:]
     mx, my = x.mean(0), y.mean(0)
@@ -40,6 +62,15 @@ def init_I0(model: "Stage2ModelPT", u: torch.Tensor) -> torch.Tensor:
     return I0_ols
 
 def init_reversals(model: "Stage2ModelPT", u: torch.Tensor, baseline: torch.Tensor, cfg=None):
+    """Set reversal potentials from data quantiles and neurotransmitter signs.
+
+    * E_exc ← 99th percentile of neural traces
+    * E_inh ← 1st percentile
+    * E_dcv ← median tonic drive (rest)
+
+    The sign structure is built from ``model.sign_t`` (stored by the
+    constructor) and combined with data-driven magnitudes in one shot.
+    """
     q_lo, q_hi = 0.01, 0.99
     finite = u.detach().cpu().numpy().ravel()
     finite = finite[np.isfinite(finite)]
@@ -54,14 +85,110 @@ def init_reversals(model: "Stage2ModelPT", u: torch.Tensor, baseline: torch.Tens
         e_inh = rest - pad
     if not np.isfinite(e_exc) or e_exc <= rest:
         e_exc = rest + pad
+
+    mode = str(getattr(cfg, "reversal_mode", "per_neuron") if cfg else "per_neuron")
+    sign_t = getattr(model, "sign_t", None)
+
     with torch.no_grad():
-        if model.E_sv.numel() > 1:
-            sign = torch.sign(model.E_sv)
-            model.E_sv.data.copy_(torch.where(sign > 0, e_exc, torch.where(sign < 0, e_inh, 0.0)))
+        if mode == "per_edge" and sign_t is not None:
+            E_sv = _build_edge_specific_reversals(
+                model.T_sv, sign_t, e_exc, e_inh)
+        elif mode == "per_neuron" and sign_t is not None:
+            E_sv = _build_per_source_reversals(
+                model.T_sv, sign_t, e_exc, e_inh)
         else:
-            model.E_sv.data.fill_(e_exc)
+            E_sv = torch.full_like(model.E_sv, e_exc)
+        model.E_sv.data.copy_(E_sv)
         model.E_dcv.data.fill_(rest)
     print(f"[init] reversals: E_exc={e_exc:.4f}, E_inh={e_inh:.4f}, E_dcv={rest:.4f}")
+
+# ── Connectivity-based weight initialisation ────────────────────────────
+
+def init_W_from_config(model: "Stage2ModelPT", cfg=None) -> None:
+    """Apply connectivity-structure-based W_sv / W_dcv initialisation.
+
+    Modes (from ``cfg.W_sv_init_mode``):
+
+    * ``uniform`` (default) — keep the constructor's constant W.
+    * ``log_counts`` — ``T·W = log₂(1+c)`` so each synapse group's effective
+      weight grows sub-linearly with contact count.
+    * ``sqrt_counts`` — ``T·W = √c``.
+
+    If ``cfg.W_sv_normalize`` is True the effective weights ``T·W`` are further
+    row-normalised so that each post-synaptic neuron receives unit total input.
+    """
+    from .model import _reparam_inv, _W_SV_INIT, _W_DCV_INIT
+
+    W_sv_mode = str(getattr(cfg, "W_sv_init_mode", "uniform")) if cfg else "uniform"
+    W_sv_norm = bool(getattr(cfg, "W_sv_normalize", False)) if cfg else False
+
+    for attr, T_mat, init_val, mode, do_norm in [
+            ("W_sv",  model.T_sv,  _W_SV_INIT,  W_sv_mode, W_sv_norm),
+            ("W_dcv", model.T_dcv, _W_DCV_INIT, "uniform",  False)]:
+        if mode == "uniform" and not do_norm:
+            continue  # constructor's default is already uniform
+        lo = getattr(model, f"_{attr}_lo")
+        hi = getattr(model, f"_{attr}_hi")
+        mask = (T_mat > 0).float()
+        safe_c = T_mat.clamp(min=1.0)
+        if mode == "log_counts":
+            W_init = torch.where(mask.bool(),
+                                 torch.log2(1.0 + T_mat) / safe_c,
+                                 torch.ones_like(T_mat))
+        elif mode == "sqrt_counts":
+            W_init = torch.where(mask.bool(),
+                                 1.0 / safe_c.sqrt(),
+                                 torch.ones_like(T_mat))
+        else:  # uniform + normalize
+            W_init = torch.full_like(T_mat, init_val)
+        if do_norm:
+            eff = T_mat * W_init
+            row_sum = eff.sum(dim=1, keepdim=True).clamp(min=1e-8)
+            W_init = W_init / row_sum
+        W_raw = _reparam_inv(W_init, lo, hi) * mask
+        raw = getattr(model, f"_{attr}_raw")
+        with torch.no_grad():
+            raw.data.copy_(W_raw)
+        print(f"[init] {attr} ({mode}{'+norm' if do_norm else ''}): "
+              f"mean(edges)={W_init[mask.bool()].mean():.4f}")
+
+
+def init_G_from_config(model: "Stage2ModelPT", cfg=None) -> None:
+    """Apply connectivity-structure-based G initialisation for edge-specific G.
+
+    Modes (from ``cfg.G_init_mode``):
+
+    * ``uniform`` (default) — keep the constructor's constant G.
+    * ``log_counts`` — ``T_e·G = log₂(1+c)``.
+    * ``sqrt_counts`` — ``T_e·G = √c``.
+    """
+    if not model.edge_specific_G:
+        return  # scalar G has no mode switching
+    from .model import _reparam_inv, _G_INIT
+
+    mode = str(getattr(cfg, "G_init_mode", "uniform")) if cfg else "uniform"
+    if mode == "uniform":
+        return
+
+    T_e = model.T_e
+    mask = (T_e > 0).float()
+    safe_te = T_e.clamp(min=1.0)
+    if mode == "log_counts":
+        G_mat = torch.where(mask.bool(),
+                            torch.log2(1.0 + T_e) / safe_te,
+                            torch.full_like(T_e, _G_INIT))
+    elif mode == "sqrt_counts":
+        G_mat = torch.where(mask.bool(),
+                            1.0 / safe_te.sqrt(),
+                            torch.full_like(T_e, _G_INIT))
+    else:
+        return
+    G_mat = G_mat * mask
+    G_raw = _reparam_inv(G_mat, model._G_lo, model._G_hi)
+    with torch.no_grad():
+        model._G_raw.data.copy_(G_raw)
+    print(f"[init] G ({mode}): mean(edges)={G_mat[mask.bool()].mean():.4f}")
+
 
 def _collect_current_patterns(
     model: "Stage2ModelPT", u: torch.Tensor,
@@ -291,6 +418,8 @@ def init_network_scale(model: "Stage2ModelPT", u: torch.Tensor,
 
 
 def init_all_from_data(model: "Stage2ModelPT", u: torch.Tensor, cfg=None):
+    init_W_from_config(model, cfg)
+    init_G_from_config(model, cfg)
     baseline = init_I0(model, u)
     init_reversals(model, u, baseline, cfg)
     init_network_scale(model, u, cfg)

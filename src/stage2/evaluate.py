@@ -14,7 +14,9 @@ from .model import Stage2ModelPT
 
 __all__ = [
     "compute_onestep",
+    "compute_cv_reg",
     "compute_free_run",
+    "free_run_stochastic",
     "loo_forward_simulate",
     "run_loo_all",
     "choose_loo_subset",
@@ -75,7 +77,6 @@ def _clamp(x: torch.Tensor, lo: Optional[float], hi: Optional[float]) -> torch.T
 def _teacher_forced_prior(
     model: Stage2ModelPT, u: torch.Tensor, gating, stim,
 ) -> torch.Tensor:
-    """One-step teacher-forced prior: u(t-1) → u(t) with ground-truth input."""
     T, N = u.shape
     device = u.device
     ones = torch.ones(N, device=device)
@@ -92,14 +93,6 @@ def _teacher_forced_prior(
 
 
 def _resolve_motor_indices(data: Dict[str, Any], N: int) -> list[int]:
-    """Return integer motor-neuron indices, resolving names if needed.
-
-    Priority:
-      1. ``data["motor_neurons"]`` – already mapped to ints by io_h5.
-      2. ``cfg.motor_neurons`` that are ints (or int-castable strings).
-      3. ``cfg.motor_neurons`` that are neuron *names* – resolved via
-         ``data["neuron_labels"]``.
-    """
     # 1. Pre-resolved indices stored during data loading
     pre = data.get("motor_neurons")
     if pre is not None and len(pre) > 0:
@@ -169,6 +162,161 @@ def compute_onestep(model: Stage2ModelPT, data: Dict[str, Any]) -> Dict[str, Any
     }
 
 
+# --------------------------------------------------------------------------- #
+#  Per-neuron shrinkage CV-reg                                                  #
+# --------------------------------------------------------------------------- #
+
+def _fit_ar1_ols(x: np.ndarray, y: np.ndarray):
+    """Fit y = a*x + b by OLS.  Returns (a, b)."""
+    valid = np.isfinite(x) & np.isfinite(y)
+    if valid.sum() < 3:
+        return 0.0, float(np.nanmean(y)) if np.any(np.isfinite(y)) else 0.0
+    xv, yv = x[valid].astype(np.float64), y[valid].astype(np.float64)
+    x_m, y_m = xv.mean(), yv.mean()
+    var_x = ((xv - x_m) ** 2).mean()
+    cov_xy = ((xv - x_m) * (yv - y_m)).mean()
+    a = cov_xy / max(var_x, 1e-12)
+    b = y_m - a * x_m
+    return float(a), float(b)
+
+
+def compute_cv_reg(
+    u_np: np.ndarray,
+    model_mu: np.ndarray,
+    *,
+    n_folds: int = 5,
+    log_reg_min: float = -3.0,
+    log_reg_max: float = 5.0,
+    n_grid: int = 50,
+) -> Dict[str, Any]:
+    """Per-neuron shrinkage CV-reg: blend AR(1) <-> full-model prediction.
+
+    For each neuron *i*, find optimal alpha_i in [0, 1] via temporal-block
+    k-fold CV:
+
+        u_reg = u_ar1 + alpha_i * (u_model - u_ar1)
+
+    where alpha_i = 1 / (1 + reg_i*) and reg_i* minimises held-out
+    one-step MSE.
+
+    Parameters
+    ----------
+    u_np : (T, N) ground-truth neural activity
+    model_mu : (T, N) teacher-forced one-step model prediction
+    n_folds : number of contiguous temporal blocks
+    log_reg_min, log_reg_max : log10 bounds for regularisation grid
+    n_grid : number of grid points (log-spaced)
+
+    Returns
+    -------
+    dict with keys:
+        cv_reg_mu : (T, N)  blended prediction using best alpha
+        alpha     : (N,)    per-neuron optimal alpha (0 = AR1, 1 = model)
+        best_reg  : (N,)    per-neuron optimal regularisation strength
+        reg_grid  : (n_grid,) regularisation values searched
+        alpha_grid: (n_grid,) corresponding alpha = 1/(1+reg)
+        cv_mse_all: (N, n_grid) mean CV-MSE at each grid point
+        r2        : (N,)    R^2 of the blended prediction
+        r2_improvement : (N,)  R^2(cv_reg) - R^2(raw model)
+    """
+    T, N = u_np.shape
+
+    # Regularisation grid (log-spaced)
+    reg_grid = np.logspace(log_reg_min, log_reg_max, n_grid)
+    alpha_grid = 1.0 / (1.0 + reg_grid)  # high reg -> alpha near 0 (AR1)
+
+    # Temporal transitions: t -> t+1
+    u_prev = u_np[:-1]          # (T-1, N)
+    u_next = u_np[1:]           # (T-1, N)
+    model_pred = model_mu[1:]   # (T-1, N)
+    n_trans = T - 1
+
+    # Create contiguous temporal-block fold assignments
+    fold_ids = np.zeros(n_trans, dtype=int)
+    fold_size = n_trans // n_folds
+    for k in range(n_folds):
+        start = k * fold_size
+        end = (k + 1) * fold_size if k < n_folds - 1 else n_trans
+        fold_ids[start:end] = k
+
+    # Per-neuron CV
+    best_alpha = np.zeros(N, dtype=np.float64)
+    best_reg = np.full(N, np.inf, dtype=np.float64)
+    cv_mse_all = np.full((N, n_grid), np.nan, dtype=np.float64)
+
+    for i in range(N):
+        fold_mse = np.full((n_folds, n_grid), np.nan, dtype=np.float64)
+
+        for k in range(n_folds):
+            train_mask = fold_ids != k
+            test_mask = fold_ids == k
+            if test_mask.sum() == 0:
+                continue
+
+            # Fit AR(1) on training portion: u_{t+1,i} = a * u_{t,i} + b
+            a, b = _fit_ar1_ols(u_prev[train_mask, i], u_next[train_mask, i])
+            ar1_test = a * u_prev[test_mask, i] + b
+            model_test = model_pred[test_mask, i]
+            target_test = u_next[test_mask, i]
+
+            # Correction vector (model - AR1) on held-out block
+            correction = model_test - ar1_test
+
+            # Evaluate each regularisation level
+            for gi, alpha in enumerate(alpha_grid):
+                blend = ar1_test + alpha * correction
+                resid = target_test - blend
+                valid = np.isfinite(resid)
+                if valid.sum() > 0:
+                    fold_mse[k, gi] = float(np.mean(resid[valid] ** 2))
+
+        # Average across folds and pick best
+        mean_mse = np.nanmean(fold_mse, axis=0)
+        cv_mse_all[i] = mean_mse
+
+        if np.all(np.isnan(mean_mse)):
+            best_alpha[i] = 0.0
+            best_reg[i] = np.inf
+        else:
+            best_idx = int(np.nanargmin(mean_mse))
+            best_alpha[i] = alpha_grid[best_idx]
+            best_reg[i] = reg_grid[best_idx]
+
+    # Build final blended prediction using full-data AR(1)
+    cv_reg_mu = np.zeros_like(u_np)
+    cv_reg_mu[0] = u_np[0]
+    for i in range(N):
+        a, b = _fit_ar1_ols(u_prev[:, i], u_next[:, i])
+        ar1_full = a * u_prev[:, i] + b
+        cv_reg_mu[1:, i] = ar1_full + best_alpha[i] * (model_pred[:, i] - ar1_full)
+
+    # Per-neuron R^2 of blended prediction
+    r2_cv = np.array([_r2(u_np[1:, i], cv_reg_mu[1:, i]) for i in range(N)])
+    r2_raw = np.array([_r2(u_np[1:, i], model_mu[1:, i]) for i in range(N)])
+
+    _logger = get_stage2_logger()
+    _n_shrunk = int((best_alpha < 0.5).sum())
+    _med_alpha = float(np.median(best_alpha))
+    _med_reg = float(np.median(best_reg[np.isfinite(best_reg)]))
+    _logger.info("cv_reg_done", N=N, n_folds=n_folds,
+                 median_alpha=_med_alpha, n_shrunk=_n_shrunk,
+                 median_reg=_med_reg,
+                 r2_raw_median=float(np.nanmedian(r2_raw)),
+                 r2_cv_median=float(np.nanmedian(r2_cv)))
+
+    return {
+        "cv_reg_mu": cv_reg_mu,
+        "alpha": best_alpha,
+        "best_reg": best_reg,
+        "reg_grid": reg_grid,
+        "alpha_grid": alpha_grid,
+        "cv_mse_all": cv_mse_all,
+        "r2": r2_cv,
+        "r2_raw": r2_raw,
+        "r2_improvement": r2_cv - r2_raw,
+    }
+
+
 def compute_free_run(model: Stage2ModelPT, data: Dict[str, Any]) -> Dict[str, Any]:
     device = next(model.parameters()).device
     u0 = data["u_stage1"].to(device)
@@ -213,6 +361,104 @@ def compute_free_run(model: Stage2ModelPT, data: Dict[str, Any]) -> Dict[str, An
         "mode": "motor_conditioned" if conditioned else "autonomous",
     }
 
+
+def free_run_stochastic(
+    model: Stage2ModelPT,
+    data: Dict[str, Any],
+    n_samples: int = 5,
+) -> Dict[str, Any]:
+    """Full-brain stochastic free-run: all neurons evolve autonomously with
+    learned process noise.
+
+    At each time step *every* neuron receives noise::
+
+        u_{t+1,i} = mu_{t+1,i} + sigma_{t,i} * eps,  eps ~ N(0,1)
+
+    where ``sigma_{t,i}`` is state-dependent (heteroscedastic) or constant
+    (homoscedastic) depending on the model.
+
+    Parameters
+    ----------
+    model : Stage2ModelPT
+    data  : dict with ``u_stage1``, optional ``gating``, ``stim``
+    n_samples : int
+        Number of independent sample trajectories.
+
+    Returns
+    -------
+    dict with keys:
+        samples    : np.ndarray, shape ``(n_samples, T, N)``
+        mean       : np.ndarray, shape ``(T, N)`` — ensemble mean
+        std        : np.ndarray, shape ``(T, N)`` — ensemble std
+        ci_lo      : np.ndarray, shape ``(T, N)`` — 2.5th percentile
+        ci_hi      : np.ndarray, shape ``(T, N)`` — 97.5th percentile
+        r2_per_sample : np.ndarray, shape ``(n_samples, N)`` — per-sample R²
+        r2_mean    : np.ndarray, shape ``(N,)`` — R² of ensemble mean
+    """
+    device = next(model.parameters()).device
+    u0 = data["u_stage1"].to(device)
+    T, N = u0.shape
+    gating = data.get("gating")
+    stim = data.get("stim")
+    lo, hi = _get_clip_bounds(model)
+    ones = torch.ones(N, device=device)
+    is_hetero = (getattr(model, "_noise_mode", "homoscedastic") == "heteroscedastic")
+
+    # Pre-compute constant sigma for homoscedastic models
+    if not is_hetero:
+        sigma_const = model.sigma_at().detach()  # (N,)
+
+    samples_np = np.zeros((n_samples, T, N), dtype=np.float32)
+
+    with torch.no_grad():
+        for k in range(n_samples):
+            u_cur = u0[0].clone()
+            samples_np[k, 0] = u_cur.cpu().numpy()
+            s_sv = torch.zeros(N, model.r_sv, device=device)
+            s_dcv = torch.zeros(N, model.r_dcv, device=device)
+
+            for t in range(T - 1):
+                g = gating[t] if gating is not None else ones
+                s = stim[t] if stim is not None else None
+                mu_next, s_sv, s_dcv = model.prior_step(
+                    u_cur, s_sv, s_dcv, g, s,
+                )
+                # Inject process noise into all neurons
+                if is_hetero:
+                    sigma_t = model.sigma_at(u_cur).detach()  # (N,)
+                else:
+                    sigma_t = sigma_const
+                eps = torch.randn(N, device=device)
+                u_next = mu_next + sigma_t * eps
+                u_next = _clamp(u_next, lo, hi)
+                u_cur = u_next
+                samples_np[k, t + 1] = u_cur.cpu().numpy()
+
+    u_np = u0.cpu().numpy()
+
+    # Ensemble statistics
+    ens_mean = samples_np.mean(axis=0)           # (T, N)
+    ens_std = samples_np.std(axis=0)             # (T, N)
+    ci_lo = np.percentile(samples_np, 2.5, axis=0)   # (T, N)
+    ci_hi = np.percentile(samples_np, 97.5, axis=0)  # (T, N)
+
+    # Per-sample R² and ensemble-mean R²
+    r2_per_sample = np.full((n_samples, N), np.nan)
+    for k in range(n_samples):
+        for j in range(N):
+            r2_per_sample[k, j] = _r2(u_np[1:, j], samples_np[k, 1:, j])
+    r2_mean = np.array([_r2(u_np[1:, j], ens_mean[1:, j]) for j in range(N)])
+
+    return {
+        "samples": samples_np,
+        "mean": ens_mean,
+        "std": ens_std,
+        "ci_lo": ci_lo,
+        "ci_hi": ci_hi,
+        "r2_per_sample": r2_per_sample,
+        "r2_mean": r2_mean,
+    }
+
 def loo_forward_simulate(
     model: Stage2ModelPT, u_all: torch.Tensor,
     held_out: int, gating, stim,
@@ -240,9 +486,134 @@ def loo_forward_simulate(
     return u_pred.cpu().numpy()
 
 
+def loo_forward_simulate_stochastic(
+    model: Stage2ModelPT, u_all: torch.Tensor,
+    held_out: int, gating, stim,
+    n_samples: int = 5,
+) -> np.ndarray:
+    """Sample *n_samples* stochastic LOO trajectories for neuron *held_out*.
+
+    At each time-step, instead of using the deterministic mean prediction,
+    we sample::
+
+        u_{t+1,i} ~ N( mu_{t+1,i}, sigma_{t,i}^2 )
+
+    where sigma is state-dependent (heteroscedastic) or constant
+    (homoscedastic) depending on the model configuration.
+    All other neurons are clamped to ground truth.
+
+    Returns
+    -------
+    samples : np.ndarray, shape ``(n_samples, T)``
+    """
+    T, N = u_all.shape
+    device = u_all.device
+    i = held_out
+    lo, hi = _get_clip_bounds(model)
+    ones = torch.ones(N, device=device)
+
+    # For homoscedastic models we can pre-compute sigma once
+    is_hetero = (getattr(model, "_noise_mode", "homoscedastic") == "heteroscedastic")
+    if not is_hetero:
+        sigma_i_const = model.sigma_at().detach()[i]
+
+    samples = np.zeros((n_samples, T), dtype=np.float32)
+    with torch.no_grad():
+        for k in range(n_samples):
+            u_pred = torch.zeros(T, device=device)
+            u_pred[0] = u_all[0, i]
+            s_sv  = torch.zeros(N, model.r_sv,  device=device)
+            s_dcv = torch.zeros(N, model.r_dcv, device=device)
+
+            for t in range(T - 1):
+                u_t = u_all[t].clone()
+                u_t[i] = u_pred[t]
+                g = gating[t] if gating is not None else ones
+                s = stim[t]   if stim   is not None else None
+                mu_next, s_sv, s_dcv = model.prior_step(u_t, s_sv, s_dcv, g, s)
+                # State-dependent or constant noise
+                if is_hetero:
+                    sigma_i = model.sigma_at(u_t).detach()[i]
+                else:
+                    sigma_i = sigma_i_const
+                noise = torch.randn(1, device=device) * sigma_i
+                u_pred[t + 1] = _clamp(
+                    mu_next[i : i + 1] + noise, lo, hi
+                ).squeeze()
+
+            samples[k] = u_pred.cpu().numpy()
+    return samples
+
+
+def _calibrate_loo_sigma(
+    u_true: np.ndarray, loo_pred: np.ndarray,
+) -> float:
+    """Compute per-neuron empirical LOO residual std (excluding frame 0).
+
+    This is the RMS of the deterministic LOO prediction error — the "true"
+    scale of LOO uncertainty, which is much larger than the learned one-step σ.
+    """
+    resid = u_true[1:] - loo_pred[1:]
+    m = np.isfinite(resid)
+    if m.sum() < 2:
+        return 1.0
+    return float(np.std(resid[m]))
+
+
+def loo_forward_simulate_calibrated(
+    model: Stage2ModelPT, u_all: torch.Tensor,
+    held_out: int, gating, stim,
+    sigma_empirical: float,
+    n_samples: int = 20,
+) -> np.ndarray:
+    """Calibrated stochastic LOO: inject noise scaled to the *empirical*
+    LOO residual std, not the (too-small) learned σ.
+
+    This produces stochastic sample trajectories whose 95% CI matches
+    the actual spread of LOO prediction errors.
+
+    Parameters
+    ----------
+    sigma_empirical : float
+        Per-neuron empirical LOO residual std from `_calibrate_loo_sigma`.
+    """
+    T, N = u_all.shape
+    device = u_all.device
+    i = held_out
+    lo, hi = _get_clip_bounds(model)
+    ones = torch.ones(N, device=device)
+
+    # Use empirical sigma for the held-out neuron, model sigma for others
+    sigma_emp_t = torch.tensor(sigma_empirical, device=device, dtype=torch.float32)
+
+    samples = np.zeros((n_samples, T), dtype=np.float32)
+    with torch.no_grad():
+        for k in range(n_samples):
+            u_pred = torch.zeros(T, device=device)
+            u_pred[0] = u_all[0, i]
+            s_sv  = torch.zeros(N, model.r_sv,  device=device)
+            s_dcv = torch.zeros(N, model.r_dcv, device=device)
+
+            for t in range(T - 1):
+                u_t = u_all[t].clone()
+                u_t[i] = u_pred[t]
+                g = gating[t] if gating is not None else ones
+                s = stim[t]   if stim   is not None else None
+                mu_next, s_sv, s_dcv = model.prior_step(u_t, s_sv, s_dcv, g, s)
+                # Inject noise at the *empirical* LOO scale
+                noise = torch.randn(1, device=device) * sigma_emp_t
+                u_pred[t + 1] = _clamp(
+                    mu_next[i : i + 1] + noise, lo, hi
+                ).squeeze()
+
+            samples[k] = u_pred.cpu().numpy()
+    return samples
+
+
 def run_loo_all(
     model: Stage2ModelPT, data: Dict[str, Any],
     subset: Optional[List[int]] = None,
+    n_sample_trajectories: int = 0,
 ) -> Dict[str, Any]:
     device = next(model.parameters()).device
     u = data["u_stage1"].to(device)
@@ -250,12 +621,33 @@ def run_loo_all(
     indices = subset if subset is not None else list(range(u.shape[1]))
     u_np = u.cpu().numpy()
 
+    # Decide whether to run stochastic sampling
+    do_stochastic = (
+        n_sample_trajectories > 0
+        and getattr(model, "_learn_noise", False)
+    )
+
     preds = {}
+    samples = {}  # idx -> (n_samples, T) array
+    calibrated_samples = {}  # idx -> (n_samples, T) array — calibrated to empirical LOO residuals
     labels = data.get("neuron_labels", [])
     _logger = get_stage2_logger()
-    _logger.info("loo_start", n_neurons=len(indices))
+    _logger.info("loo_start", n_neurons=len(indices),
+                 stochastic=do_stochastic, n_samples=n_sample_trajectories)
     for cnt, i in enumerate(indices):
         preds[i] = loo_forward_simulate(model, u, i, gating, stim)
+        if do_stochastic:
+            samples[i] = loo_forward_simulate_stochastic(
+                model, u, i, gating, stim,
+                n_samples=n_sample_trajectories,
+            )
+            # Calibrated sampling: use empirical LOO residual std
+            sigma_emp = _calibrate_loo_sigma(u_np[:, i], preds[i])
+            calibrated_samples[i] = loo_forward_simulate_calibrated(
+                model, u, i, gating, stim,
+                sigma_empirical=sigma_emp,
+                n_samples=n_sample_trajectories,
+            )
         lbl = labels[i] if i < len(labels) else f"#{i}"
         r2_i = float(_r2(u_np[1:, i], preds[i][1:]))
         if cnt == 0 or (cnt + 1) % 10 == 0 or len(indices) <= 10:
@@ -265,9 +657,12 @@ def run_loo_all(
     pred_full = np.column_stack([preds.get(i, u_np[:, i]) for i in range(u.shape[1])])
     r2, corr, rmse = _per_neuron_metrics(u_np[1:], pred_full[1:], indices)
 
-    return {
-        "pred": preds, "r2": r2, "corr": corr, "rmse": rmse,
-    }
+    result = {"pred": preds, "r2": r2, "corr": corr, "rmse": rmse}
+    if samples:
+        result["samples"] = samples
+    if calibrated_samples:
+        result["calibrated_samples"] = calibrated_samples
+    return result
 
 
 def choose_loo_subset(
@@ -439,9 +834,35 @@ def run_full_evaluation(
         seed=_cfg_val(cfg, "eval_loo_subset_seed", 0, int),
     )
 
-    loo      = run_loo_all(model, data, subset=subset)
+    # Per-neuron shrinkage CV-reg
+    cv_reg = None
+    if _cfg_val(cfg, "cv_reg_enabled", True, bool):
+        u_np = data["u_stage1"].cpu().numpy()
+        cv_reg = compute_cv_reg(
+            u_np, onestep["prior_mu"],
+            n_folds=_cfg_val(cfg, "cv_reg_n_folds", 5, int),
+            log_reg_min=_cfg_val(cfg, "cv_reg_log_min", -3.0, float),
+            log_reg_max=_cfg_val(cfg, "cv_reg_log_max", 5.0, float),
+            n_grid=_cfg_val(cfg, "cv_reg_n_grid", 50, int),
+        )
+    onestep["cv_reg"] = cv_reg
+
+    loo      = run_loo_all(
+        model, data, subset=subset,
+        n_sample_trajectories=_cfg_val(cfg, "n_sample_trajectories", 0, int),
+    )
     currents = compute_current_decomposition(model, data)
     free_run = compute_free_run(model, data)
+
+    # Full-brain stochastic free-run sampling
+    _n_fr = _cfg_val(cfg, "n_freerun_samples", 0, int)
+    freerun_stoch = None
+    if _n_fr > 0 and getattr(model, "_learn_noise", False):
+        _logger = get_stage2_logger()
+        _logger.info("freerun_stochastic_start", n_samples=_n_fr)
+        freerun_stoch = free_run_stochastic(model, data, n_samples=_n_fr)
+        _logger.info("freerun_stochastic_done",
+                     r2_mean_median=float(np.nanmedian(freerun_stoch["r2_mean"])))
 
     beh     = evaluate_training_decoder(decoder, data, onestep) if decoder is not None else None
     beh_all = (
@@ -457,7 +878,8 @@ def run_full_evaluation(
 
     return {
         "onestep": onestep, "loo": loo, "currents": currents,
-        "free_run": free_run,
+        "free_run": free_run, "freerun_stoch": freerun_stoch,
+        "cv_reg": cv_reg,
         "beh": beh, "beh_all": beh_all,
         "beh_r2_model": r2_model_mean,
     }

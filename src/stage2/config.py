@@ -56,12 +56,27 @@ class DynamicsConfig:
     per_neuron_amplitudes: bool = True  # (N, r) per-neuron vs shared (r,)
 
     learn_reversals: bool = False
-    reversal_mode: str = "scalar"   # "scalar"|"per_neuron"|"per_edge"
+    reversal_mode: str = "per_neuron"   # "scalar"|"per_neuron"|"per_edge"
 
     network_init_mode: str = "ols"      # "ols" (global) | "per_neuron_ridge" (per neuron)
 
     u_next_clip_min: Optional[float] = -10
     u_next_clip_max: Optional[float] = 10
+
+    # Per-neuron process noise: learnable log_sigma_u per neuron.
+    # When enabled, the model predicts a distribution u_{t+1} ~ N(mu, sigma^2)
+    # and the dynamics loss becomes Gaussian NLL instead of weighted MSE.
+    learn_noise: bool = False
+    noise_floor: float = 1e-3          # minimum sigma (softplus + floor)
+    noise_reg: float = 0.0             # L2 penalty on log_sigma_u (prevents collapse)
+    noise_mode: str = "homoscedastic"  # "homoscedastic" | "heteroscedastic"
+    # homoscedastic:   sigma_i = softplus(b_i) + floor  (constant per neuron)
+    # heteroscedastic: sigma_{t,i} = softplus(w_i * u_{t,i} + b_i) + floor
+    #                  (diagonal linear map — noise scales with own activation)
+    noise_sigma_source: str = "all"     # "all" | "rollout"
+    # "all"     — σ receives gradients from one-step + rollout + LOO NLL
+    # "rollout" — σ is detached from the one-step NLL so only rollout
+    #              and LOO NLL shape the noise magnitude (wider CIs)
 
 @dataclass
 class BehaviorConfig:
@@ -74,6 +89,19 @@ class BehaviorConfig:
     train_behavior_ridge_log_lambda_min: float = -3.0
     train_behavior_ridge_log_lambda_max: float = 10.0
     train_behavior_ridge_n_grid: int = 50
+
+    # Variance-preserving calibration of behaviour predictions.
+    # Scale factor for the noise (std) ratio sd_true / sd_pred:
+    #   1.0 = full rescaling (match data variance exactly)
+    #   0.0 = no rescaling (only shift mean)
+    #   >0  = interpolate: scale = 1 + noise_scale * (sd_true/sd_pred - 1)
+    behavior_noise_scale: float = 0.0
+
+    # AR-augmented behaviour decoder: prepend lagged eigenworm values to the
+    # feature matrix so the ridge/MLP can exploit autocorrelation.
+    #   0 = disabled (current default – purely neural features)
+    #   2 = recommended (AR(2) captures the ~8 s body-wave oscillation)
+    behavior_ar_lags: int = 0
 
 @dataclass
 class StimulusConfig:
@@ -94,7 +122,7 @@ class TrainConfig:
     grad_clip_norm: float = 1
     dynamics_l2:    float = 0.0
 
-    rollout_steps: int = 10
+    rollout_steps: int = 0
     rollout_weight: float = 1
     rollout_starts: int = 8
     warmstart_rollout: bool = True
@@ -108,27 +136,17 @@ class TrainConfig:
     u_var_scale:         float = 5.0
     u_var_floor:         float = 1e-6
 
-    # Alpha-CV: periodic ridge-CV re-solve of a_sv, a_dcv
-    alpha_cv_every: int = 0          # 0=disabled
-    alpha_cv_n_folds: int = 5
-    alpha_cv_log_min: float = -10.0
-    alpha_cv_log_max: float = 10.0
-    alpha_cv_n_grid: int = 80
-    alpha_cv_blend: float = 0.5
-    alpha_cv_max_ratio: float = 0.0
-    alpha_cv_warmup: int = 3         # ramp blend over this many injections (1=no ramp)
-
-    # Backbone-CV: periodic re-solve of I0 + G scale
-    # NOTE: works well with edge_specific_G=True; with scalar G the
-    # structural Laplacian features have near-zero R² and the solved
-    # G_scale is destructively small.  Leave at 0 for scalar G.
-    backbone_cv_every: int = 5      # 0=disabled
-    backbone_cv_blend: float = 0.5
-    backbone_cv_warmup: int = 3      # ramp blend over this many injections (1=no ramp)
-    backbone_cv_n_folds: int = 5
-    backbone_cv_log_min: float = -2.0
-    backbone_cv_log_max: float = 4.0
-    backbone_cv_n_grid: int = 30
+    # Dynamics-CV: periodic joint ridge-CV re-solve of I0, G, a_sv, a_dcv
+    # All parameters are solved in a single per-neuron regression so that
+    # gap-junction and synaptic features compete on equal footing.
+    dynamics_cv_every: int = 5       # 0=disabled
+    dynamics_cv_n_folds: int = 5
+    dynamics_cv_log_min: float = -2.0
+    dynamics_cv_log_max: float = 6.0
+    dynamics_cv_n_grid: int = 50
+    dynamics_cv_blend: float = 0.5
+    dynamics_cv_warmup: int = 3      # ramp blend over this many injections (1=no ramp)
+    dynamics_cv_r2_gate: float = 0.01  # skip neuron if per-neuron fit R² < gate
 
     # Init-anchored regularization
     lambda_u_reg: float = 0.0
@@ -144,8 +162,8 @@ class TrainConfig:
 
     # LOO auxiliary loss
     loo_aux_weight: float = 0.0      # 0=disabled
-    loo_aux_steps: int = 0
-    loo_aux_neurons: int = 8
+    loo_aux_steps: int = 20
+    loo_aux_neurons: int = 4
     loo_aux_starts: int = 1
 
 
@@ -157,6 +175,29 @@ class EvalConfig:
     eval_loo_subset_names: Tuple[str, ...] = ("AVAL", "AVAR")
     eval_loo_subset_seed: int = 0
     eval_loo_subset_neurons: Optional[Tuple[int, ...]] = None
+
+    # CV-reg: per-neuron shrinkage α blending AR(1) ↔ full model
+    #   û_reg = û_ar1 + α_i * (û_model − û_ar1),  α = 1/(1+reg)
+    # α chosen per-neuron by temporal-block k-fold CV on one-step MSE.
+    cv_reg_enabled: bool = False     # set False to skip CV-reg entirely
+    cv_reg_n_folds: int = 5
+    cv_reg_log_min: float = -3.0    # log10(reg) lower bound
+    cv_reg_log_max: float = 5.0     # log10(reg) upper bound
+    cv_reg_n_grid:  int = 50        # grid points (log-spaced)
+
+    # Stochastic trajectory sampling: when the model has learnable noise,
+    # sample this many trajectories per neuron during LOO evaluation.
+    # 0 = disabled (deterministic only); 20 gives reasonable CI bands.
+    n_sample_trajectories: int = 20
+
+    # Full-brain stochastic free-run: sample K whole-brain trajectories
+    # where *all* neurons evolve autonomously with learned process noise.
+    # 0 = disabled (deterministic free-run only).
+    n_freerun_samples: int = 20
+
+    # Alpha-CV / Backbone-CV diagnostics (re-runs ridge-CV solvers at
+    # plot time – can be slow; set False to skip the diagnostic figure)
+    include_dynamics_cv_diagnostics: bool = True
 
 
 @dataclass

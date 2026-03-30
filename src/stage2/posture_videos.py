@@ -1,18 +1,4 @@
 #!/usr/bin/env python
-"""Worm posture video generation.
-
-Consolidated module for three posture-video tools:
-
-* **make_video** – Animate raw body-angle posture with curvature colouring.
-* **make_eigenworm_video** – Reconstruct posture from eigenworm amplitudes.
-* **make_posture_compare_video** – 3-panel comparison
-  (ground truth | motor raw decoded | motor model decoded).
-
-CLI
----
-    python -m scripts.posture_videos raw       --h5 ... --out ...
-    python -m scripts.posture_videos eigenworm --h5 ... --out ...
-"""
 
 from __future__ import annotations
 
@@ -55,13 +41,6 @@ _STEPHENS_SHAPES_NAME = "shapes.csv"
 
 def _recompute_eigvecs_at_dim(d_target: int,
                               h5_path: Optional[str] = None) -> np.ndarray:
-    """Recompute Stephens eigenvectors at *d_target* from ``shapes.csv``.
-
-    The eigenworm amplitudes stored in the H5 may have been projected
-    using a basis computed at a different body-angle dimensionality
-    (e.g. 49) than the saved ``.npy`` file (e.g. 100).  This helper
-    recomputes the basis on-the-fly so reconstruction is consistent.
-    """
     candidates: list[Path] = []
     if h5_path:
         h5_dir = Path(h5_path).resolve().parent
@@ -92,16 +71,6 @@ def _recompute_eigvecs_at_dim(d_target: int,
 def _load_eigenvectors(eigvec_npy: Optional[str] = None,
                        h5_path: Optional[str] = None,
                        d_target: Optional[int] = None) -> np.ndarray:
-    """Load Stephens eigenvectors from *eigvec_npy*.
-
-    Search order (first match wins):
-    1. Explicit *eigvec_npy* argument.
-    2. ``eigenvectors_stephens.npy`` in the same folder as the H5 file.
-    3. ``eigenvectors_stephens.npy`` in the parent / grandparent folders of the H5.
-
-    If *d_target* is given and differs from the loaded eigenvector
-    dimension, recompute from ``shapes.csv`` at the correct dimension.
-    """
     candidates: list[Path] = []
     if eigvec_npy:
         candidates.append(Path(eigvec_npy))
@@ -573,23 +542,6 @@ def make_posture_compare_video(
     max_frames: int = 0,
     eigvec_npy: Optional[str] = None,
 ) -> None:
-    """Render side-by-side posture video.
-
-    Panels: ground truth | motor raw decoded | motor model decoded.
-
-    Parameters
-    ----------
-    h5_path : str
-        Path to the recording HDF5 file.
-    out_path : str
-        Output MP4 path.
-    ew_raw : (T, n_modes) array
-        Ground-truth eigenworm amplitudes.
-    ew_stage1 : (T, n_modes) array
-        Eigenworms decoded from raw motor-neuron activity.
-    ew_model_cv : (T, n_modes) array
-        Eigenworms decoded from model-predicted motor-neuron activity.
-    """
     if ew_stage1 is None or ew_model_cv is None:
         raise ValueError(
             "make_posture_compare_video requires ew_stage1 (motor raw) "

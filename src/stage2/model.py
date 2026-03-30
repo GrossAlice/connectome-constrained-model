@@ -46,23 +46,6 @@ def _match_rank(x: torch.Tensor, r: int) -> torch.Tensor:
         return x.repeat(r)
     return x.repeat((r + x.numel() - 1) // x.numel())[:r]
 
-def _build_per_source_reversals(T_sv, sign_t, e_exc, e_inh):
-    mask = T_sv > 0
-    total = mask.sum(1).float().clamp(min=1)
-    E = (((sign_t > 0) & mask).sum(1).float() / total * e_exc
-         + ((sign_t < 0) & mask).sum(1).float() / total * e_inh)
-    return torch.where(total <= 1, torch.zeros_like(E), E)
-
-
-def _build_edge_specific_reversals(T_sv, sign_t, e_exc, e_inh):
-    mask = T_sv > 0
-    E = torch.where(
-        sign_t > 0,
-        torch.full_like(sign_t, float(e_exc)),
-        torch.where(sign_t < 0, torch.full_like(sign_t, float(e_inh)), torch.zeros_like(sign_t)),
-    )
-    return E * mask.float()
-
 
 class Stage2ModelPT(nn.Module):
     def __init__(self, N: int, T_e: torch.Tensor, T_sv: torch.Tensor,
@@ -85,34 +68,16 @@ class Stage2ModelPT(nn.Module):
         self.register_buffer("T_dcv", T_dcv.to(device).float().abs())
 
         # Synaptic weight matrices (learnable or fixed)
-        W_sv_init_mode = str(getattr(cfg, "W_sv_init_mode", "uniform"))
-        W_sv_normalize = bool(getattr(cfg, "W_sv_normalize", False))
-        for attr, T_mat, init_val, mode, do_norm in [
-                ("W_sv",  self.T_sv,  _W_SV_INIT,  W_sv_init_mode, W_sv_normalize),
-                ("W_dcv", self.T_dcv, _W_DCV_INIT, "uniform",       False)]:
-            val = init_val
+        # Non-uniform modes (log_counts, sqrt_counts, normalize) are applied
+        # by init_W_from_config() in init_from_data after construction.
+        for attr, T_mat, init_val in [
+                ("W_sv",  self.T_sv,  _W_SV_INIT),
+                ("W_dcv", self.T_dcv, _W_DCV_INIT)]:
             W_lo, W_hi = _W_LO, None
             setattr(self, f"_{attr}_lo", W_lo)
             setattr(self, f"_{attr}_hi", W_hi)
             mask = (T_mat > 0).float()
-            safe_c = T_mat.clamp(min=1.0)          # avoid div-by-zero; only used where mask=1
-            if mode == "log_counts":
-                # T*W = log2(1+c)  →  W = log2(1+c)/c
-                W_init = torch.where(mask.bool(),
-                                     torch.log2(1.0 + T_mat) / safe_c,
-                                     torch.ones_like(T_mat))  # safe value for non-edges
-            elif mode == "sqrt_counts":
-                # T*W = sqrt(c)  →  W = 1/sqrt(c)
-                W_init = torch.where(mask.bool(),
-                                     1.0 / safe_c.sqrt(),
-                                     torch.ones_like(T_mat))  # safe value for non-edges
-            else:   # "uniform" (default)
-                W_init = torch.full_like(T_mat, val)
-            if do_norm:
-                # Row-normalise: make (T_mat * W_init).sum(dim=1) == 1 per post-syn neuron
-                eff = T_mat * W_init
-                row_sum = eff.sum(dim=1, keepdim=True).clamp(min=1e-8)
-                W_init = W_init / row_sum
+            W_init = torch.full_like(T_mat, init_val)
             W_raw = _reparam_inv(W_init, W_lo, W_hi)
             W_raw = W_raw * mask                   # zero raw weights for non-edges
             learn = bool(getattr(cfg, f"learn_{attr}", False))
@@ -122,8 +87,10 @@ class Stage2ModelPT(nn.Module):
                 self.register_buffer(f"_{attr}_raw", W_raw, persistent=False)
 
         # Lambda (leak/decay)
+        # lambda_u_init is normally computed by init_lambda_u() from stage-1
+        # data; allow None for eval-only paths that immediately load_state_dict.
         if lambda_u_init is None:
-            raise ValueError("lambda_u_init is required (from OLS on smoothed data)")
+            lambda_u_init = torch.full((N,), 0.1)
         lu = lambda_u_init.to(device).float()
         self._lambda_u_lo = _LAMBDA_U_LO
         self._lambda_u_hi = _LAMBDA_U_HI
@@ -132,26 +99,13 @@ class Stage2ModelPT(nn.Module):
             requires_grad=bool(getattr(cfg, "learn_lambda_u", False)))
 
         # Gap-junction conductance
+        # Non-uniform modes (log_counts, sqrt_counts) are applied by
+        # init_G_from_config() in init_from_data after construction.
         self._G_lo = _G_LO
         self._G_hi = _G_MAX
         self.edge_specific_G = bool(getattr(cfg, "edge_specific_G", False))
         if self.edge_specific_G:
-            mask_e  = (self.T_e > 0).float()
-            safe_te = self.T_e.clamp(min=1.0)
-            G_init_mode = str(getattr(cfg, "G_init_mode", "uniform"))
-            if G_init_mode == "log_counts":
-                # T_e * G = log2(1+c)  →  G = log2(1+c)/c
-                G_mat = torch.where(mask_e.bool(),
-                                    torch.log2(1.0 + self.T_e) / safe_te,
-                                    torch.full_like(self.T_e, _G_INIT))
-            elif G_init_mode == "sqrt_counts":
-                # T_e * G = sqrt(c)  →  G = 1/sqrt(c)
-                G_mat = torch.where(mask_e.bool(),
-                                    1.0 / safe_te.sqrt(),
-                                    torch.full_like(self.T_e, _G_INIT))
-            else:   # "uniform"
-                G_mat = torch.full_like(self.T_e, _G_INIT)
-            G_mat = G_mat * mask_e
+            G_mat = torch.full_like(self.T_e, _G_INIT) * (self.T_e > 0).float()
             self._G_raw = nn.Parameter(_reparam_inv(G_mat, self._G_lo, self._G_hi))
         else:
             G_init = torch.tensor(_G_INIT, dtype=torch.float32, device=device)
@@ -186,6 +140,33 @@ class Stage2ModelPT(nn.Module):
         # Reversal potentials
         self._init_reversals(cfg, sign_t, device)
 
+        # Per-neuron process noise: learnable sigma_u(i)
+        self._learn_noise = bool(getattr(cfg, "learn_noise", False))
+        self._noise_floor = float(getattr(cfg, "noise_floor", 1e-3))
+        self._noise_mode = str(getattr(cfg, "noise_mode", "homoscedastic"))
+        if self._learn_noise and self._noise_mode == "heteroscedastic":
+            # Diagonal linear map:  sigma_{t,i} = softplus(w_i * u_{t,i} + b_i) + floor
+            # Initialise w ≈ 0 (starts near homoscedastic), b so softplus(b) ≈ 0.1
+            self._sigma_w = nn.Parameter(torch.zeros(N, device=device))
+            self._sigma_b = nn.Parameter(
+                _softplus_inv(torch.full((N,), 0.1, device=device)))
+            # Keep _log_sigma_u as non-learnable buffer for backward compat
+            self.register_buffer(
+                "_log_sigma_u",
+                torch.zeros(N, device=device),
+                persistent=False,
+            )
+        elif self._learn_noise:
+            # Homoscedastic: sigma_i = softplus(b_i) + floor
+            self._log_sigma_u = nn.Parameter(
+                _softplus_inv(torch.full((N,), 0.1, device=device)))
+        else:
+            self.register_buffer(
+                "_log_sigma_u",
+                torch.zeros(N, device=device),
+                persistent=False,
+            )
+
     def _init_synaptic_params(self, cfg, device, N):
         for prefix, r in [("sv", self.r_sv), ("dcv", self.r_dcv)]:
             a_lo = _A_LO
@@ -212,16 +193,22 @@ class Stage2ModelPT(nn.Module):
                 setattr(self, f"_tau_{prefix}_raw", nn.Parameter(z.clone(), requires_grad=False))
 
     def _init_reversals(self, cfg, sign_t, device):
-        e_exc = _E_SV_EXC_INIT
-        e_inh = _E_SV_INH_INIT
+        # Store sign_t for init_from_data.init_reversals to use.
+        if sign_t is not None:
+            self.register_buffer("sign_t", sign_t.to(device).float(),
+                                 persistent=False)
+        else:
+            self.register_buffer("sign_t", None)
+        # Create E_sv / E_dcv with correct *shape* (values are set by
+        # init_from_data.init_reversals or load_state_dict).
         mode = str(getattr(cfg, "reversal_mode", "per_neuron"))
         if mode == "per_edge" and sign_t is not None:
-            E_sv = _build_edge_specific_reversals(self.T_sv, sign_t.to(device).float(), e_exc, e_inh)
+            E_sv = torch.zeros(self.N, self.N, device=device)
         elif mode == "per_neuron" and sign_t is not None:
-            E_sv = _build_per_source_reversals(self.T_sv, sign_t.to(device).float(), e_exc, e_inh)
+            E_sv = torch.zeros(self.N, device=device)
         else:
-            E_sv = torch.tensor(e_exc, device=device)
-        E_dcv = torch.tensor(_E_DCV_INIT, device=device)
+            E_sv = torch.tensor(0.0, device=device)
+        E_dcv = torch.tensor(0.0, device=device)
         if bool(getattr(cfg, "learn_reversals", False)):
             self.E_sv, self.E_dcv = nn.Parameter(E_sv), nn.Parameter(E_dcv)
         else:
@@ -250,6 +237,43 @@ class Stage2ModelPT(nn.Module):
     @property
     def tau_dcv(self): return _reparam_fwd(self._tau_dcv_raw, self._tau_dcv_lo, self._tau_dcv_hi)
 
+    def sigma_at(self, u: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Per-neuron noise std, optionally state-dependent.
+
+        Parameters
+        ----------
+        u : Tensor, shape ``(..., N)`` or ``None``
+            Current neural state.  Required for heteroscedastic mode;
+            ignored (but accepted) for homoscedastic.
+
+        Returns
+        -------
+        Tensor, shape ``(..., N)``
+            ``softplus(raw) + floor``, strictly positive.
+
+        In **homoscedastic** mode the result is broadcast-friendly ``(N,)``
+        regardless of *u*.  In **heteroscedastic** mode the result has the
+        same leading dimensions as *u*.
+        """
+        if self._learn_noise and self._noise_mode == "heteroscedastic":
+            if u is None:
+                # Fallback: return sigma at u=0 (just the bias)
+                return F.softplus(self._sigma_b) + self._noise_floor
+            return F.softplus(self._sigma_w * u + self._sigma_b) + self._noise_floor
+        if self._learn_noise:
+            return F.softplus(self._log_sigma_u) + self._noise_floor
+        return torch.full((self.N,), self._noise_floor,
+                          device=self._log_sigma_u.device)
+
+    @property
+    def sigma_process(self) -> torch.Tensor:
+        """Per-neuron process noise std (N,) — homoscedastic / baseline.
+
+        For heteroscedastic models this returns sigma at u=0 (the bias term).
+        Use :meth:`sigma_at` for state-dependent noise.
+        """
+        return self.sigma_at(None)
+
     def set_param_constrained(self, name: str, value: torch.Tensor) -> None:
         raw = getattr(self, f"_{name}_raw")
         lo, hi = getattr(self, f"_{name}_lo"), getattr(self, f"_{name}_hi")
@@ -260,16 +284,6 @@ class Stage2ModelPT(nn.Module):
         return torch.sigmoid(u)
 
     def convolve_stimulus(self, stim_raw: torch.Tensor) -> torch.Tensor:
-        """Convolve raw (delta-pulse) stimulus with the learnable causal kernel.
-
-        Parameters
-        ----------
-        stim_raw : (T, N) sparse stimulus matrix (e.g. optogenetics pulses)
-
-        Returns
-        -------
-        stim_conv : (T, N) — smoothed stimulus drive
-        """
         if self.stim_kernel is None or self.stim_kernel_len <= 1:
             return stim_raw
         # Ensure non-negative kernel (softplus) and normalise
@@ -286,14 +300,6 @@ class Stage2ModelPT(nn.Module):
         return out.squeeze(1).t()          # (T, N)
 
     def laplacian_with_G(self, G: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Gap-junction Laplacian, optionally overriding the shared conductance G.
-
-        Parameters
-        ----------
-        G : Tensor, optional
-            Per-call conductance override (scalar or edge-specific matrix).
-            When ``None``, falls back to ``self.G``.
-        """
         G_eff = self.G if G is None else G.to(device=self.T_e.device, dtype=self.T_e.dtype)
         if self.edge_specific_G:
             W = G_eff * (self.T_e > 0).float()

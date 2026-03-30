@@ -399,6 +399,7 @@ def _extract_beh_data(data: Dict[str, Any]):
 
 def _calibrate_predictions(
 	b_np: np.ndarray, bm_np: np.ndarray, *pred_arrays: np.ndarray,
+	noise_scale: float = 1.0,
 ) -> None:
 	for j in range(b_np.shape[1]):
 		valid_j = bm_np[:, j] > 0.5
@@ -410,7 +411,9 @@ def _calibrate_predictions(
 			sd_y, sd_p = np.std(b_np[mask, j]), np.std(arr[mask, j])
 			if sd_p < 1e-12:
 				continue
-			arr[:, j] = mu_y + (arr[:, j] - mu_p) * (sd_y / sd_p)
+			# noise_scale interpolates: 0 = mean-shift only, 1 = full variance match
+			ratio = 1.0 + noise_scale * (sd_y / sd_p - 1.0)
+			arr[:, j] = mu_y + (arr[:, j] - mu_p) * ratio
 
 
 def _fit_ridge_cv_decoder(
@@ -563,7 +566,9 @@ def _eval_decoder_common(
 	}
 
 	if calibrate:
-		_calibrate_predictions(b_np, bm_np, b_pred_gt, result["b_pred_model"])
+		_ns = float(_cfg_val(cfg, "behavior_noise_scale", 1.0))
+		_calibrate_predictions(b_np, bm_np, b_pred_gt, result["b_pred_model"],
+		                       noise_scale=_ns)
 
 	return result
 
@@ -655,7 +660,9 @@ def _evaluate_mlp_decoder(
 	}
 
 	if calibrate:
-		_calibrate_predictions(b_np, bm_np, b_pred_gt, result["b_pred_model"])
+		_ns = float(_cfg_val(cfg, "behavior_noise_scale", 1.0))
+		_calibrate_predictions(b_np, bm_np, b_pred_gt, result["b_pred_model"],
+		                       noise_scale=_ns)
 
 	n_show = min(n_modes, 6)
 	logger = get_stage2_logger()
