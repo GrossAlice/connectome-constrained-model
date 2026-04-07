@@ -9,9 +9,9 @@ def _r2(y_true: np.ndarray, y_pred: np.ndarray) -> float:
         return float("nan")
     yt, yp = y_true[m].astype(np.float64), y_pred[m].astype(np.float64)
     ss_tot = np.sum((yt - yt.mean()) ** 2)
-    if ss_tot < 1e-12:
-        return float("nan")
-    return float(1.0 - np.sum((yt - yp) ** 2) / ss_tot)
+    # Use 1e-12 floor (not NaN) for near-constant neurons, matching
+    # the ridge-MLP baseline convention.
+    return float(1.0 - np.sum((yt - yp) ** 2) / max(ss_tot, 1e-12))
 
 
 def _cfg_val(cfg, attr: str, default, cast=float):

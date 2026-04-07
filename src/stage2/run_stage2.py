@@ -33,7 +33,8 @@ def main(argv: list[str] | None = None) -> None:
         extra_kw["multi_worm"] = True
         extra_kw["h5_paths"] = tuple(h5_list)
 
-    # Parse --set overrides: attempt int, then float, then bool, else str
+    # Parse --set overrides: attempt int, then float, then tuple, then bool, else str
+    import ast as _ast
     for key, val in args.overrides:
         for converter in (int, float):
             try:
@@ -42,8 +43,19 @@ def main(argv: list[str] | None = None) -> None:
             except ValueError:
                 continue
         else:
-            if val.lower() in ("true", "false"):
-                val = val.lower() == "true"
+            # Try parsing as a tuple/list literal, e.g. "(2.0, 0.8)"
+            if val.startswith("(") or val.startswith("["):
+                try:
+                    parsed = _ast.literal_eval(val)
+                    if isinstance(parsed, (tuple, list)):
+                        val = tuple(parsed)
+                    else:
+                        val = parsed
+                except (ValueError, SyntaxError):
+                    pass  # fall through to bool / str
+            if isinstance(val, str):
+                if val.lower() in ("true", "false"):
+                    val = val.lower() == "true"
         extra_kw[key] = val
 
     cfg = make_config(h5_list[0] if h5_list else "", **extra_kw)

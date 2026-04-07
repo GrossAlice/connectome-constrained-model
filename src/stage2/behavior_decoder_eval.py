@@ -281,21 +281,26 @@ def fit_linear_behaviour_decoder_for_training(data: Dict[str, Any]) -> Optional[
 
 
 class MLPBehaviourDecoder(nn.Module):
-	"""Small MLP decoder: Linear → LayerNorm → ReLU → Dropout → Linear.
+	"""MLP decoder: N × (Linear → LayerNorm → ReLU → Dropout) → Linear.
 
-	The first linear layer can be warm-started from ridge-CV weights.
+	Default architecture (2×128) matches the benchmark winner from
+	``unified_benchmark.py``.
 	"""
 
 	def __init__(self, in_dim: int, out_dim: int,
-				 hidden: int = 32, dropout: float = 0.1):
+				 hidden: int = 128, n_layers: int = 2,
+				 dropout: float = 0.1):
 		super().__init__()
-		self.net = nn.Sequential(
-			nn.Linear(in_dim, hidden),
-			nn.LayerNorm(hidden),
-			nn.ReLU(),
-			nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
-			nn.Linear(hidden, out_dim),
-		)
+		layers: list[nn.Module] = []
+		in_d = in_dim
+		for _ in range(n_layers):
+			layers.append(nn.Linear(in_d, hidden))
+			layers.append(nn.LayerNorm(hidden))
+			layers.append(nn.ReLU())
+			layers.append(nn.Dropout(dropout) if dropout > 0 else nn.Identity())
+			in_d = hidden
+		layers.append(nn.Linear(in_d, out_dim))
+		self.net = nn.Sequential(*layers)
 
 	def forward(self, x: torch.Tensor) -> torch.Tensor:
 		return self.net(x)
@@ -333,12 +338,14 @@ def init_behaviour_decoder(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 	}
 
 	if decoder_type == "mlp":
-		hidden = int(getattr(cfg, "behavior_decoder_hidden", 32) or 32)
+		hidden = int(getattr(cfg, "behavior_decoder_hidden", 128) or 128)
+		n_layers = int(getattr(cfg, "behavior_decoder_n_layers", 2) or 2)
 		dropout = float(getattr(cfg, "behavior_decoder_dropout", 0.1) or 0.0)
-		model = MLPBehaviourDecoder(n_features, n_modes, hidden, dropout).to(device)
+		model = MLPBehaviourDecoder(n_features, n_modes, hidden, n_layers, dropout).to(device)
 		n_params = sum(p.numel() for p in model.parameters())
+		hidden_desc = "→".join([str(hidden)] * n_layers)
 		print(
-			f"  [behaviour-decoder/init] MLP decoder ({n_features}→{hidden}→{n_modes}, "
+			f"  [behaviour-decoder/init] MLP decoder ({n_features}→{hidden_desc}→{n_modes}, "
 			f"{n_params:,} params, {n_valid} valid frames)"
 		)
 		base["type"] = "mlp"
@@ -395,25 +402,6 @@ def _extract_beh_data(data: Dict[str, Any]):
 	bm_np = bm.cpu().numpy() if isinstance(bm, torch.Tensor) else bm
 	u_np = data["u_stage1"].cpu().numpy()
 	return b_np, bm_np, u_np
-
-
-def _calibrate_predictions(
-	b_np: np.ndarray, bm_np: np.ndarray, *pred_arrays: np.ndarray,
-	noise_scale: float = 1.0,
-) -> None:
-	for j in range(b_np.shape[1]):
-		valid_j = bm_np[:, j] > 0.5
-		for arr in pred_arrays:
-			mask = valid_j & np.isfinite(arr[:, j])
-			if mask.sum() < 3:
-				continue
-			mu_y, mu_p = np.mean(b_np[mask, j]), np.mean(arr[mask, j])
-			sd_y, sd_p = np.std(b_np[mask, j]), np.std(arr[mask, j])
-			if sd_p < 1e-12:
-				continue
-			# noise_scale interpolates: 0 = mean-shift only, 1 = full variance match
-			ratio = 1.0 + noise_scale * (sd_y / sd_p - 1.0)
-			arr[:, j] = mu_y + (arr[:, j] - mu_p) * ratio
 
 
 def _fit_ridge_cv_decoder(
@@ -480,7 +468,7 @@ def _eval_decoder_common(
 	coef: np.ndarray, intercept: np.ndarray,
 	motor_idx: list, n_lags: int,
 	data: Dict[str, Any], onestep: Dict[str, Any],
-	calibrate: bool, cv_models=None,
+	cv_models=None,
 	decoder_type: str = "linear_frozen",
 ) -> Optional[Dict[str, Any]]:
 	beh = _extract_beh_data(data)
@@ -565,18 +553,12 @@ def _eval_decoder_common(
 		},
 	}
 
-	if calibrate:
-		_ns = float(_cfg_val(cfg, "behavior_noise_scale", 1.0))
-		_calibrate_predictions(b_np, bm_np, b_pred_gt, result["b_pred_model"],
-		                       noise_scale=_ns)
-
 	return result
 
 
 @torch.no_grad()
 def _evaluate_mlp_decoder(
 	decoder: Dict[str, Any], data: Dict[str, Any], onestep: Dict[str, Any],
-	*, calibrate: bool = True,
 ) -> Optional[Dict[str, Any]]:
 	"""Evaluate an MLP behaviour decoder on GT and model traces."""
 	beh = _extract_beh_data(data)
@@ -659,11 +641,6 @@ def _evaluate_mlp_decoder(
 		},
 	}
 
-	if calibrate:
-		_ns = float(_cfg_val(cfg, "behavior_noise_scale", 1.0))
-		_calibrate_predictions(b_np, bm_np, b_pred_gt, result["b_pred_model"],
-		                       noise_scale=_ns)
-
 	n_show = min(n_modes, 6)
 	logger = get_stage2_logger()
 	logger.info(
@@ -678,13 +655,12 @@ def _evaluate_mlp_decoder(
 
 def evaluate_training_decoder(
 	decoder: Dict[str, Any], data: Dict[str, Any], onestep: Dict[str, Any],
-	*, calibrate: bool = True,
 ) -> Optional[Dict[str, Any]]:
 	if decoder is None or data.get("b") is None:
 		return None
 
 	if decoder["type"] == "mlp":
-		return _evaluate_mlp_decoder(decoder, data, onestep, calibrate=calibrate)
+		return _evaluate_mlp_decoder(decoder, data, onestep)
 
 	W_np = decoder["W"].detach().cpu().numpy()
 	dtype = "linear_learned" if decoder["W"].requires_grad else "linear_frozen"
@@ -695,7 +671,6 @@ def evaluate_training_decoder(
 		n_lags=decoder["n_lags"],
 		data=data,
 		onestep=onestep,
-		calibrate=calibrate,
 		cv_models=decoder.get("cv_models"),
 		decoder_type=dtype,
 	)

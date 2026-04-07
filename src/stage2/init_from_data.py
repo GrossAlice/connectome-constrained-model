@@ -105,52 +105,13 @@ def init_reversals(model: "Stage2ModelPT", u: torch.Tensor, baseline: torch.Tens
 # ── Connectivity-based weight initialisation ────────────────────────────
 
 def init_W_from_config(model: "Stage2ModelPT", cfg=None) -> None:
-    """Apply connectivity-structure-based W_sv / W_dcv initialisation.
+    """No-op — kept for call-site compatibility.
 
-    Modes (from ``cfg.W_sv_init_mode``):
-
-    * ``uniform`` (default) — keep the constructor's constant W.
-    * ``log_counts`` — ``T·W = log₂(1+c)`` so each synapse group's effective
-      weight grows sub-linearly with contact count.
-    * ``sqrt_counts`` — ``T·W = √c``.
-
-    If ``cfg.W_sv_normalize`` is True the effective weights ``T·W`` are further
-    row-normalised so that each post-synaptic neuron receives unit total input.
+    Previously supported ``W_sv_init_mode`` and ``W_sv_normalize`` config
+    options.  Sweeps showed zero effect; the constructor's uniform default
+    is always used.
     """
-    from .model import _reparam_inv, _W_SV_INIT, _W_DCV_INIT
-
-    W_sv_mode = str(getattr(cfg, "W_sv_init_mode", "uniform")) if cfg else "uniform"
-    W_sv_norm = bool(getattr(cfg, "W_sv_normalize", False)) if cfg else False
-
-    for attr, T_mat, init_val, mode, do_norm in [
-            ("W_sv",  model.T_sv,  _W_SV_INIT,  W_sv_mode, W_sv_norm),
-            ("W_dcv", model.T_dcv, _W_DCV_INIT, "uniform",  False)]:
-        if mode == "uniform" and not do_norm:
-            continue  # constructor's default is already uniform
-        lo = getattr(model, f"_{attr}_lo")
-        hi = getattr(model, f"_{attr}_hi")
-        mask = (T_mat > 0).float()
-        safe_c = T_mat.clamp(min=1.0)
-        if mode == "log_counts":
-            W_init = torch.where(mask.bool(),
-                                 torch.log2(1.0 + T_mat) / safe_c,
-                                 torch.ones_like(T_mat))
-        elif mode == "sqrt_counts":
-            W_init = torch.where(mask.bool(),
-                                 1.0 / safe_c.sqrt(),
-                                 torch.ones_like(T_mat))
-        else:  # uniform + normalize
-            W_init = torch.full_like(T_mat, init_val)
-        if do_norm:
-            eff = T_mat * W_init
-            row_sum = eff.sum(dim=1, keepdim=True).clamp(min=1e-8)
-            W_init = W_init / row_sum
-        W_raw = _reparam_inv(W_init, lo, hi) * mask
-        raw = getattr(model, f"_{attr}_raw")
-        with torch.no_grad():
-            raw.data.copy_(W_raw)
-        print(f"[init] {attr} ({mode}{'+norm' if do_norm else ''}): "
-              f"mean(edges)={W_init[mask.bool()].mean():.4f}")
+    pass
 
 
 def init_G_from_config(model: "Stage2ModelPT", cfg=None) -> None:
@@ -339,82 +300,11 @@ def _init_network_scale_ols(
         _apply_scales(model, names, final_betas, final_rms, rms_resid, "OLS")
 
 
-# ── Per-neuron ridge init ───────────────────────────────────────────────
-
-def _init_network_scale_per_neuron_ridge(
-    model: "Stage2ModelPT", u: torch.Tensor,
-    ridge_alpha: float = 1.0,
-    min_beta: float = 1e-6,
-) -> None:
-    """Initialise G / a_sv / a_dcv via per-neuron ridge regression.
-
-    For each neuron *n* independently, solve the ridge problem::
-
-        r_{t,n} ≈ β_{G,n} · c_gap_{t,n} + β_{sv,n} · c_sv_{t,n}
-                   + β_{dcv,n} · c_dcv_{t,n}
-
-    then take the **median** across neurons for each channel's global
-    scale factor.  This is more robust than the pooled OLS because it
-    avoids cancellation across neurons and doesn't need hard-coded
-    floor fractions.
-    """
-    with torch.no_grad():
-        resid, patterns, names = _collect_current_patterns(model, u)
-        rms_resid = resid.pow(2).mean().sqrt().item()
-        if rms_resid < 1e-12:
-            return
-
-        dev = model.I0.device
-        K = len(patterns)
-        T_1, N = resid.shape
-
-        # (T-1, N, K) feature tensor
-        X = torch.stack(patterns, dim=2)          # (T-1, N, K)
-        # Per-neuron ridge: β_n = (X_n'X_n + αI)^{-1} X_n' r_n
-        # Batch over neurons using (N, K, T) x (N, T, 1) → (N, K, 1)
-        X_t = X.permute(1, 2, 0)                  # (N, K, T-1)
-        r_t = resid.permute(1, 0).unsqueeze(2)    # (N, T-1, 1)
-        XtX = torch.bmm(X_t, X_t.permute(0, 2, 1))  # (N, K, K)
-        reg = ridge_alpha * torch.eye(K, device=dev).unsqueeze(0).expand(N, -1, -1)
-        Xtr = torch.bmm(X_t, r_t)                    # (N, K, 1)
-        beta_all = torch.linalg.solve(XtX + reg, Xtr).squeeze(2)  # (N, K)
-        # Clamp to non-negative (physical: these are conductances/amplitudes)
-        beta_all = beta_all.clamp(min=0)
-
-        # Robust summary: median across neurons
-        beta_median = beta_all.median(dim=0).values   # (K,)
-        beta_mean   = beta_all.mean(dim=0)             # (K,)
-        beta_q25    = beta_all.quantile(0.25, dim=0)
-        beta_q75    = beta_all.quantile(0.75, dim=0)
-
-        betas = [max(beta_median[i].item(), min_beta) for i in range(K)]
-        raw_rms = [patterns[i].pow(2).mean().sqrt().item() for i in range(K)]
-        rms_list = [raw_rms[i] * betas[i] for i in range(K)]
-
-        # Log per-neuron distribution
-        print(f"[init] network_scale (per_neuron_ridge, α={ridge_alpha:.1g}):")
-        for i, name in enumerate(names):
-            print(f"[init]   {name} β distribution: "
-                  f"median={beta_median[i]:.4f}  mean={beta_mean[i]:.4f}  "
-                  f"IQR=[{beta_q25[i]:.4f}, {beta_q75[i]:.4f}]")
-
-        _apply_scales(model, names, betas, rms_list, rms_resid,
-                      "per_neuron_ridge")
-
-
 # ── Dispatch ────────────────────────────────────────────────────────────
 
 def init_network_scale(model: "Stage2ModelPT", u: torch.Tensor,
                        cfg=None) -> None:
-    mode = str(getattr(cfg, "network_init_mode", "ols") or "ols").lower()
-    # support old names for backward compat
-    if mode in ("per_neuron", "per_neuron_ridge"):
-        _init_network_scale_per_neuron_ridge(model, u)
-    elif mode in ("global", "ols"):
-        _init_network_scale_ols(model, u)
-    else:
-        raise ValueError(f"Unknown network_init_mode={mode!r}; "
-                         f"expected 'global'/'ols' or 'per_neuron'/'per_neuron_ridge'")
+    _init_network_scale_ols(model, u)
 
 
 def init_all_from_data(model: "Stage2ModelPT", u: torch.Tensor, cfg=None):

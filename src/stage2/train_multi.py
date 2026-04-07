@@ -24,14 +24,9 @@ from .io_multi import load_multi_worm_data
 from .model import Stage2ModelPT
 from .train import (
     compute_dynamics_loss,
-    joint_cv_solve,
-    inject_joint_cv,
     snapshot_model_state,
     _TeeWriter,
     _snapshot_params,
-    _solve_neuron_ridge_cv,
-    _fill_alpha_features,
-    _compute_joint_cv_features,
 )
 from .worm_state import WormState, build_worm_states
 
@@ -63,196 +58,6 @@ def _forward_pass_worm(
         preds.append(u_next)
 
     return torch.stack(preds)   # (T, N)
-
-
-
-def _compute_joint_cv_features_worm(
-    model:   Stage2ModelPT,
-    u:       torch.Tensor,                   # (T, N) — no grad needed
-    gating:  Optional[torch.Tensor],
-    stim:    Optional[torch.Tensor],
-    lam_w:   torch.Tensor,                   # (N,) per-worm lambda_u (detached)
-    I0_w:    torch.Tensor,                   # (N,) per-worm I0 (detached)
-    G_w:     Optional[torch.Tensor],         # per-worm G scalar or None
-    b_w:     Optional[torch.Tensor],         # (N,) per-worm stim weight or None
-) -> Dict[str, Any]:
-    T, N   = u.shape
-    device = u.device
-
-    with torch.no_grad():
-        # Structural Laplacian (G≡1) for gap features
-        L_struct  = model.laplacian_with_G(torch.ones(1, device=device)).detach()
-        T_eff_sv  = (model.T_sv * model.W_sv).detach()
-        T_eff_dcv = (model.T_dcv * model.W_dcv).detach()
-        tau_sv    = model.tau_sv.detach()
-        tau_dcv   = model.tau_dcv.detach()
-        E_sv      = model.E_sv.detach()
-        E_dcv     = model.E_dcv.detach()
-        dt        = model.dt
-
-        gamma_sv  = torch.exp(-dt / (tau_sv  + 1e-12))
-        gamma_dcv = torch.exp(-dt / (tau_dcv + 1e-12))
-        r_sv, r_dcv = model.r_sv, model.r_dcv
-
-        gap_feat = torch.zeros(T - 1, N, device=device)
-        feat_sv  = torch.zeros(T - 1, N, r_sv,  device=device)
-        feat_dcv = torch.zeros(T - 1, N, r_dcv, device=device)
-        target   = torch.zeros(T - 1, N, device=device)
-
-        s_sv  = torch.zeros(N, r_sv,  device=device)
-        s_dcv = torch.zeros(N, r_dcv, device=device)
-
-        for t in range(1, T):
-            u_prev    = u[t - 1]
-            g         = gating[t - 1] if gating is not None else torch.ones(N, device=device)
-            phi_gated = torch.sigmoid(u_prev) * g.view(N)
-
-            s_sv  = gamma_sv.view(1, -1)  * s_sv  + phi_gated.unsqueeze(1)
-            s_dcv = gamma_dcv.view(1, -1) * s_dcv + phi_gated.unsqueeze(1)
-
-            pool_sv  = T_eff_sv.t()  @ s_sv
-            pool_dcv = T_eff_dcv.t() @ s_dcv
-
-            _fill_alpha_features(feat_sv,  t - 1, pool_sv,  s_sv,  T_eff_sv,  E_sv,  u_prev)
-            _fill_alpha_features(feat_dcv, t - 1, pool_dcv, s_dcv, T_eff_dcv, E_dcv, u_prev)
-
-            # Gap feature from structural Laplacian (G≡1)
-            gap_feat[t - 1] = L_struct @ u_prev
-
-            # Target: [u(t+1) - (1-λ)*u(t)] / λ  minus stimulus
-            I_stim   = torch.zeros(N, device=device)
-            s_ext    = stim[t - 1] if stim is not None else None
-            if b_w is not None and s_ext is not None:
-                I_stim = b_w.to(device) * s_ext.view(N)
-
-            residual = u[t] - (1.0 - lam_w) * u_prev - lam_w * I_stim
-            target[t - 1] = residual / lam_w.clamp(min=1e-8)
-
-    return {
-        "gap_features": gap_feat.cpu().numpy().astype(np.float64),
-        "features_sv":  feat_sv.cpu().numpy().astype(np.float64),
-        "features_dcv": feat_dcv.cpu().numpy().astype(np.float64),
-        "target":       target.cpu().numpy().astype(np.float64),
-    }
-
-
-def _multi_joint_cv(
-    model:       Stage2ModelPT,
-    worm_states: List[WormState],
-    cfg:         Stage2PTConfig,
-) -> None:
-    n_folds       = int(getattr(cfg, "dynamics_cv_n_folds",        5)  or 5)
-    log_lam_min   = float(getattr(cfg, "dynamics_cv_log_min", -2.0))
-    log_lam_max   = float(getattr(cfg, "dynamics_cv_log_max",  6.0))
-    n_grid        = int(getattr(cfg, "dynamics_cv_n_grid",          50)  or 50)
-    r2_gate       = float(getattr(cfg, "dynamics_cv_r2_gate", 0.01))
-    ridge_grid    = _log_ridge_grid(log_lam_min, log_lam_max, n_grid)
-
-    N              = model.N
-    r_sv, r_dcv    = model.r_sv, model.r_dcv
-    p_syn          = r_sv + r_dcv
-    p_total        = 1 + p_syn           # gap(1) + synaptic
-    n_grid_actual  = len(ridge_grid)
-
-    # Non-negativity mask: synaptic ≥ 0, gap unconstrained
-    nonneg = np.zeros(p_total, dtype=bool)
-    nonneg[1:] = True
-
-    all_gap, all_feat_sv, all_feat_dcv, all_target = [], [], [], []
-
-    with torch.no_grad():
-        lam_shared = model.lambda_u.detach()
-        I0_shared  = model.I0.detach()
-    for worm in worm_states:
-        u = worm.assemble_detached().detach()
-        feats = _compute_joint_cv_features_worm(
-            model, u, worm.gating, worm.stim,
-            lam_shared, I0_shared, worm.G, worm.b,
-        )
-        feat_mask = worm.train_mask().cpu().numpy()[1:]   # (T-1,) bool
-        all_gap.append(feats["gap_features"][feat_mask])
-        all_feat_sv.append(feats["features_sv"][feat_mask])
-        all_feat_dcv.append(feats["features_dcv"][feat_mask])
-        all_target.append(feats["target"][feat_mask])
-
-    if not all_gap:
-        print("[MultiWorm] Dynamics-CV: no valid worm features — skipping.")
-        return
-
-    gap_all      = np.concatenate(all_gap,      axis=0)   # (T_tot, N)
-    feat_sv_all  = np.concatenate(all_feat_sv,  axis=0)
-    feat_dcv_all = np.concatenate(all_feat_dcv, axis=0)
-    target_all   = np.concatenate(all_target,   axis=0)
-    T_tot        = gap_all.shape[0]
-
-    with torch.no_grad():
-        a_sv_cur  = model.a_sv.detach().cpu().numpy()
-        a_dcv_cur = model.a_dcv.detach().cpu().numpy()
-        I0_cur    = model.I0.detach().cpu().numpy()
-
-    a_sv_out  = (np.tile(a_sv_cur, (N, 1)) if a_sv_cur.ndim == 1
-                 else a_sv_cur.copy())
-    a_dcv_out = (np.tile(a_dcv_cur, (N, 1)) if a_dcv_cur.ndim == 1
-                 else a_dcv_cur.copy())
-    I0_out    = I0_cur.copy()
-    G_coefs   = np.full(N, np.nan, dtype=np.float64)
-
-    n_updated, n_at_upper, n_gated = 0, 0, 0
-
-    for i in range(N):
-        parts = [gap_all[:, i:i+1]]
-        if r_sv  > 0: parts.append(feat_sv_all[:, i, :])
-        if r_dcv > 0: parts.append(feat_dcv_all[:, i, :])
-        X_i = np.concatenate(parts, axis=1)
-        y_i = target_all[:, i]
-
-        valid = np.all(np.isfinite(X_i), axis=1) & np.isfinite(y_i)
-        n_v   = int(valid.sum())
-        if n_v < max(p_total + 5, 20):
-            continue
-        if np.abs(X_i[valid]).max() < 1e-10:
-            continue
-
-        result = _solve_neuron_ridge_cv(X_i[valid], y_i[valid], ridge_grid, n_folds,
-                                        nonneg_mask=nonneg)
-        coef = result["coef"].copy()
-        coef[nonneg] = np.maximum(coef[nonneg], 0.0)
-
-        # Fit R²
-        y_pred = X_i[valid] @ coef + result["intercept"]
-        ss_res = float(np.sum((y_i[valid] - y_pred.ravel()) ** 2))
-        ss_tot = float(np.sum((y_i[valid] - y_i[valid].mean()) ** 2))
-        fit_r2_i = 1.0 - ss_res / max(ss_tot, 1e-12)
-
-        if result["at_upper"]: n_at_upper += 1
-        if fit_r2_i < r2_gate:
-            n_gated += 1
-            continue
-
-        G_coefs[i] = coef[0]
-        idx = 1
-        if r_sv  > 0: a_sv_out[i]  = coef[idx:idx+r_sv];  idx += r_sv
-        if r_dcv > 0: a_dcv_out[i] = coef[idx:idx+r_dcv]
-        I0_out[i] = result["intercept"]
-        n_updated += 1
-
-    # Compute G_scale
-    valid_G = G_coefs[np.isfinite(G_coefs) & (G_coefs > 0)]
-    G_scale = float(np.median(valid_G)) if len(valid_G) > 0 else 0.0
-
-    device = next(model.parameters()).device
-    result_dict = {
-        "I0":        torch.tensor(I0_out,    dtype=torch.float32, device=device),
-        "alpha_sv":  torch.tensor(a_sv_out,  dtype=torch.float32, device=device),
-        "alpha_dcv": torch.tensor(a_dcv_out, dtype=torch.float32, device=device),
-        "G_scale":   G_scale,
-    }
-    inject_joint_cv(model, result_dict)
-    print(
-        f"[MultiWorm] Dynamics-CV (stacked {T_tot} frames, {len(worm_states)} worms): "
-        f"{n_updated}/{N} updated, {n_gated} gated, {n_at_upper} at upper λ bound, "
-        f"G_scale={G_scale:.4f}"
-    )
 
 
 
@@ -328,12 +133,14 @@ def _init_beh_decoder_multi(
     decoder_type = str(getattr(cfg, "behavior_decoder_type", "mlp") or "mlp").strip().lower()
 
     if decoder_type == "mlp":
-        hidden  = int(getattr(cfg, "behavior_decoder_hidden", 32) or 32)
-        dropout = float(getattr(cfg, "behavior_decoder_dropout", 0.1) or 0.0)
-        model = MLPBehaviourDecoder(n_feat + 1, n_modes, hidden, dropout).to(device)
+        hidden   = int(getattr(cfg, "behavior_decoder_hidden", 128) or 128)
+        n_layers = int(getattr(cfg, "behavior_decoder_n_layers", 2) or 2)
+        dropout  = float(getattr(cfg, "behavior_decoder_dropout", 0.1) or 0.0)
+        model = MLPBehaviourDecoder(n_feat + 1, n_modes, hidden, n_layers, dropout).to(device)
         n_params = sum(p.numel() for p in model.parameters())
+        hidden_desc = "\u2192".join([str(hidden)] * n_layers)
         print(
-            f"[MultiWorm] Beh MLP decoder: {n_feat + 1}\u2192{hidden}\u2192{n_modes}  "
+            f"[MultiWorm] Beh MLP decoder: {n_feat + 1}\u2192{hidden_desc}\u2192{n_modes}  "
             f"({n_params:,} params, stacked {len(X_all)} frames from {n_atanas} Atanas worm(s))"
         )
         return {
@@ -601,13 +408,34 @@ def _train_multi_worm_inner(
     # Snapshot OLS-init values for regularization
     _lambda_u_init_target = model.lambda_u.detach().clone()
     _I0_init_target       = model.I0.detach().clone()
-    _G_init_target        = model.G.detach().clone()
     _tau_sv_init_target   = model.tau_sv.detach().clone()
     _tau_dcv_init_target  = model.tau_dcv.detach().clone()
 
     # 4. Build WormState objects
     worm_states = build_worm_states(data, cfg)
     _log_multi_config(cfg, N_atlas, n_worms)
+
+    # 4b. Connectome-informed u_unobs initialisation
+    T_e = data["T_e"]
+    if bool(mc.u_unobs_connectome_init) and bool(mc.infer_unobserved):
+        from .unobs_init import connectome_init_u_unobs
+        connectome_init_u_unobs(
+            worm_states, T_e,
+            alpha=float(mc.u_unobs_init_alpha),
+            temporal_smooth_sigma=float(mc.u_unobs_init_smooth_sigma),
+        )
+
+    # 4c. Low-rank parameterisation: u_unobs = u_obs @ C
+    if bool(mc.u_unobs_low_rank) and bool(mc.infer_unobserved):
+        from .unobs_init import _connectome_mixing_matrix
+        for worm in worm_states:
+            if worm.N_unobs > 0:
+                C = _connectome_mixing_matrix(
+                    T_e, worm.obs_idx, worm.unobs_idx,
+                    alpha=float(mc.u_unobs_low_rank_alpha),
+                )
+                worm.enable_low_rank(C)
+        print("[UnobsInit] Low-rank mode enabled: u_unobs = u_obs @ C")
 
     # 5. Behaviour decoder
     motor_atlas_idx = _get_motor_atlas_idx(cfg, atlas_lbl)
@@ -664,21 +492,25 @@ def _train_multi_worm_inner(
         f"  opt_u={len(u_params)} params"
     )
 
-    # 7. Initial dynamics ridge-CV (joint I0 + G + a_sv + a_dcv)
-    dynamics_cv_every = int(getattr(cfg, "dynamics_cv_every", 5) or 0)
-    if dynamics_cv_every > 0:
-        print("[MultiWorm] Running initial dynamics-CV …")
-        _multi_joint_cv(model, worm_states, cfg)
+    # 7b. Warmup: pre-train u_unobs with frozen model
+    _warmup_epochs = int(mc.u_unobs_warmup_epochs)
+    if _warmup_epochs > 0 and bool(mc.infer_unobserved) and u_params:
+        from .unobs_init import warmup_u_unobs
+        warmup_u_unobs(
+            model, worm_states, cfg,
+            num_warmup_epochs=_warmup_epochs,
+            warmup_lr=float(mc.u_unobs_warmup_lr),
+        )
+        # Re-create the u optimizer so Adam state is fresh after warmup
+        opt_u = optim.Adam(u_params, lr=u_lr)
 
     # 8. Training config
     num_epochs         = int(getattr(cfg, "num_epochs",          40))
     inner_steps        = int(mc.u_unobs_inner_steps)
     smoothness_w       = float(mc.u_unobs_smoothness)
     infer_unobs        = bool(mc.infer_unobserved) and (opt_u is not None)
-    interaction_l2     = float(getattr(cfg, "interaction_l2",    0.0) or 0.0)
     lambda_u_reg       = float(getattr(cfg, "lambda_u_reg",      0.0) or 0.0)
     I0_reg             = float(getattr(cfg, "I0_reg",            0.0) or 0.0)
-    G_reg              = float(getattr(cfg, "G_reg",             0.0) or 0.0)
     tau_reg            = float(getattr(cfg, "tau_reg",           0.0) or 0.0)
     rollout_weight     = float(getattr(cfg, "rollout_weight",     0.0) or 0.0)
     rollout_steps      = int(getattr(cfg, "rollout_steps",        0)   or 0)
@@ -687,14 +519,10 @@ def _train_multi_worm_inner(
     per_worm_G         = bool(mc.per_worm_G)
     print_every        = int(getattr(cfg, "print_every",          1)   or 1)
 
-    if interaction_l2 > 0:
-        print(f"[MultiWorm] Interaction L2 = {interaction_l2:.4g}")
     if lambda_u_reg > 0:
         print(f"[MultiWorm] Lambda-u regularization (logit space) = {lambda_u_reg:.4g}")
     if I0_reg > 0:
         print(f"[MultiWorm] I0 regularization = {I0_reg:.4g}")
-    if G_reg > 0:
-        print(f"[MultiWorm] G regularization = {G_reg:.4g}")
     if tau_reg > 0:
         print(f"[MultiWorm] tau regularization (log space) = {tau_reg:.4g}")
     if rollout_weight > 0:
@@ -752,9 +580,6 @@ def _train_multi_worm_inner(
 
     for epoch in range(num_epochs):
 
-        if dynamics_cv_every > 0 and epoch > 0 and epoch % dynamics_cv_every == 0:
-            _multi_joint_cv(model, worm_states, cfg)
-
         # Step 1 — Trajectory inference (fix θ, ψ; update u_U)
         step1_loss_val: Optional[float] = None
         if infer_unobs:
@@ -801,15 +626,6 @@ def _train_multi_worm_inner(
             )
             tr_losses[worm.worm_id] = float(worm_loss.item())
 
-            # Interaction L2: penalise network contribution beyond pure AR(1)
-            if interaction_l2 > 0:
-                with torch.no_grad():
-                    lam_d = model.lambda_u.detach()
-                    I0_d  = model.I0.detach()
-                    ar1_mu = (1.0 - lam_d) * u_full[:-1] + lam_d * I0_d
-                interaction  = pm[1:] - ar1_mu
-                worm_loss    = worm_loss + interaction_l2 * interaction.pow(2).mean()
-
             # Rollout loss
             if rollout_weight > 0 and rollout_steps > 0:
                 rl_w       = _rollout_loss_worm(model, worm, u_full, rollout_steps, rollout_starts)
@@ -843,10 +659,6 @@ def _train_multi_worm_inner(
         # Regularize I0 toward OLS init
         if I0_reg > 0 and model.I0.requires_grad:
             total_loss = total_loss + I0_reg * (model.I0 - _I0_init_target).pow(2).mean()
-
-        # Regularize G toward init (prevents G/alpha trading)
-        if G_reg > 0 and model._G_raw.requires_grad:
-            total_loss = total_loss + G_reg * (model.G - _G_init_target).pow(2).mean()
 
         # Regularize tau in log space (keeps ranks separated)
         if tau_reg > 0:
@@ -904,7 +716,6 @@ def _train_multi_worm_inner(
                             model, wd, cfg, epoch_losses,
                             str(epoch_dir), show=False,
                             decoder=wdec,
-                            include_ridge_diagnostics=False,
                         )
                         print(
                             f"[MultiWorm] Plots saved to"
@@ -923,11 +734,7 @@ def _train_multi_worm_inner(
             best_val   = val_mean
             best_state = snapshot_model_state(model)
 
-    # 10. Final dynamics-CV
-    if dynamics_cv_every > 0:
-        _multi_joint_cv(model, worm_states, cfg)
-
-    # 11. Save results
+    # 10. Save results
     worm_results: Dict[str, Any] = {}
     for ws in worm_states:
         worm_results[ws.worm_id] = {

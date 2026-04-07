@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from typing import Dict, Any, Optional, Tuple, List
 
 from .behavior_decoder_eval import (
@@ -14,10 +15,12 @@ from .model import Stage2ModelPT
 
 __all__ = [
     "compute_onestep",
-    "compute_cv_reg",
     "compute_free_run",
     "free_run_stochastic",
     "loo_forward_simulate",
+    "loo_forward_simulate_windowed",
+    "loo_forward_simulate_batched",
+    "loo_forward_simulate_batched_windowed",
     "run_loo_all",
     "choose_loo_subset",
     "compute_current_decomposition",
@@ -79,16 +82,11 @@ def _teacher_forced_prior(
 ) -> torch.Tensor:
     T, N = u.shape
     device = u.device
-    ones = torch.ones(N, device=device)
-    prior_mu = torch.zeros_like(u)
-    prior_mu[0] = u[0]
-    s_sv  = torch.zeros(N, model.r_sv,  device=device)
-    s_dcv = torch.zeros(N, model.r_dcv, device=device)
+    model.eval()
     with torch.no_grad():
-        for t in range(1, T):
-            g = gating[t - 1] if gating is not None else ones
-            s = stim[t - 1]   if stim   is not None else None
-            prior_mu[t], s_sv, s_dcv = model.prior_step(u[t - 1], s_sv, s_dcv, g, s)
+        params = model.precompute_params()
+        prior_mu = model.forward_sequence(u, gating_data=gating,
+                                          stim_data=stim, params=params)
     return prior_mu
 
 
@@ -166,164 +164,17 @@ def compute_onestep(model: Stage2ModelPT, data: Dict[str, Any]) -> Dict[str, Any
 #  Per-neuron shrinkage CV-reg                                                  #
 # --------------------------------------------------------------------------- #
 
-def _fit_ar1_ols(x: np.ndarray, y: np.ndarray):
-    """Fit y = a*x + b by OLS.  Returns (a, b)."""
-    valid = np.isfinite(x) & np.isfinite(y)
-    if valid.sum() < 3:
-        return 0.0, float(np.nanmean(y)) if np.any(np.isfinite(y)) else 0.0
-    xv, yv = x[valid].astype(np.float64), y[valid].astype(np.float64)
-    x_m, y_m = xv.mean(), yv.mean()
-    var_x = ((xv - x_m) ** 2).mean()
-    cov_xy = ((xv - x_m) * (yv - y_m)).mean()
-    a = cov_xy / max(var_x, 1e-12)
-    b = y_m - a * x_m
-    return float(a), float(b)
-
-
-def compute_cv_reg(
-    u_np: np.ndarray,
-    model_mu: np.ndarray,
-    *,
-    n_folds: int = 5,
-    log_reg_min: float = -3.0,
-    log_reg_max: float = 5.0,
-    n_grid: int = 50,
-) -> Dict[str, Any]:
-    """Per-neuron shrinkage CV-reg: blend AR(1) <-> full-model prediction.
-
-    For each neuron *i*, find optimal alpha_i in [0, 1] via temporal-block
-    k-fold CV:
-
-        u_reg = u_ar1 + alpha_i * (u_model - u_ar1)
-
-    where alpha_i = 1 / (1 + reg_i*) and reg_i* minimises held-out
-    one-step MSE.
-
-    Parameters
-    ----------
-    u_np : (T, N) ground-truth neural activity
-    model_mu : (T, N) teacher-forced one-step model prediction
-    n_folds : number of contiguous temporal blocks
-    log_reg_min, log_reg_max : log10 bounds for regularisation grid
-    n_grid : number of grid points (log-spaced)
-
-    Returns
-    -------
-    dict with keys:
-        cv_reg_mu : (T, N)  blended prediction using best alpha
-        alpha     : (N,)    per-neuron optimal alpha (0 = AR1, 1 = model)
-        best_reg  : (N,)    per-neuron optimal regularisation strength
-        reg_grid  : (n_grid,) regularisation values searched
-        alpha_grid: (n_grid,) corresponding alpha = 1/(1+reg)
-        cv_mse_all: (N, n_grid) mean CV-MSE at each grid point
-        r2        : (N,)    R^2 of the blended prediction
-        r2_improvement : (N,)  R^2(cv_reg) - R^2(raw model)
-    """
-    T, N = u_np.shape
-
-    # Regularisation grid (log-spaced)
-    reg_grid = np.logspace(log_reg_min, log_reg_max, n_grid)
-    alpha_grid = 1.0 / (1.0 + reg_grid)  # high reg -> alpha near 0 (AR1)
-
-    # Temporal transitions: t -> t+1
-    u_prev = u_np[:-1]          # (T-1, N)
-    u_next = u_np[1:]           # (T-1, N)
-    model_pred = model_mu[1:]   # (T-1, N)
-    n_trans = T - 1
-
-    # Create contiguous temporal-block fold assignments
-    fold_ids = np.zeros(n_trans, dtype=int)
-    fold_size = n_trans // n_folds
-    for k in range(n_folds):
-        start = k * fold_size
-        end = (k + 1) * fold_size if k < n_folds - 1 else n_trans
-        fold_ids[start:end] = k
-
-    # Per-neuron CV
-    best_alpha = np.zeros(N, dtype=np.float64)
-    best_reg = np.full(N, np.inf, dtype=np.float64)
-    cv_mse_all = np.full((N, n_grid), np.nan, dtype=np.float64)
-
-    for i in range(N):
-        fold_mse = np.full((n_folds, n_grid), np.nan, dtype=np.float64)
-
-        for k in range(n_folds):
-            train_mask = fold_ids != k
-            test_mask = fold_ids == k
-            if test_mask.sum() == 0:
-                continue
-
-            # Fit AR(1) on training portion: u_{t+1,i} = a * u_{t,i} + b
-            a, b = _fit_ar1_ols(u_prev[train_mask, i], u_next[train_mask, i])
-            ar1_test = a * u_prev[test_mask, i] + b
-            model_test = model_pred[test_mask, i]
-            target_test = u_next[test_mask, i]
-
-            # Correction vector (model - AR1) on held-out block
-            correction = model_test - ar1_test
-
-            # Evaluate each regularisation level
-            for gi, alpha in enumerate(alpha_grid):
-                blend = ar1_test + alpha * correction
-                resid = target_test - blend
-                valid = np.isfinite(resid)
-                if valid.sum() > 0:
-                    fold_mse[k, gi] = float(np.mean(resid[valid] ** 2))
-
-        # Average across folds and pick best
-        mean_mse = np.nanmean(fold_mse, axis=0)
-        cv_mse_all[i] = mean_mse
-
-        if np.all(np.isnan(mean_mse)):
-            best_alpha[i] = 0.0
-            best_reg[i] = np.inf
-        else:
-            best_idx = int(np.nanargmin(mean_mse))
-            best_alpha[i] = alpha_grid[best_idx]
-            best_reg[i] = reg_grid[best_idx]
-
-    # Build final blended prediction using full-data AR(1)
-    cv_reg_mu = np.zeros_like(u_np)
-    cv_reg_mu[0] = u_np[0]
-    for i in range(N):
-        a, b = _fit_ar1_ols(u_prev[:, i], u_next[:, i])
-        ar1_full = a * u_prev[:, i] + b
-        cv_reg_mu[1:, i] = ar1_full + best_alpha[i] * (model_pred[:, i] - ar1_full)
-
-    # Per-neuron R^2 of blended prediction
-    r2_cv = np.array([_r2(u_np[1:, i], cv_reg_mu[1:, i]) for i in range(N)])
-    r2_raw = np.array([_r2(u_np[1:, i], model_mu[1:, i]) for i in range(N)])
-
-    _logger = get_stage2_logger()
-    _n_shrunk = int((best_alpha < 0.5).sum())
-    _med_alpha = float(np.median(best_alpha))
-    _med_reg = float(np.median(best_reg[np.isfinite(best_reg)]))
-    _logger.info("cv_reg_done", N=N, n_folds=n_folds,
-                 median_alpha=_med_alpha, n_shrunk=_n_shrunk,
-                 median_reg=_med_reg,
-                 r2_raw_median=float(np.nanmedian(r2_raw)),
-                 r2_cv_median=float(np.nanmedian(r2_cv)))
-
-    return {
-        "cv_reg_mu": cv_reg_mu,
-        "alpha": best_alpha,
-        "best_reg": best_reg,
-        "reg_grid": reg_grid,
-        "alpha_grid": alpha_grid,
-        "cv_mse_all": cv_mse_all,
-        "r2": r2_cv,
-        "r2_raw": r2_raw,
-        "r2_improvement": r2_cv - r2_raw,
-    }
-
 
 def compute_free_run(model: Stage2ModelPT, data: Dict[str, Any]) -> Dict[str, Any]:
     device = next(model.parameters()).device
     u0 = data["u_stage1"].to(device)
     T, N = u0.shape
+    cfg = data.get("_cfg")
     gating, stim = data.get("gating"), data.get("stim")
     lo, hi = _get_clip_bounds(model)
     ones = torch.ones(N, device=device)
+    seed_steps = int(getattr(cfg, "eval_free_run_seed_steps", 16) or 16)
+    seed_steps = max(1, min(seed_steps, T))
 
     motor_idx = _resolve_motor_indices(data, N)
     conditioned = 0 < len(motor_idx) < N
@@ -333,10 +184,16 @@ def compute_free_run(model: Stage2ModelPT, data: Dict[str, Any]) -> Dict[str, An
 
     with torch.no_grad():
         u_free = torch.zeros_like(u0)
-        u_free[0] = u0[0]
+        u_free[:seed_steps] = u0[:seed_steps]
         s_sv  = torch.zeros(N, model.r_sv,  device=device)
         s_dcv = torch.zeros(N, model.r_dcv, device=device)
-        for t in range(1, T):
+
+        for t in range(1, seed_steps):
+            g = gating[t - 1] if gating is not None else ones
+            s = stim[t - 1]   if stim   is not None else None
+            _, s_sv, s_dcv = model.prior_step(u0[t - 1], s_sv, s_dcv, g, s)
+
+        for t in range(seed_steps, T):
             g = gating[t - 1] if gating is not None else ones
             s = stim[t - 1]   if stim   is not None else None
             u_prev = u0[t - 1].clone() if conditioned else u_free[t - 1]
@@ -352,12 +209,23 @@ def compute_free_run(model: Stage2ModelPT, data: Dict[str, Any]) -> Dict[str, An
 
     u_np, uf_np = u0.cpu().numpy(), u_free.cpu().numpy()
     eval_idx = motor_idx if conditioned else list(range(N))
-    r2, corr, rmse = _per_neuron_metrics(u_np[1:], uf_np[1:], eval_idx)
+    if seed_steps >= T:
+        r2 = np.full(N, np.nan)
+        corr = np.full(N, np.nan)
+        rmse = np.full(N, np.nan)
+    else:
+        r2, corr, rmse = _per_neuron_metrics(
+            u_np[seed_steps:],
+            uf_np[seed_steps:],
+            eval_idx,
+        )
 
     return {
         "u_free": uf_np,
         "r2": r2, "corr": corr, "rmse": rmse,
         "motor_idx": np.array(motor_idx, dtype=int),
+        "seed_steps": seed_steps,
+        "eval_range": (seed_steps, T),
         "mode": "motor_conditioned" if conditioned else "autonomous",
     }
 
@@ -428,8 +296,13 @@ def free_run_stochastic(
                     sigma_t = model.sigma_at(u_cur).detach()  # (N,)
                 else:
                     sigma_t = sigma_const
-                eps = torch.randn(N, device=device)
-                u_next = mu_next + sigma_t * eps
+                # Use correlated noise if low-rank factor is present
+                if getattr(model, 'noise_corr_rank', 0) > 0:
+                    eps_full = model.sample_correlated_noise(sigma_t)
+                    u_next = mu_next + eps_full
+                else:
+                    eps = torch.randn(N, device=device)
+                    u_next = mu_next + sigma_t * eps
                 u_next = _clamp(u_next, lo, hi)
                 u_cur = u_next
                 samples_np[k, t + 1] = u_cur.cpu().numpy()
@@ -482,6 +355,70 @@ def loo_forward_simulate(
             s = stim[t]   if stim   is not None else None
             mu_next, s_sv, s_dcv = model.prior_step(u_t, s_sv, s_dcv, g, s)
             u_pred[t + 1] = _clamp(mu_next[i : i + 1], lo, hi).squeeze()
+
+    return u_pred.cpu().numpy()
+
+
+def loo_forward_simulate_windowed(
+    model: Stage2ModelPT, u_all: torch.Tensor,
+    held_out: int, gating, stim,
+    window_size: int = 200,
+    warmup_steps: int = 0,
+) -> np.ndarray:
+    """LOO prediction with periodic re-seeding to reduce compounding error.
+
+    Every *window_size* frames, the held-out neuron's state is reset to its
+    ground-truth value.  If *warmup_steps* > 0, synaptic states are
+    warm-started by running *warmup_steps* teacher-forced steps on GT data
+    before each window (using the frames immediately preceding the window).
+    When *warmup_steps* is 0, synaptic states are initialised to zero (the
+    original behaviour).
+
+    Parameters
+    ----------
+    window_size : int
+        Number of frames per free-running window.  The held-out neuron is
+        re-seeded from GT at the start of each window.  E.g. 200 frames
+        at dt=0.6 s ≈ 2 min windows.
+    warmup_steps : int
+        Number of teacher-forced GT steps to run before each window to
+        build up realistic synaptic states.  0 = cold-start (zeros).
+        A good default is the longest DCV tau in frames, e.g. 30–50.
+    """
+    T, N = u_all.shape
+    device = u_all.device
+    i = held_out
+    lo, hi = _get_clip_bounds(model)
+    ones = torch.ones(N, device=device)
+
+    u_pred = torch.zeros(T, device=device)
+    u_pred[0] = u_all[0, i]
+
+    with torch.no_grad():
+        # Process windows
+        for w_start in range(0, T, window_size):
+            w_end = min(w_start + window_size, T)
+            # Re-seed held-out neuron at window start
+            u_pred[w_start] = u_all[w_start, i]
+
+            # ── Warm-start synaptic states ──
+            s_sv  = torch.zeros(N, model.r_sv,  device=device)
+            s_dcv = torch.zeros(N, model.r_dcv, device=device)
+            if warmup_steps > 0 and w_start > 0:
+                burn_start = max(0, w_start - warmup_steps)
+                for tb in range(burn_start, w_start):
+                    g = gating[tb] if gating is not None else ones
+                    s = stim[tb]   if stim   is not None else None
+                    _, s_sv, s_dcv = model.prior_step(
+                        u_all[tb], s_sv, s_dcv, g, s)
+
+            for t in range(w_start, w_end - 1):
+                u_t = u_all[t].clone()
+                u_t[i] = u_pred[t]
+                g = gating[t] if gating is not None else ones
+                s = stim[t]   if stim   is not None else None
+                mu_next, s_sv, s_dcv = model.prior_step(u_t, s_sv, s_dcv, g, s)
+                u_pred[t + 1] = _clamp(mu_next[i : i + 1], lo, hi).squeeze()
 
     return u_pred.cpu().numpy()
 
@@ -545,75 +482,381 @@ def loo_forward_simulate_stochastic(
     return samples
 
 
-def _calibrate_loo_sigma(
-    u_true: np.ndarray, loo_pred: np.ndarray,
-) -> float:
-    """Compute per-neuron empirical LOO residual std (excluding frame 0).
+# ── Batched LOO helpers ──────────────────────────────────────────────────────
 
-    This is the RMS of the deterministic LOO prediction error — the "true"
-    scale of LOO uncertainty, which is much larger than the learned one-step σ.
-    """
-    resid = u_true[1:] - loo_pred[1:]
-    m = np.isfinite(resid)
-    if m.sum() < 2:
-        return 1.0
-    return float(np.std(resid[m]))
-
-
-def loo_forward_simulate_calibrated(
-    model: Stage2ModelPT, u_all: torch.Tensor,
-    held_out: int, gating, stim,
-    sigma_empirical: float,
-    n_samples: int = 20,
-) -> np.ndarray:
-    """Calibrated stochastic LOO: inject noise scaled to the *empirical*
-    LOO residual std, not the (too-small) learned σ.
-
-    This produces stochastic sample trajectories whose 95% CI matches
-    the actual spread of LOO prediction errors.
+def _batched_synaptic_current(u_prev, phi_gated, s, T_eff, a, tau, E, dt):
+    """Batched version of ``Stage2ModelPT._synaptic_current``.
 
     Parameters
     ----------
-    sigma_empirical : float
-        Per-neuron empirical LOO residual std from `_calibrate_loo_sigma`.
+    u_prev    : (B, N)
+    phi_gated : (B, N)
+    s         : (B, N, r)
+    T_eff     : (N, N)  – topology * W matrix
+    a         : (r,) or (N, r)
+    tau       : (r,)
+    E         : scalar, (N,), or (N, N)
+    dt        : float
+    """
+    gamma = torch.exp(-dt / (tau + 1e-12))           # (r,)
+    s_next = gamma.view(1, 1, -1) * s + phi_gated.unsqueeze(-1)  # (B, N, r)
+
+    # pool[b] = T_eff^T @ s_next[b]   →  (B, N, r)
+    pool = torch.einsum("mn,bnr->bmr", T_eff.t(), s_next)
+
+    a_post = a.unsqueeze(0) if a.dim() == 1 else a   # (1,r) or (N,r)
+    g = (pool * a_post.unsqueeze(0)).sum(-1)          # (B, N)
+
+    if E.dim() == 0:
+        I = g * (E - u_prev)
+    elif E.dim() == 1:
+        weighted = s_next * E.view(1, -1, 1)         # (B, N, r)
+        pool_E = torch.einsum("mn,bnr->bmr", T_eff.t(), weighted)
+        I = (pool_E * a_post.unsqueeze(0)).sum(-1) - g * u_prev
+    else:
+        # E is (N, N)
+        pool_E = torch.einsum("mn,bnr->bmr", (T_eff * E).t(), s_next)
+        I = (pool_E * a_post.unsqueeze(0)).sum(-1) - g * u_prev
+
+    return I, s_next
+
+
+def loo_forward_simulate_batched(
+    model: Stage2ModelPT,
+    u_all: torch.Tensor,
+    held_out_indices: List[int],
+    gating,
+    stim,
+    warmup_steps: int = 0,
+) -> Dict[int, np.ndarray]:
+    """Simulate LOO for many neurons **in parallel** on GPU.
+
+    Instead of ``len(held_out_indices)`` sequential calls to
+    ``loo_forward_simulate`` (each iterating T steps), this runs a *single*
+    batched loop of T steps with all held-out neurons processed together.
+    Speedup ≈ ``len(held_out_indices)``× (typically ~100×).
+
+    If *warmup_steps* > 0, the first ``warmup_steps`` frames are run with
+    ALL neurons at ground truth (teacher-forced) to build up realistic
+    synaptic kernel states.  The held-out neuron's prediction is set to GT
+    during warmup and actual LOO divergence starts at ``warmup_steps``.
+
+    Returns dict  ``{neuron_index: np.ndarray of shape (T,)}``.
     """
     T, N = u_all.shape
     device = u_all.device
-    i = held_out
+    B = len(held_out_indices)
+    if B == 0:
+        return {}
+
+    idx = torch.tensor(held_out_indices, device=device, dtype=torch.long)
     lo, hi = _get_clip_bounds(model)
     ones = torch.ones(N, device=device)
 
-    # Use empirical sigma for the held-out neuron, model sigma for others
-    sigma_emp_t = torch.tensor(sigma_empirical, device=device, dtype=torch.float32)
+    # Running predictions per LOO trial: (B, T)
+    u_pred = torch.zeros(B, T, device=device)
+    u_pred[:, 0] = u_all[0, idx]
 
-    samples = np.zeros((n_samples, T), dtype=np.float32)
+    # Batched synaptic states: (B, N, r)
+    s_sv  = torch.zeros(B, N, model.r_sv,  device=device) if model.r_sv  > 0 else None
+    s_dcv = torch.zeros(B, N, model.r_dcv, device=device) if model.r_dcv > 0 else None
+
+    # Pre-compute constant model parameters (avoids repeated property access)
+    lambda_u = model.lambda_u.detach()       # (N,)
+    I0       = model.I0.detach()             # (N,)
+    L        = model.laplacian().detach()    # (N, N)
+    if model.r_sv > 0:
+        T_sv_eff = (model.T_sv * model._get_W("W_sv")).detach()
+        a_sv     = model.a_sv.detach()
+        tau_sv   = model.tau_sv.detach()
+        E_sv     = model.E_sv.detach()
+    if model.r_dcv > 0:
+        T_dcv_eff = (model.T_dcv * model._get_W("W_dcv")).detach()
+        a_dcv     = model.a_dcv.detach()
+        tau_dcv   = model.tau_dcv.detach()
+        E_dcv     = model.E_dcv.detach()
+
+    # Coupling gate and residual MLP
+    has_gate = getattr(model, 'has_coupling_gate', False)
+    gate_vals = model.coupling_gate_values.detach() if has_gate else None  # (N,)
+    has_mlp = model.residual_mlp is not None
+    mlp_ctx_K = getattr(model, '_mlp_context_K', 1)
+
+    # Pre-compute MLP context inputs from u_all: (T, N*K)
+    mlp_ctx_inputs = None
+    if has_mlp and mlp_ctx_K > 1:
+        u_pad = F.pad(u_all, (0, 0, mlp_ctx_K - 1, 0))
+        mlp_ctx_inputs = torch.cat(
+            [u_pad[mlp_ctx_K - 1 - k : mlp_ctx_K - 1 - k + T] for k in range(mlp_ctx_K)],
+            dim=1,
+        )  # (T, N*K)
+
+    # Pre-compute linear lag terms from u_all
+    lag_order = getattr(model, '_lag_order', 0)
+    lag_neighbor = getattr(model, '_lag_neighbor', False)
+    lag_all = None  # (T, N) pre-computed I_lag for each timestep
+    if lag_order > 0:
+        K_lag = lag_order
+        lag_alpha = model._lag_alpha.detach()  # (K, N)
+        u_lag_pad = F.pad(u_all, (0, 0, K_lag, 0))  # (T+K, N)
+        lag_buf = torch.stack(
+            [u_lag_pad[K_lag - 1 - k : K_lag - 1 - k + T] for k in range(K_lag)],
+            dim=1,
+        )  # (T, K, N)
+        lag_all = (lag_alpha.unsqueeze(0) * lag_buf).sum(1)  # (T, N)
+        if lag_neighbor and hasattr(model, '_lag_G'):
+            lag_G = model._lag_G.detach()  # (K, N, N)
+            mask = model._lag_nbr_mask  # (N, N)
+            for k in range(K_lag):
+                G_k = lag_G[k] * mask
+                lag_all = lag_all + (lag_buf[:, k, :] @ G_k.T)
+
+    batch_range = torch.arange(B, device=device)
+    warmup = min(max(warmup_steps, 0), T - 1)
+
     with torch.no_grad():
-        for k in range(n_samples):
-            u_pred = torch.zeros(T, device=device)
-            u_pred[0] = u_all[0, i]
-            s_sv  = torch.zeros(N, model.r_sv,  device=device)
-            s_dcv = torch.zeros(N, model.r_dcv, device=device)
-
-            for t in range(T - 1):
-                u_t = u_all[t].clone()
-                u_t[i] = u_pred[t]
+        # ── Warmup: teacher-force ALL neurons (including held-out) ────
+        # This builds up realistic synaptic kernel states before LOO
+        # divergence.  Predictions during warmup = GT.
+        if warmup > 0:
+            for t in range(warmup):
+                u_gt = u_all[t].unsqueeze(0).expand(B, -1)  # all GT
                 g = gating[t] if gating is not None else ones
-                s = stim[t]   if stim   is not None else None
-                mu_next, s_sv, s_dcv = model.prior_step(u_t, s_sv, s_dcv, g, s)
-                # Inject noise at the *empirical* LOO scale
-                noise = torch.randn(1, device=device) * sigma_emp_t
-                u_pred[t + 1] = _clamp(
-                    mu_next[i : i + 1] + noise, lo, hi
-                ).squeeze()
+                phi_gated = model.phi(u_gt) * g.unsqueeze(0)
+                if model.r_sv > 0:
+                    _, s_sv = _batched_synaptic_current(
+                        u_gt, phi_gated, s_sv, T_sv_eff, a_sv, tau_sv, E_sv, model.dt)
+                if model.r_dcv > 0:
+                    _, s_dcv = _batched_synaptic_current(
+                        u_gt, phi_gated, s_dcv, T_dcv_eff, a_dcv, tau_dcv, E_dcv, model.dt)
+                # Prediction = GT during warmup
+                u_pred[:, t] = u_all[t, idx]
+                if t + 1 < T:
+                    u_pred[:, t + 1] = u_all[t + 1, idx]
 
-            samples[k] = u_pred.cpu().numpy()
-    return samples
+        # ── Main LOO loop: held-out neuron diverges ──────────────────
+        for t in range(max(warmup, 0), T - 1):
+            # (B, N) – each row starts as ground truth
+            u_t = u_all[t].unsqueeze(0).expand(B, -1).clone()
+            # Replace held-out neuron in each row
+            u_t[batch_range, idx] = u_pred[:, t]
+
+            g = gating[t] if gating is not None else ones          # (N,)
+            phi_gated = model.phi(u_t) * g.unsqueeze(0)           # (B, N)
+
+            # Synaptic currents
+            I_sv_t = torch.zeros(B, N, device=device)
+            I_dcv_t = torch.zeros(B, N, device=device)
+            if model.r_sv > 0:
+                I_sv_t, s_sv = _batched_synaptic_current(
+                    u_t, phi_gated, s_sv, T_sv_eff, a_sv, tau_sv, E_sv, model.dt)
+            if model.r_dcv > 0:
+                I_dcv_t, s_dcv = _batched_synaptic_current(
+                    u_t, phi_gated, s_dcv, T_dcv_eff, a_dcv, tau_dcv, E_dcv, model.dt)
+
+            # Gap junctions:  L @ u_t^T → (N, B) → transpose → (B, N)
+            I_gap = u_t @ L.T
+
+            # Stimulus (broadcast — same across batch)
+            I_stim = torch.zeros(B, N, device=device)
+            if model.d_ell > 0 and stim is not None:
+                s_t = stim[t]
+                if model.stim_diagonal_only:
+                    I_stim = (model.b * s_t).unsqueeze(0).expand(B, -1)
+                else:
+                    I_stim = (model.b @ s_t).unsqueeze(0).expand(B, -1)
+
+            # Coupling gate
+            I_coupling = I_gap + I_sv_t + I_dcv_t
+            if has_gate:
+                I_coupling = gate_vals * I_coupling
+
+            # Residual MLP correction (K-step context from ground-truth u_all)
+            I_mlp = torch.zeros(B, N, device=device)
+            if has_mlp:
+                if mlp_ctx_inputs is not None:
+                    # Each LOO trial shares the same GT-based context
+                    # (the held-out neuron is a single entry — negligible
+                    # bias vs. re-computing per-trial context)
+                    mlp_in = mlp_ctx_inputs[t]            # (N*K,)
+                    I_mlp = model.residual_mlp(mlp_in).unsqueeze(0).expand(B, -1)
+                else:
+                    I_mlp = model.residual_mlp(u_all[t]).unsqueeze(0).expand(B, -1)
+
+            # Linear lag terms (pre-computed from GT trajectory)
+            I_lag = torch.zeros(B, N, device=device)
+            if lag_all is not None:
+                I_lag = lag_all[t].unsqueeze(0).expand(B, -1)
+
+            # Euler step
+            u_next = ((1.0 - lambda_u) * u_t
+                      + lambda_u * (I0 + I_coupling + I_stim + I_mlp + I_lag))
+
+            if lo is not None or hi is not None:
+                u_next = u_next.clamp(min=lo, max=hi)
+
+            # Each trial extracts its own neuron
+            u_pred[:, t + 1] = u_next[batch_range, idx]
+
+    # Pack results
+    u_pred_np = u_pred.cpu().numpy()
+    return {int(held_out_indices[b]): u_pred_np[b] for b in range(B)}
+
+
+def loo_forward_simulate_batched_windowed(
+    model: Stage2ModelPT,
+    u_all: torch.Tensor,
+    held_out_indices: List[int],
+    gating,
+    stim,
+    window_size: int = 200,
+    warmup_steps: int = 0,
+) -> Dict[int, np.ndarray]:
+    """Batched windowed LOO — periodic re-seeding, all neurons in parallel."""
+    T, N = u_all.shape
+    device = u_all.device
+    B = len(held_out_indices)
+    if B == 0:
+        return {}
+
+    idx = torch.tensor(held_out_indices, device=device, dtype=torch.long)
+    lo, hi = _get_clip_bounds(model)
+    ones = torch.ones(N, device=device)
+
+    u_pred = torch.zeros(B, T, device=device)
+    u_pred[:, 0] = u_all[0, idx]
+
+    # Pre-compute constants
+    lambda_u = model.lambda_u.detach()
+    I0       = model.I0.detach()
+    L        = model.laplacian().detach()
+    has_sv  = model.r_sv  > 0
+    has_dcv = model.r_dcv > 0
+    if has_sv:
+        T_sv_eff = (model.T_sv * model._get_W("W_sv")).detach()
+        a_sv, tau_sv, E_sv = model.a_sv.detach(), model.tau_sv.detach(), model.E_sv.detach()
+    if has_dcv:
+        T_dcv_eff = (model.T_dcv * model._get_W("W_dcv")).detach()
+        a_dcv, tau_dcv, E_dcv = model.a_dcv.detach(), model.tau_dcv.detach(), model.E_dcv.detach()
+
+    # Coupling gate and residual MLP
+    has_gate = getattr(model, 'has_coupling_gate', False)
+    gate_vals = model.coupling_gate_values.detach() if has_gate else None
+    has_mlp = model.residual_mlp is not None
+    mlp_ctx_K = getattr(model, '_mlp_context_K', 1)
+
+    # Pre-compute MLP context inputs from u_all: (T, N*K)
+    mlp_ctx_inputs = None
+    if has_mlp and mlp_ctx_K > 1:
+        u_pad = F.pad(u_all, (0, 0, mlp_ctx_K - 1, 0))
+        mlp_ctx_inputs = torch.cat(
+            [u_pad[mlp_ctx_K - 1 - k : mlp_ctx_K - 1 - k + T] for k in range(mlp_ctx_K)],
+            dim=1,
+        )
+
+    # Pre-compute linear lag terms from u_all
+    lag_order = getattr(model, '_lag_order', 0)
+    lag_neighbor = getattr(model, '_lag_neighbor', False)
+    lag_all = None  # (T, N)
+    if lag_order > 0:
+        K_lag = lag_order
+        lag_alpha = model._lag_alpha.detach()
+        u_lag_pad = F.pad(u_all, (0, 0, K_lag, 0))
+        lag_buf = torch.stack(
+            [u_lag_pad[K_lag - 1 - k : K_lag - 1 - k + T] for k in range(K_lag)],
+            dim=1,
+        )
+        lag_all = (lag_alpha.unsqueeze(0) * lag_buf).sum(1)
+        if lag_neighbor and hasattr(model, '_lag_G'):
+            lag_G = model._lag_G.detach()
+            mask = model._lag_nbr_mask
+            for k in range(K_lag):
+                G_k = lag_G[k] * mask
+                lag_all = lag_all + (lag_buf[:, k, :] @ G_k.T)
+
+    batch_range = torch.arange(B, device=device)
+
+    with torch.no_grad():
+        for w_start in range(0, T, window_size):
+            w_end = min(w_start + window_size, T)
+            u_pred[:, w_start] = u_all[w_start, idx]
+
+            # Warm-start synaptic states
+            s_sv  = torch.zeros(B, N, model.r_sv,  device=device) if has_sv  else None
+            s_dcv = torch.zeros(B, N, model.r_dcv, device=device) if has_dcv else None
+            if warmup_steps > 0 and w_start > 0:
+                burn_start = max(0, w_start - warmup_steps)
+                for tb in range(burn_start, w_start):
+                    u_gt = u_all[tb].unsqueeze(0).expand(B, -1)
+                    g = gating[tb] if gating is not None else ones
+                    phi_g = model.phi(u_gt) * g.unsqueeze(0)
+                    if has_sv:
+                        _, s_sv = _batched_synaptic_current(
+                            u_gt, phi_g, s_sv, T_sv_eff, a_sv, tau_sv, E_sv, model.dt)
+                    if has_dcv:
+                        _, s_dcv = _batched_synaptic_current(
+                            u_gt, phi_g, s_dcv, T_dcv_eff, a_dcv, tau_dcv, E_dcv, model.dt)
+
+            for t in range(w_start, w_end - 1):
+                u_t = u_all[t].unsqueeze(0).expand(B, -1).clone()
+                u_t[batch_range, idx] = u_pred[:, t]
+
+                g = gating[t] if gating is not None else ones
+                phi_gated = model.phi(u_t) * g.unsqueeze(0)
+
+                I_sv_t = torch.zeros(B, N, device=device)
+                I_dcv_t = torch.zeros(B, N, device=device)
+                if has_sv:
+                    I_sv_t, s_sv = _batched_synaptic_current(
+                        u_t, phi_gated, s_sv, T_sv_eff, a_sv, tau_sv, E_sv, model.dt)
+                if has_dcv:
+                    I_dcv_t, s_dcv = _batched_synaptic_current(
+                        u_t, phi_gated, s_dcv, T_dcv_eff, a_dcv, tau_dcv, E_dcv, model.dt)
+
+                I_gap = u_t @ L.T
+                I_stim = torch.zeros(B, N, device=device)
+                if model.d_ell > 0 and stim is not None:
+                    s_t = stim[t]
+                    if model.stim_diagonal_only:
+                        I_stim = (model.b * s_t).unsqueeze(0).expand(B, -1)
+                    else:
+                        I_stim = (model.b @ s_t).unsqueeze(0).expand(B, -1)
+
+                # Coupling gate
+                I_coupling = I_gap + I_sv_t + I_dcv_t
+                if has_gate:
+                    I_coupling = gate_vals * I_coupling
+
+                # Residual MLP correction
+                I_mlp = torch.zeros(B, N, device=device)
+                if has_mlp:
+                    if mlp_ctx_inputs is not None:
+                        mlp_in = mlp_ctx_inputs[t]
+                        I_mlp = model.residual_mlp(mlp_in).unsqueeze(0).expand(B, -1)
+                    else:
+                        I_mlp = model.residual_mlp(u_all[t]).unsqueeze(0).expand(B, -1)
+
+                # Linear lag terms (pre-computed from GT trajectory)
+                I_lag = torch.zeros(B, N, device=device)
+                if lag_all is not None:
+                    I_lag = lag_all[t].unsqueeze(0).expand(B, -1)
+
+                u_next = ((1.0 - lambda_u) * u_t
+                          + lambda_u * (I0 + I_coupling + I_stim + I_mlp + I_lag))
+                if lo is not None or hi is not None:
+                    u_next = u_next.clamp(min=lo, max=hi)
+                u_pred[:, t + 1] = u_next[batch_range, idx]
+
+    u_pred_np = u_pred.cpu().numpy()
+    return {int(held_out_indices[b]): u_pred_np[b] for b in range(B)}
 
 
 def run_loo_all(
     model: Stage2ModelPT, data: Dict[str, Any],
     subset: Optional[List[int]] = None,
     n_sample_trajectories: int = 0,
+    window_size: int = 0,
+    warmup_steps: int = 0,
 ) -> Dict[str, Any]:
     device = next(model.parameters()).device
     u = data["u_stage1"].to(device)
@@ -627,41 +870,65 @@ def run_loo_all(
         and getattr(model, "_learn_noise", False)
     )
 
-    preds = {}
-    samples = {}  # idx -> (n_samples, T) array
-    calibrated_samples = {}  # idx -> (n_samples, T) array — calibrated to empirical LOO residuals
+    use_windowed = window_size > 0
+
     labels = data.get("neuron_labels", [])
     _logger = get_stage2_logger()
     _logger.info("loo_start", n_neurons=len(indices),
-                 stochastic=do_stochastic, n_samples=n_sample_trajectories)
-    for cnt, i in enumerate(indices):
-        preds[i] = loo_forward_simulate(model, u, i, gating, stim)
-        if do_stochastic:
+                 stochastic=do_stochastic, n_samples=n_sample_trajectories,
+                 windowed=use_windowed, window_size=window_size)
+
+    # ── Batched deterministic LOO (all neurons in parallel) ──────────
+    preds = loo_forward_simulate_batched(model, u, indices, gating, stim,
+                                         warmup_steps=warmup_steps)
+    _logger.info("loo_batched_done", n_neurons=len(indices), variant="deterministic",
+                 warmup_steps=warmup_steps)
+
+    preds_windowed = {}
+    if use_windowed:
+        preds_windowed = loo_forward_simulate_batched_windowed(
+            model, u, indices, gating, stim,
+            window_size=window_size, warmup_steps=warmup_steps,
+        )
+        _logger.info("loo_batched_done", n_neurons=len(indices), variant="windowed")
+
+    # ── Sequential stochastic sampling (depends on deterministic preds) ──
+    samples = {}
+    if do_stochastic:
+        for cnt, i in enumerate(indices):
             samples[i] = loo_forward_simulate_stochastic(
                 model, u, i, gating, stim,
                 n_samples=n_sample_trajectories,
             )
-            # Calibrated sampling: use empirical LOO residual std
-            sigma_emp = _calibrate_loo_sigma(u_np[:, i], preds[i])
-            calibrated_samples[i] = loo_forward_simulate_calibrated(
-                model, u, i, gating, stim,
-                sigma_empirical=sigma_emp,
-                n_samples=n_sample_trajectories,
-            )
+            lbl = labels[i] if i < len(labels) else f"#{i}"
+            if cnt == 0 or (cnt + 1) % 10 == 0:
+                _logger.info("loo_stochastic_progress", done=cnt + 1,
+                             total=len(indices), neuron=int(i), name=lbl)
+
+    # Log per-neuron R² summary
+    for cnt, i in enumerate(indices):
         lbl = labels[i] if i < len(labels) else f"#{i}"
         r2_i = float(_r2(u_np[1:, i], preds[i][1:]))
         if cnt == 0 or (cnt + 1) % 10 == 0 or len(indices) <= 10:
+            extra = {}
+            if use_windowed:
+                extra["r2_windowed"] = float(_r2(u_np[1:, i], preds_windowed[i][1:]))
             _logger.info("loo_progress", done=cnt + 1, total=len(indices),
-                         neuron=int(i), name=lbl, r2=r2_i)
+                         neuron=int(i), name=lbl, r2=r2_i, **extra)
 
     pred_full = np.column_stack([preds.get(i, u_np[:, i]) for i in range(u.shape[1])])
     r2, corr, rmse = _per_neuron_metrics(u_np[1:], pred_full[1:], indices)
 
     result = {"pred": preds, "r2": r2, "corr": corr, "rmse": rmse}
+    if use_windowed:
+        pred_w_full = np.column_stack([preds_windowed.get(i, u_np[:, i]) for i in range(u.shape[1])])
+        r2_w, corr_w, rmse_w = _per_neuron_metrics(u_np[1:], pred_w_full[1:], indices)
+        result["pred_windowed"] = preds_windowed
+        result["r2_windowed"] = r2_w
+        result["corr_windowed"] = corr_w
+        result["rmse_windowed"] = rmse_w
     if samples:
         result["samples"] = samples
-    if calibrated_samples:
-        result["calibrated_samples"] = calibrated_samples
     return result
 
 
@@ -834,22 +1101,11 @@ def run_full_evaluation(
         seed=_cfg_val(cfg, "eval_loo_subset_seed", 0, int),
     )
 
-    # Per-neuron shrinkage CV-reg
-    cv_reg = None
-    if _cfg_val(cfg, "cv_reg_enabled", True, bool):
-        u_np = data["u_stage1"].cpu().numpy()
-        cv_reg = compute_cv_reg(
-            u_np, onestep["prior_mu"],
-            n_folds=_cfg_val(cfg, "cv_reg_n_folds", 5, int),
-            log_reg_min=_cfg_val(cfg, "cv_reg_log_min", -3.0, float),
-            log_reg_max=_cfg_val(cfg, "cv_reg_log_max", 5.0, float),
-            n_grid=_cfg_val(cfg, "cv_reg_n_grid", 50, int),
-        )
-    onestep["cv_reg"] = cv_reg
-
     loo      = run_loo_all(
         model, data, subset=subset,
         n_sample_trajectories=_cfg_val(cfg, "n_sample_trajectories", 0, int),
+        window_size=_cfg_val(cfg, "eval_loo_window_size", 0, int),
+        warmup_steps=_cfg_val(cfg, "eval_loo_warmup_steps", 0, int),
     )
     currents = compute_current_decomposition(model, data)
     free_run = compute_free_run(model, data)
@@ -879,7 +1135,6 @@ def run_full_evaluation(
     return {
         "onestep": onestep, "loo": loo, "currents": currents,
         "free_run": free_run, "freerun_stoch": freerun_stoch,
-        "cv_reg": cv_reg,
         "beh": beh, "beh_all": beh_all,
         "beh_r2_model": r2_model_mean,
     }

@@ -15,8 +15,6 @@ from .behavior_decoder_eval import (
     behaviour_all_neurons_prediction,
     compute_behaviour_loss,
     init_behaviour_decoder,
-    _log_ridge_grid,
-    _make_contiguous_folds,
 )
 from .config import Stage2PTConfig
 from .io_h5 import load_data_pt, save_results_pt
@@ -25,11 +23,10 @@ from .plot_eval import generate_eval_loo_plots
 
 __all__ = [
     "train_stage2",
+    "train_stage2_cv",
     # Used by train_multi.py:
     "compute_dynamics_loss",
     "snapshot_model_state",
-    "joint_cv_solve",
-    "inject_joint_cv",
 ]
 
 
@@ -64,6 +61,7 @@ def compute_dynamics_loss(
     u_var_scale: float = 1.0,
     u_var_floor: float = 1e-8,
     model_sigma: Optional[torch.Tensor] = None,
+    train_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Dynamics loss: weighted MSE *or* Gaussian NLL when *model_sigma* is given.
 
@@ -79,6 +77,13 @@ def compute_dynamics_loss(
 
     For *heteroscedastic* models, *model_sigma* has shape ``(T, N)`` where
     each row is the state-dependent noise for that time step.
+
+    Parameters
+    ----------
+    train_mask : optional bool tensor, shape ``(T,)``
+        If provided, only include time steps where ``train_mask[t]`` is True
+        in the loss.  Used for k-fold CV training where held-out time steps
+        must be excluded from the gradient.
     """
     T = target.shape[0]
 
@@ -92,6 +97,8 @@ def compute_dynamics_loss(
         resid2 = (target - prior_mu) ** 2
         valid = (torch.isfinite(resid2) & torch.isfinite(sigma2)
                  & (sigma2 > 0))
+        if train_mask is not None:
+            valid = valid & train_mask.view(-1, 1)
         if not valid.any():
             return torch.tensor(0.0, device=target.device)
         nll = 0.5 * (resid2 / sigma2 + torch.log(sigma2))
@@ -108,6 +115,8 @@ def compute_dynamics_loss(
     )
     resid2 = (target - prior_mu) ** 2
     valid = torch.isfinite(resid2) & torch.isfinite(var_eff) & (var_eff > 0)
+    if train_mask is not None:
+        valid = valid & train_mask.view(-1, 1)
     if not valid.any():
         return torch.tensor(0.0, device=target.device)
     weighted = torch.where(valid, resid2 / var_eff, torch.zeros_like(resid2))
@@ -169,6 +178,13 @@ def compute_rollout_loss(
             s_sv = torch.zeros(N, model.r_sv, device=device)
             s_dcv = torch.zeros(N, model.r_dcv, device=device)
 
+        # Warm-start MLP context history from teacher-forced trajectory
+        if hasattr(model, 'init_mlp_history'):
+            model.init_mlp_history(u_target, t0)
+        # Warm-start lag history from teacher-forced trajectory
+        if hasattr(model, 'init_lag_history'):
+            model.init_lag_history(u_target, t0)
+
         seg_loss = torch.tensor(0.0, device=device)
         seg_count = 0
 
@@ -207,6 +223,7 @@ def compute_teacher_forced_states(
     *,
     gating_data: Optional[torch.Tensor] = None,
     stim_data: Optional[torch.Tensor] = None,
+    cached_params: Optional[dict] = None,
 ) -> dict:
     """Run a teacher-forced pass and cache synaptic states at each time step.
 
@@ -216,6 +233,9 @@ def compute_teacher_forced_states(
 
     These can be used to warm-start rollout segments or neuron-dropout
     segments so that the synaptic trace state is realistic rather than zero.
+
+    If *cached_params* is provided (from ``model.precompute_params()``),
+    reparameterized parameters are reused instead of recomputed per step.
     """
     T, N = u.shape
     device = u.device
@@ -227,11 +247,20 @@ def compute_teacher_forced_states(
     s_sv = torch.zeros(N, r_sv, device=device)
     s_dcv = torch.zeros(N, r_dcv, device=device)
 
+    ones = torch.ones(N, device=device)
+
+    # Reset MLP history so prior_step builds it up from t=0
+    if hasattr(model, 'reset_mlp_history'):
+        model.reset_mlp_history()
+    # Reset lag history so prior_step builds it up from t=0
+    if hasattr(model, 'reset_lag_history'):
+        model.reset_lag_history()
+
     with torch.no_grad():
         for t in range(T - 1):
             s_sv_cache[t] = s_sv
             s_dcv_cache[t] = s_dcv
-            g = gating_data[t] if gating_data is not None else torch.ones(N, device=device)
+            g = gating_data[t] if gating_data is not None else ones
             s = stim_data[t] if stim_data is not None else None
             _, s_sv, s_dcv = model.prior_step(u[t], s_sv, s_dcv, g, s)
         # Last time step gets the final states
@@ -296,6 +325,13 @@ def compute_loo_aux_loss(
                 s_sv = torch.zeros(N, model.r_sv, device=device)
                 s_dcv = torch.zeros(N, model.r_dcv, device=device)
 
+            # Warm-start MLP context history
+            if hasattr(model, 'init_mlp_history'):
+                model.init_mlp_history(u_target, t0)
+            # Warm-start lag history
+            if hasattr(model, 'init_lag_history'):
+                model.init_lag_history(u_target, t0)
+
             u_pred_i = u_target[t0, i]  # seed with true IC
             seg_loss = torch.tensor(0.0, device=device)
             seg_count = 0
@@ -345,433 +381,19 @@ def snapshot_model_state(model: Stage2ModelPT) -> Dict[str, torch.Tensor]:
         # Per-neuron process noise (always present, but only meaningful
         # when learn_noise is True)
         params_final["sigma_process"] = model.sigma_process.detach().cpu()
+        # Low-rank correlated noise factor
+        if getattr(model, 'noise_corr_rank', 0) > 0:
+            params_final["noise_V"] = model._noise_V.detach().cpu()
+        # Config flags
+        params_final["linear_chemical_synapses"] = torch.tensor(
+            int(model.linear_chemical_synapses))
     return params_final
-
-
-# --------------------------------------------------------------------------- #
-#  Per-neuron ridge-CV solver for kernel amplitudes (merged from ridge_alpha.py)
-# --------------------------------------------------------------------------- #
-
-def _compute_joint_cv_features(
-    model,
-    data: Dict[str, Any],
-) -> Dict[str, Any]:
-    """Compute joint features (gap + synaptic) and target for dynamics CV.
-
-    Target for neuron *i* at time *t*::
-
-        y_i(t) = [u_i(t+1) - (1-lam_i)*u_i(t)] / lam_i  -  I_stim_i(t)
-               = I0_i  +  G * (L_struct @ u(t))_i  +  I_sv_i  +  I_dcv_i
-
-    Features per neuron:
-      - gap:  (L_struct @ u(t))_i   (structural Laplacian, G≡1)
-      - sv:   per-rank synaptic pooling patterns   (r_sv features)
-      - dcv:  per-rank DCV pooling patterns         (r_dcv features)
-
-    The intercept captures I0.  All parameters compete in a single
-    per-neuron ridge regression, avoiding the sequential gap-then-synaptic
-    decomposition that caused catastrophic shrinkage.
-    """
-    device = next(model.parameters()).device
-    u = data["u_stage1"].to(device)
-    T, N = u.shape
-    gating = data.get("gating")
-    stim = data.get("stim")
-
-    with torch.no_grad():
-        lam = model.lambda_u.detach()
-        # Structural Laplacian (G≡1) so the gap coefficient directly
-        # estimates the optimal absolute G value.
-        L_struct = model.laplacian_with_G(torch.ones(1, device=device)).detach()
-
-        T_eff_sv = (model.T_sv * model.W_sv).detach()
-        T_eff_dcv = (model.T_dcv * model.W_dcv).detach()
-        tau_sv = model.tau_sv.detach()
-        tau_dcv = model.tau_dcv.detach()
-        E_sv = model.E_sv.detach()
-        E_dcv = model.E_dcv.detach()
-        dt = model.dt
-
-        gamma_sv = torch.exp(-dt / (tau_sv + 1e-12))
-        gamma_dcv = torch.exp(-dt / (tau_dcv + 1e-12))
-
-        r_sv = model.r_sv
-        r_dcv = model.r_dcv
-
-        gap_feat = torch.zeros(T - 1, N, device=device)
-        feat_sv = torch.zeros(T - 1, N, r_sv, device=device)
-        feat_dcv = torch.zeros(T - 1, N, r_dcv, device=device)
-        target = torch.zeros(T - 1, N, device=device)
-
-        s_sv = torch.zeros(N, r_sv, device=device)
-        s_dcv = torch.zeros(N, r_dcv, device=device)
-
-        for t in range(1, T):
-            u_prev = u[t - 1]
-            g = gating[t - 1] if gating is not None else torch.ones(N, device=device)
-            phi_gated = torch.sigmoid(u_prev) * g.view(N)
-
-            s_sv = gamma_sv.view(1, -1) * s_sv + phi_gated.unsqueeze(1)
-            s_dcv = gamma_dcv.view(1, -1) * s_dcv + phi_gated.unsqueeze(1)
-
-            pool_sv = T_eff_sv.t() @ s_sv
-            pool_dcv = T_eff_dcv.t() @ s_dcv
-
-            _fill_alpha_features(feat_sv, t - 1, pool_sv, s_sv, T_eff_sv, E_sv, u_prev)
-            _fill_alpha_features(feat_dcv, t - 1, pool_dcv, s_dcv, T_eff_dcv, E_dcv, u_prev)
-
-            # Gap feature from structural Laplacian (G≡1)
-            gap_feat[t - 1] = L_struct @ u_prev
-
-            # Target: [u(t+1) - (1-λ)*u(t)] / λ  minus stimulus
-            # This equals I0 + G*(L_struct @ u) + I_sv + I_dcv
-            residual = u[t] - (1.0 - lam) * u_prev
-
-            if model.d_ell > 0 and stim is not None:
-                s_t = stim[t - 1]
-                if s_t is not None:
-                    if model.stim_diagonal_only:
-                        I_stim = model.b.detach() * s_t.view(N)
-                    else:
-                        I_stim = model.b.detach() @ s_t
-                    residual = residual - lam * I_stim
-
-            target[t - 1] = residual / lam.clamp(min=1e-8)
-
-    return {
-        "gap_features": gap_feat.cpu().numpy().astype(np.float64),
-        "features_sv": feat_sv.cpu().numpy().astype(np.float64),
-        "features_dcv": feat_dcv.cpu().numpy().astype(np.float64),
-        "target": target.cpu().numpy().astype(np.float64),
-    }
-
-
-def _fill_alpha_features(
-    out: torch.Tensor, t_idx: int, pool: torch.Tensor, s: torch.Tensor,
-    T_eff: torch.Tensor, E: torch.Tensor, u_prev: torch.Tensor,
-) -> None:
-    """Write per-(neuron, rank) features into out[t_idx]."""
-    if E.dim() == 0:
-        out[t_idx] = (E - u_prev).unsqueeze(1) * pool
-    elif E.dim() == 1:
-        E_pool = T_eff.t() @ (s * E.view(-1, 1))
-        out[t_idx] = E_pool - u_prev.unsqueeze(1) * pool
-    else:
-        E_pool = (T_eff * E).t() @ s
-        out[t_idx] = E_pool - u_prev.unsqueeze(1) * pool
-
-
-def _solve_neuron_ridge_cv(
-    X: np.ndarray, y: np.ndarray, ridge_grid: np.ndarray, n_folds: int,
-    nonneg_mask: Optional[np.ndarray] = None,
-) -> Dict[str, Any]:
-    """Solve a single-target ridge regression with k-fold CV for λ selection.
-
-    Within each CV fold, column means / stds and the target mean are
-    computed on the *training* rows only, then applied to both training
-    and held-out rows — avoiding validation-set leakage.
-
-    Parameters
-    ----------
-    nonneg_mask : optional bool array of shape (p,)
-        If provided, coefficients at True positions are clamped to ≥ 0
-        during CV evaluation and final fit.  Other positions are
-        unconstrained.  If None, no non-negativity is applied.
-    """
-    T_eff, p = X.shape
-    folds = _make_contiguous_folds(np.arange(T_eff), n_folds)
-    n_lam = len(ridge_grid)
-    eye_p = np.eye(p, dtype=np.float64)
-
-    # ---- Cross-validation (fold-outer, λ-inner for efficiency) -------
-    fold_errors: list[list[float]] = [[] for _ in range(n_lam)]
-
-    for fold_idx in folds:
-        train_mask = np.ones(T_eff, dtype=bool)
-        train_mask[fold_idx] = False
-        tr = np.where(train_mask)[0]
-        if tr.size < max(p + 1, 5) or fold_idx.size == 0:
-            continue
-
-        # Per-fold standardisation (training rows only)
-        X_tr, y_tr = X[tr], y[tr]
-        x_mean_tr = X_tr.mean(axis=0)
-        x_std_tr  = X_tr.std(axis=0)
-        x_std_tr  = np.where(x_std_tr > 1e-12, x_std_tr, 1.0)
-        y_mean_tr = float(y_tr.mean())
-
-        Xs_tr = (X_tr - x_mean_tr) / x_std_tr
-        yc_tr = y_tr - y_mean_tr
-
-        gram_base = Xs_tr.T @ Xs_tr
-        rhs       = Xs_tr.T @ yc_tr
-
-        # Apply training stats to held-out fold
-        Xs_val = (X[fold_idx] - x_mean_tr) / x_std_tr
-        yc_val = y[fold_idx] - y_mean_tr
-
-        for lam_idx, lam in enumerate(ridge_grid):
-            gram = gram_base + lam * eye_p if lam > 0 else gram_base
-            try:
-                coef_s = np.linalg.solve(gram, rhs)
-            except np.linalg.LinAlgError:
-                coef_s, *_ = np.linalg.lstsq(gram, rhs, rcond=None)
-
-            # Apply the same constraint that will be used at injection time.
-            coef_nn = coef_s.copy()
-            if nonneg_mask is not None:
-                coef_nn[nonneg_mask] = np.maximum(coef_nn[nonneg_mask], 0.0)
-            mse = float(np.mean((yc_val - Xs_val @ coef_nn) ** 2))
-            if np.isfinite(mse):
-                fold_errors[lam_idx].append(mse)
-
-    cv_mse = np.full(n_lam, np.inf, dtype=np.float64)
-    for lam_idx in range(n_lam):
-        if fold_errors[lam_idx]:
-            cv_mse[lam_idx] = float(np.mean(fold_errors[lam_idx]))
-
-    if not np.any(np.isfinite(cv_mse)):
-        best_idx = 0
-    else:
-        best_idx = int(np.nanargmin(np.where(np.isfinite(cv_mse), cv_mse, np.inf)))
-    best_lambda = float(ridge_grid[best_idx])
-
-    # ---- Final fit on all data (full-data standardisation) -----------
-    x_mean = X.mean(axis=0)
-    x_std  = X.std(axis=0)
-    x_std  = np.where(x_std > 1e-12, x_std, 1.0)
-    y_mean = float(y.mean())
-
-    Xs = (X - x_mean) / x_std
-    yc = y - y_mean
-
-    gram_full = Xs.T @ Xs
-    if best_lambda > 0:
-        gram_full = gram_full + best_lambda * eye_p
-    rhs = Xs.T @ yc
-    try:
-        coef_s = np.linalg.solve(gram_full, rhs)
-    except np.linalg.LinAlgError:
-        coef_s, *_ = np.linalg.lstsq(gram_full, rhs, rcond=None)
-
-    coef = coef_s / x_std
-    intercept = y_mean - float(x_mean @ coef)
-
-    return {
-        "coef": coef,
-        "intercept": intercept,
-        "best_lambda": best_lambda,
-        "cv_mse": cv_mse,
-        "at_upper": bool(best_idx == len(ridge_grid) - 1),
-    }
-
-
-# --------------------------------------------------------------------------- #
-#  Joint dynamics CV: solve I0 + G + a_sv + a_dcv per neuron simultaneously   #
-# --------------------------------------------------------------------------- #
-
-def joint_cv_solve(
-    model,
-    data: Dict[str, Any],
-    cfg=None,
-    *,
-    n_folds: int = 5,
-    log_lambda_min: float = -2.0,
-    log_lambda_max: float = 6.0,
-    n_grid: int = 50,
-    r2_gate: float = 0.01,
-) -> Dict[str, Any]:
-    """Solve per-neuron I0, G_coef, a_sv, a_dcv jointly via ridge-CV.
-
-    Instead of separate alpha-CV (synaptic only) and backbone-CV (gap only),
-    this puts all features into a single per-neuron regression.  The gap
-    and synaptic features compete on equal footing, so the solver allocates
-    variance correctly even when gap junctions dominate.
-
-    Features per neuron i (total = 1 + r_sv + r_dcv):
-      col 0:          gap feature  (L_struct @ u)_i   →  coefficient = G_scale
-      cols 1..r_sv:   SV synaptic pooling patterns     →  coefficients = a_sv[i,:]
-      cols r_sv+1..:  DCV synaptic pooling patterns    →  coefficients = a_dcv[i,:]
-      intercept (via centering):                        →  I0_i
-    """
-    if cfg is not None:
-        n_folds = int(getattr(cfg, "dynamics_cv_n_folds", n_folds) or n_folds)
-        log_lambda_min = float(getattr(cfg, "dynamics_cv_log_min", log_lambda_min))
-        log_lambda_max = float(getattr(cfg, "dynamics_cv_log_max", log_lambda_max))
-        n_grid = int(getattr(cfg, "dynamics_cv_n_grid", n_grid) or n_grid)
-        r2_gate = float(getattr(cfg, "dynamics_cv_r2_gate", r2_gate))
-
-    ridge_grid = _log_ridge_grid(log_lambda_min, log_lambda_max, n_grid)
-    n_grid_actual = len(ridge_grid)
-    N = model.N
-    r_sv = model.r_sv
-    r_dcv = model.r_dcv
-    p_syn = r_sv + r_dcv          # synaptic feature count
-    p_total = 1 + p_syn           # gap(1) + sv(r_sv) + dcv(r_dcv)
-    # Intercept is handled by mean-centering inside _solve_neuron_ridge_cv
-
-    feats = _compute_joint_cv_features(model, data)
-    gap = feats["gap_features"]       # (T-1, N)
-    feat_sv = feats["features_sv"]    # (T-1, N, r_sv)
-    feat_dcv = feats["features_dcv"]  # (T-1, N, r_dcv)
-    target = feats["target"]          # (T-1, N)
-
-    # Non-negativity mask: synaptic coefficients ≥ 0, gap coefficient unconstrained
-    nonneg = np.zeros(p_total, dtype=bool)
-    nonneg[1:] = True   # indices 1.. are synaptic
-
-    # Current values as defaults for neurons that aren't updated
-    with torch.no_grad():
-        a_sv_cur = model.a_sv.detach().cpu().numpy()
-        a_dcv_cur = model.a_dcv.detach().cpu().numpy()
-        I0_cur = model.I0.detach().cpu().numpy()
-
-    if a_sv_cur.ndim == 1:
-        a_sv_out = np.tile(a_sv_cur, (N, 1))
-    else:
-        a_sv_out = a_sv_cur.copy()
-    if a_dcv_cur.ndim == 1:
-        a_dcv_out = np.tile(a_dcv_cur, (N, 1))
-    else:
-        a_dcv_out = a_dcv_cur.copy()
-    I0_out = I0_cur.copy()
-    G_coefs = np.full(N, np.nan, dtype=np.float64)
-
-    lambdas = np.full(N, np.nan, dtype=np.float64)
-    fit_r2 = np.full(N, np.nan, dtype=np.float64)
-    cv_mse_all = np.full((N, n_grid_actual), np.nan, dtype=np.float64)
-    at_upper_flags = np.zeros(N, dtype=bool)
-    n_updated = 0
-    n_at_upper = 0
-    n_gated = 0
-
-    for i in range(N):
-        # Build feature matrix: [gap | sv_ranks | dcv_ranks]
-        parts = [gap[:, i : i + 1]]    # (T-1, 1)
-        if r_sv > 0:
-            parts.append(feat_sv[:, i, :])   # (T-1, r_sv)
-        if r_dcv > 0:
-            parts.append(feat_dcv[:, i, :])  # (T-1, r_dcv)
-
-        X_i = np.concatenate(parts, axis=1)  # (T-1, p_total)
-        y_i = target[:, i]
-
-        valid = np.all(np.isfinite(X_i), axis=1) & np.isfinite(y_i)
-        n_valid = int(valid.sum())
-        if n_valid < max(p_total + 5, 20):
-            continue
-
-        x_norms = np.abs(X_i[valid]).max(axis=0)
-        if x_norms.max() < 1e-10:
-            continue
-
-        result = _solve_neuron_ridge_cv(
-            X_i[valid], y_i[valid], ridge_grid, n_folds, nonneg_mask=nonneg,
-        )
-        coef = result["coef"]
-
-        # Compute fit R² (with non-negativity applied to synaptic only)
-        coef_constrained = coef.copy()
-        coef_constrained[nonneg] = np.maximum(coef_constrained[nonneg], 0.0)
-        y_pred = X_i[valid] @ coef_constrained + result["intercept"]
-        ss_res = float(np.sum((y_i[valid] - y_pred.ravel()) ** 2))
-        ss_tot = float(np.sum((y_i[valid] - y_i[valid].mean()) ** 2))
-        fit_r2[i] = 1.0 - ss_res / max(ss_tot, 1e-12)
-
-        cv_mse_i = result["cv_mse"]
-        cv_mse_all[i, :len(cv_mse_i)] = cv_mse_i
-        lambdas[i] = result["best_lambda"]
-        if result["at_upper"]:
-            n_at_upper += 1
-            at_upper_flags[i] = True
-
-        # R² quality gate: skip neuron if the joint fit has no skill
-        if fit_r2[i] < r2_gate:
-            n_gated += 1
-            continue
-
-        # Extract coefficients
-        G_coefs[i] = coef_constrained[0]   # gap (unconstrained)
-        idx = 1
-        if r_sv > 0:
-            a_sv_out[i] = coef_constrained[idx : idx + r_sv]  # already ≥ 0
-            idx += r_sv
-        if r_dcv > 0:
-            a_dcv_out[i] = coef_constrained[idx : idx + r_dcv]
-            idx += r_dcv
-        I0_out[i] = result["intercept"]
-        n_updated += 1
-
-    # Robust G scale: median of per-neuron gap coefficients (positive only)
-    valid_G = G_coefs[np.isfinite(G_coefs) & (G_coefs > 0)]
-    G_scale = float(np.median(valid_G)) if len(valid_G) > 0 else 0.0
-
-    device = next(model.parameters()).device
-    return {
-        "I0": torch.tensor(I0_out, dtype=torch.float32, device=device),
-        "alpha_sv": torch.tensor(a_sv_out, dtype=torch.float32, device=device),
-        "alpha_dcv": torch.tensor(a_dcv_out, dtype=torch.float32, device=device),
-        "G_scale": G_scale,
-        "G_coefs": G_coefs,
-        "fit_r2": fit_r2,
-        "lambdas": lambdas,
-        "ridge_grid": ridge_grid,
-        "cv_mse_all": cv_mse_all,
-        "n_updated": n_updated,
-        "n_at_upper": n_at_upper,
-        "n_gated": n_gated,
-        "at_upper_flags": at_upper_flags,
-    }
-
-
-def inject_joint_cv(
-    model,
-    result: Dict[str, Any],
-    blend: float = 1.0,
-) -> None:
-    """Inject joint-CV solved I0, a_sv, a_dcv, and G back into the model."""
-    blend = max(0.0, min(1.0, blend))
-    with torch.no_grad():
-        # ---- I0: blend between current and solved ----
-        I0_new = result["I0"]
-        model.I0.data.copy_((1.0 - blend) * model.I0 + blend * I0_new)
-
-        # ---- Synaptic amplitudes: blend between current and solved ----
-        for attr, key in [("a_sv", "alpha_sv"), ("a_dcv", "alpha_dcv")]:
-            cur = getattr(model, attr, None)
-            if cur is None or cur.numel() == 0:
-                continue
-            target_val = result[key]
-            # Handle shared amplitudes: if model param is (r,) but
-            # CV solved per-neuron (N, r), reduce to (r,) via mean.
-            if cur.ndim == 1 and target_val.ndim == 2:
-                target_val = target_val.mean(dim=0)
-            blended = (1.0 - blend) * cur + blend * target_val
-            model.set_param_constrained(attr, blended)
-
-        # ---- G: blend toward absolute solved scale ----
-        G_scale = result["G_scale"]
-        if G_scale > 1e-8:
-            G_cur = model.G
-            if model.edge_specific_G:
-                # Preserve per-edge structure, rescale overall level
-                G_nonzero = G_cur[G_cur > 0]
-                median_cur = float(G_nonzero.median()) if G_nonzero.numel() > 0 else 1.0
-                ratio = G_scale / max(median_cur, 1e-8)
-                effective_ratio = 1.0 + blend * (ratio - 1.0)
-                if effective_ratio > 0.01:   # safety floor
-                    model.set_param_constrained("G", G_cur * effective_ratio)
-            else:
-                # Scalar G: direct blend
-                G_new = (1.0 - blend) * G_cur + blend * torch.tensor(
-                    G_scale, device=G_cur.device, dtype=G_cur.dtype)
-                if G_new.item() > 1e-4:     # safety floor
-                    model.set_param_constrained("G", G_new)
 
 
 # --------------------------------------------------------------------------- #
 #  Formatting helpers                                                           #
 # --------------------------------------------------------------------------- #
+
 
 def _fmt(x: torch.Tensor) -> str:
     x = x.detach().float().cpu().flatten()
@@ -852,6 +474,12 @@ class _TeeWriter:
         self._stdout.flush()
         self._file.flush()
 
+    def isatty(self):
+        return False
+
+    def fileno(self):
+        return self._stdout.fileno()
+
     def close(self):
         self._file.close()
         sys.stdout = self._stdout
@@ -896,9 +524,7 @@ def _log_config(cfg: Stage2PTConfig, d_ell: int) -> None:
         f"  lambda_u: learn={getattr(cfg, 'learn_lambda_u', False)}\n"
         f"  fix_taus: sv={getattr(cfg, 'fix_tau_sv', False)} dcv={getattr(cfg, 'fix_tau_dcv', False)}\n"
         f"  ranks: r_sv={len(cfg.tau_sv_init)} r_dcv={len(cfg.tau_dcv_init)}\n"
-        f"  learn_W: sv={getattr(cfg, 'learn_W_sv', False)} dcv={getattr(cfg, 'learn_W_dcv', False)}"
-        f"  W_sv_init_mode={getattr(cfg, 'W_sv_init_mode', 'uniform')}"
-        f"  W_sv_normalize={getattr(cfg, 'W_sv_normalize', False)}\n"
+        f"  learn_W: sv={getattr(cfg, 'learn_W_sv', False)} dcv={getattr(cfg, 'learn_W_dcv', False)}\n"
         f"  gap_junctions: edge_specific_G={getattr(cfg, 'edge_specific_G', False)}\n"
         f"  reversals: learn={getattr(cfg, 'learn_reversals', False)} "
         f"mode={getattr(cfg, 'reversal_mode', 'per_neuron')}\n"
@@ -1025,14 +651,78 @@ def _snapshot_params(model) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-#  Main entry point                                                             #
+#  K-fold temporal CV for one-step R²                                           #
 # --------------------------------------------------------------------------- #
 
-def train_stage2(
+def _make_temporal_folds(T: int, n_folds: int):
+    """Partition prediction frames 1..T-1 into *n_folds* contiguous blocks.
+
+    Returns list of (test_start, test_end) with 1-based frame indices,
+    i.e. each block covers prediction targets u[test_start : test_end].
+    """
+    n_frames = T - 1  # frames 1..T-1
+    fold_size = n_frames // n_folds
+    remainder = n_frames - fold_size * n_folds
+    folds = []
+    cursor = 1
+    for fi in range(n_folds):
+        size = fold_size + (1 if fi < remainder else 0)
+        folds.append((cursor, cursor + size))
+        cursor += size
+    return folds
+
+
+def train_stage2_cv(
     cfg: Stage2PTConfig,
     save_dir: str | None = None,
     show: bool = False,
+    warm_start_dir: str | None = None,
 ) -> Optional[dict]:
+    """Train Stage 2 with k-fold temporal CV for fair one-step **and LOO** R².
+
+    For each fold the model is trained from scratch with the held-out
+    time steps excluded from the dynamics loss (via ``train_mask``).
+    Teacher-forced predictions on the held-out frames are stitched into
+    a full ``(T, N)`` array and used to compute cross-validated R².
+
+    After all folds are trained, LOO forward simulations are run per-fold
+    on each fold's model, collecting held-out frame predictions.  The
+    stitched LOO trajectories give properly cross-validated LOO R².
+
+    The best-fold model (lowest held-out MSE) is kept for free-run /
+    current-decomposition evaluation, giving a complete set of metrics
+    comparable to the Transformer baseline.
+    """
+    from .init_from_data import init_lambda_u, init_all_from_data
+    from .evaluate import (
+        _teacher_forced_prior, compute_onestep,
+        loo_forward_simulate, loo_forward_simulate_windowed,
+        loo_forward_simulate_batched, loo_forward_simulate_batched_windowed,
+        choose_loo_subset,
+    )
+    from ._utils import _r2, _cfg_val
+
+    n_folds = cfg.cv_folds
+    assert n_folds >= 2, f"cv_folds must be >= 2, got {n_folds}"
+
+    # ---- reproducibility seed ------------------------------------------------
+    _seed = int(getattr(cfg, "seed", 0) or 0)
+    if _seed > 0:
+        import random
+        random.seed(_seed)
+        np.random.seed(_seed)
+        torch.manual_seed(_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(_seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        # Force ALL ops deterministic (catches backward-pass atomics)
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        import os as _os
+        _os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+        print(f"[Stage2-CV] Deterministic mode: seed={_seed}")
+
+    # ---- data ----------------------------------------------------------------
     data = load_data_pt(cfg)
     data["_cfg"] = cfg
 
@@ -1051,8 +741,7 @@ def train_stage2(
     device = torch.device(cfg.device)
     d_ell = data.get("d_ell", 0)
     gating_data = data.get("gating")
-    stim_data_raw = data.get("stim")          # raw (delta-pulse) stimulus
-    stim_data = stim_data_raw                  # will be overwritten by convolved version each epoch
+    stim_data_raw = data.get("stim")
     b_seq = data.get("b")
 
     if save_dir is not None:
@@ -1063,525 +752,595 @@ def train_stage2(
     else:
         _tee = None
 
-    try:  # ensure tee is closed even on crash
-        from .init_from_data import init_lambda_u, init_all_from_data
-        lambda_u_init = init_lambda_u(u_stage1, cfg)
-        beh_all_baseline = behaviour_all_neurons_prediction(data)
+    try:
+        # ---- fold setup ------------------------------------------------------
+        folds = _make_temporal_folds(T, n_folds)
+        pred_u_full = np.full((T, N), np.nan, dtype=np.float32)
+        fold_test_mse = []
+        fold_states = []
 
-        # ---- neurotransmitter sign data for reversals ----------------------------
-        sign_t = data.get("sign_t")
+        print(f"\n{'='*60}")
+        print(f"[Stage2-CV] {n_folds}-fold temporal cross-validation")
+        print(f"[Stage2-CV] T={T}, N={N}, epochs/fold={cfg.num_epochs}")
+        for fi, (s, e) in enumerate(folds):
+            print(f"  fold {fi}: test=[{s}, {e})  ({e-s} frames)")
+        print(f"{'='*60}\n")
 
-        # ---- build model ---------------------------------------------------------
-        model = Stage2ModelPT(
-            N, data["T_e"], data["T_sv"], data["T_dcv"], data["dt"],
-            cfg, device, d_ell=d_ell,
-            lambda_u_init=lambda_u_init,
-            sign_t=sign_t,
-        ).to(device)
-
-        init_all_from_data(model, u_stage1, cfg)
-
-        # ---- snapshot init values for regularization anchors ---------------------
-        # These fixed tensors serve as targets for optional targeted
-        # regularizers (lambda_u_reg, I0_reg, G_reg, tau_reg).
-        # They break the degeneracy between lambda_u, I0, G, and alpha
-        # amplitudes that would otherwise let parameters trade off freely.
-        with torch.no_grad():
-            lambda_u_init_anchor = model.lambda_u.detach().clone()
-            lambda_u_raw_init_anchor = model._lambda_u_raw.detach().clone()
-            I0_init_anchor = model.I0.detach().clone()
-            G_init_anchor = model.G.detach().clone()
-            tau_sv_init_anchor = model.tau_sv.detach().clone()
-            tau_dcv_init_anchor = model.tau_dcv.detach().clone()
-            # Snapshot the init network strength product for floor penalty
-            _init_G_rms = float(model.G.pow(2).mean().sqrt())
-            _init_a_sv_rms = float(model.a_sv.pow(2).mean().sqrt())
-            _init_strength = _init_G_rms * _init_a_sv_rms
-
-        # ---- init decomposition diagnostic --------------------------------------
-        from .plot_eval import _compute_input_decomposition
-        with torch.no_grad():
-            decomp, per_neuron = _compute_input_decomposition(model, data)
-            # Pretty-print with plain labels for terminal
-            _label_map = {
-                "AR(1) residual\n(network should explain)": "AR1_resid",
-                "$\\lambda I_{gap}$": "λI_gap",
-                "$\\lambda I_{sv}$": "λI_sv",
-                "$\\lambda I_{dcv}$": "λI_dcv",
-                "$\\lambda I_{stim}$": "λI_stim",
-                "Network total": "net_total",
-                "Model error\n(predicted \u2212 actual)": "model_err",
-            }
-            parts = "  ".join(
-                f"{_label_map.get(k, k)}={v:.4f}" for k, v in decomp.items()
-            )
-            print(f"[Stage2][init-decomp] RMS:  {parts}")
-            # Per-neuron: flag neurons where unexplained >> target residual
-            resid_rms = per_neuron[:, 0]  # target residual per neuron
-            gap_rms = per_neuron[:, 1]
-            net_rms = np.sqrt(per_neuron[:, 1]**2 + per_neuron[:, 2]**2 + per_neuron[:, 3]**2)
-            ratio = net_rms / np.maximum(resid_rms, 1e-12)
-            n_over = int((ratio > 2.0).sum())
-            n_under = int((ratio < 0.1).sum())
-            print(f"[Stage2][init-decomp] Per-neuron: "
-                  f"{n_over}/{len(ratio)} have network/resid > 2×  "
-                  f"{n_under}/{len(ratio)} have network/resid < 0.1×")
-
-        _log_config(cfg, d_ell)
-        with torch.no_grad():
-            _log_init_params(model, cfg)
-
-        # ---- optimiser -----------------------------------------------------------
-        syn_lr_mult = float(getattr(cfg, "synaptic_lr_multiplier", 1.0) or 1.0)
-        syn_names = {"_a_sv_raw", "_a_dcv_raw", "_W_sv_raw", "_W_dcv_raw"}
-        syn_params = [p for n, p in model.named_parameters() if n in syn_names and p.requires_grad]
-        other_params = [p for n, p in model.named_parameters() if n not in syn_names and p.requires_grad]
-        param_groups = [{"params": other_params, "lr": cfg.learning_rate}]
-        if syn_params:
-            param_groups.append({"params": syn_params, "lr": cfg.learning_rate * syn_lr_mult})
-            print(f"[Stage2] Synaptic LR multiplier: {syn_lr_mult:.1f}x "
-                  f"({len(syn_params)} synaptic params @ lr={cfg.learning_rate * syn_lr_mult:.5f})")
-        params = other_params + syn_params
-        optimiser = optim.Adam(param_groups)
-
-        z_obs = u_stage1.to(device)
-        z_target = z_obs
-        uvar = u_var_stage1.to(device) if u_var_stage1 is not None else None
-
-        use_uvar = bool(getattr(cfg, "use_u_var_weighting", False))
-        uvar_scale = float(getattr(cfg, "u_var_scale", 1.0))
-        uvar_floor = float(getattr(cfg, "u_var_floor", 1e-8))
-        if use_uvar and uvar is None:
-            print("[Stage2][warn] use_u_var_weighting requested but u_var missing; using sigma_u^2 only.")
-
-        print(f"[Stage2] One-step training: T={T}, N={N}, dt={data['dt']:.4f}s")
-
-        # ---- rollout helper ------------------------------------------------------
-        def compute_prior(u: torch.Tensor) -> torch.Tensor:
-            s_sv = torch.zeros((N, model.r_sv), device=device)
-            s_dcv = torch.zeros((N, model.r_dcv), device=device)
-            preds = [u[0]]
-            for t in range(1, T):
-                g = gating_data[t - 1] if gating_data is not None else torch.ones(N, device=device)
-                s = stim_data[t - 1] if stim_data is not None else None
-                u_next, s_sv, s_dcv = model.prior_step(u[t - 1], s_sv, s_dcv, g, s)
-                preds.append(u_next)
-            return torch.stack(preds)
-
-        def posterior_check(prior_mu: torch.Tensor, target: torch.Tensor) -> None:
-            if uvar is None:
-                return
-            # Slice uvar to match the (possibly shorter) input tensors
-            _uvar = uvar[:prior_mu.shape[0]] if uvar.shape[0] != prior_mu.shape[0] else uvar
-            ok = torch.isfinite(target) & torch.isfinite(prior_mu) & torch.isfinite(_uvar) & (_uvar > 0)
-            n = int(ok.sum().item())
-            if n == 0:
-                return
-            zs = ((target - prior_mu) / torch.sqrt(_uvar + 1e-8))[ok]
-            print(
-                f"[Stage2][PosteriorCheck] z-score mean={zs.mean():+.3f} "
-                f"std={zs.std(unbiased=False):.3f} "
-                f"P(|z|>2)={(zs.abs() > 2).float().mean():.3f} "
-                f"P(|z|>3)={(zs.abs() > 3).float().mean():.3f} (n={n})"
-            )
-
-        # ---- behaviour decoder ---------------------------------------------------
-        behavior_weight = float(getattr(cfg, "behavior_weight", 0.0) or 0.0)
-        beh_decoder = None
-        if behavior_weight > 0.0 and b_seq is not None:
-            print("[Stage2] Initialising learnable behaviour decoder ...")
-            beh_decoder = init_behaviour_decoder(data)
-            if beh_decoder is None:
-                print("[Stage2][warn] Behaviour decoder init failed; behaviour loss disabled.")
-            elif beh_decoder["type"] == "mlp":
-                mlp_params = list(beh_decoder["model"].parameters())
-                params.extend(mlp_params)
-                optimiser.add_param_group({"params": mlp_params, "lr": cfg.learning_rate})
-            else:
-                params.append(beh_decoder["W"])
-                optimiser.add_param_group({"params": [beh_decoder["W"]], "lr": cfg.learning_rate})
-
-        epoch_losses: list[dict] = []
-        grad_clip = float(getattr(cfg, "grad_clip_norm", 0.0) or 0.0)
-        ridge_b = float(getattr(cfg, "ridge_b", 0.0) or 0.0)
-        dynamics_l2 = float(getattr(cfg, "dynamics_l2", 0.0) or 0.0)
-        rollout_steps = int(getattr(cfg, "rollout_steps", 0) or 0)
-        rollout_weight = float(getattr(cfg, "rollout_weight", 0.0) or 0.0)
-        rollout_starts = int(getattr(cfg, "rollout_starts", 0) or 0)
-        warmstart_rollout = bool(getattr(cfg, "warmstart_rollout", False))
-        interaction_l2 = float(getattr(cfg, "interaction_l2", 0.0) or 0.0)
-        ridge_W_sv = float(getattr(cfg, "ridge_W_sv", 0.0) or 0.0)
-        ridge_W_dcv = float(getattr(cfg, "ridge_W_dcv", 0.0) or 0.0)
-        plot_every = int(getattr(cfg, "plot_every", 0) or 0)
-
-        # Interaction L2 penalty (penalises network-driven component beyond AR(1))
-        if interaction_l2 > 0:
-            print(f"[Stage2] Interaction L2 penalty = {interaction_l2:.4g}")
-        if ridge_W_sv > 0:
-            print(f"[Stage2] Ridge W_sv = {ridge_W_sv:.4g}")
-        if ridge_W_dcv > 0:
-            print(f"[Stage2] Ridge W_dcv = {ridge_W_dcv:.4g}")
-        if dynamics_l2 > 0:
-            print(f"[Stage2] Dynamics L2 = {dynamics_l2:.4g}")
-        I0_reg = float(getattr(cfg, "I0_reg", 0.0) or 0.0)
-        lambda_u_reg = float(getattr(cfg, "lambda_u_reg", 0.0) or 0.0)
-        G_reg = float(getattr(cfg, "G_reg", 0.0) or 0.0)
-        tau_reg = float(getattr(cfg, "tau_reg", 0.0) or 0.0)
-        if I0_reg > 0:
-            print(f"[Stage2] I0 regularization toward init = {I0_reg:.4g}")
-        if lambda_u_reg > 0:
-            print(f"[Stage2] lambda_u regularization (logit space) toward init = {lambda_u_reg:.4g}")
-        if G_reg > 0:
-            print(f"[Stage2] G regularization toward init = {G_reg:.4g}")
-        if tau_reg > 0:
-            print(f"[Stage2] tau regularization (log space) toward init = {tau_reg:.4g}")
-        net_floor_weight = float(getattr(cfg, "network_strength_floor", 0.0) or 0.0)
-        net_floor_target = float(getattr(cfg, "network_strength_target", 0.8) or 0.8)
-        if net_floor_weight > 0:
-            print(f"[Stage2] Network strength floor = {net_floor_weight:.4g} "
-                  f"(target ≥ {net_floor_target:.0%} of init = {_init_strength * net_floor_target:.4f})")
-        if rollout_weight > 0 and rollout_steps > 0:
-            print(f"[Stage2] Rollout auxiliary = {rollout_weight:.4g} × rollout_loss ({rollout_steps} steps, {rollout_starts} starts)")
-        # LOO auxiliary loss
-        loo_aux_weight = float(getattr(cfg, "loo_aux_weight", 0.0) or 0.0)
-        loo_aux_steps  = int(getattr(cfg, "loo_aux_steps", 20) or 20)
-        loo_aux_neurons = int(getattr(cfg, "loo_aux_neurons", 4) or 4)
-        loo_aux_starts = int(getattr(cfg, "loo_aux_starts", 1) or 1)
-        if loo_aux_weight > 0:
-            print(f"[Stage2] LOO auxiliary = {loo_aux_weight:.4g} \u00d7 loo_loss "
-                  f"({loo_aux_steps} steps, {loo_aux_neurons} neurons, {loo_aux_starts} starts)")
-        dynamics_cv_every = int(getattr(cfg, "dynamics_cv_every", 0) or 0)
-        dynamics_cv_blend = float(getattr(cfg, "dynamics_cv_blend", 0.5) or 0.5)
-        dynamics_cv_warmup = max(1, int(getattr(cfg, "dynamics_cv_warmup", 3) or 1))
-        if dynamics_cv_every > 0:
-            print(f"[Stage2] Dynamics-CV (joint I0+G+a_sv+a_dcv) every {dynamics_cv_every} epochs "
-                  f"(blend={dynamics_cv_blend:.2f}, warmup={dynamics_cv_warmup})")
-
-        # Injection counter for warmup ramp
-        _dynamics_cv_count = 0
-
-        # ---- training loop -------------------------------------------------------
-        for epoch in range(cfg.num_epochs):
-            # ---- Re-convolve stimulus with learnable kernel ------------------
-            if stim_data_raw is not None and model.stim_kernel is not None:
-                stim_data = model.convolve_stimulus(stim_data_raw)
-                # Update data dict so CV solvers see the convolved version
-                data["stim"] = stim_data
-            else:
-                stim_data = stim_data_raw
-
-            # ---- Joint dynamics-CV re-solve ---------------------------------
-            _do_cv = (dynamics_cv_every > 0
-                      and epoch > 0
-                      and epoch % dynamics_cv_every == 0)
-
-            if _do_cv:
-                _dynamics_cv_count += 1
-                cv_result = None
-                try:
-                    cv_result = joint_cv_solve(model, data, cfg)
-                except Exception as e:
-                    print(f"[Stage2][warn] Dynamics-CV solve failed at epoch {epoch}: {e}")
-
-                if cv_result is not None:
-                    _cv_ramp = min(_dynamics_cv_count, dynamics_cv_warmup) / dynamics_cv_warmup
-                    _cv_blend = dynamics_cv_blend * _cv_ramp
-
-                    inject_joint_cv(model, cv_result, blend=_cv_blend)
-
-                    # Reset Adam momentum for all injected parameters
-                    for _p in [model.I0, model._G_raw,
-                               model._a_sv_raw, model._a_dcv_raw]:
-                        _st = optimiser.state.get(_p, {})
-                        _st.pop("exp_avg", None)
-                        _st.pop("exp_avg_sq", None)
-                        _st.pop("step", None)
-
-                    # Diagnostics
-                    valid_r2 = cv_result['fit_r2'][np.isfinite(cv_result['fit_r2'])]
-                    r2_str = f"  fit R\u00b2 med={float(np.median(valid_r2)):.3f}" if len(valid_r2) > 0 else ""
-                    valid_lams = cv_result['lambdas'][np.isfinite(cv_result['lambdas'])]
-                    lam_str = ""
-                    if len(valid_lams) > 0:
-                        lam_str = (f"  \u03bb med={np.median(valid_lams):.2g}"
-                                   f" IQR=[{np.percentile(valid_lams, 25):.2g},"
-                                   f" {np.percentile(valid_lams, 75):.2g}]")
-                    print(f"[Stage2] Dynamics-CV @ epoch {epoch}: "
-                          f"{cv_result['n_updated']}/{N} updated, "
-                          f"{cv_result['n_gated']} gated (R\u00b2<thr), "
-                          f"{cv_result['n_at_upper']} at upper"
-                          f"  G_scale={cv_result['G_scale']:.4f}"
-                          f"{r2_str}{lam_str}"
-                          f"  blend={_cv_blend:.3f}")
-
-            optimiser.zero_grad()
-
-            prior_mu = compute_prior(z_target)
-            # Skip frame 0: prior_mu[0] == z_target[0] by construction,
-            # giving a trivially perfect prediction that biases the loss.
-            # model_sigma is passed only when learn_noise is True;
-            # compute_dynamics_loss then uses Gaussian NLL instead of
-            # weighted MSE.  For heteroscedastic models sigma_at(u)
-            # returns (T-1, N); for homoscedastic it returns (N,).
-            if model._learn_noise:
-                if model._noise_mode == "heteroscedastic":
-                    _model_sigma = model.sigma_at(z_target[:-1])  # (T-1, N)
-                else:
-                    _model_sigma = model.sigma_at()               # (N,)
-                # When noise_sigma_source="rollout", detach sigma from the
-                # one-step NLL so that only the rollout/LOO NLL terms shape
-                # the noise magnitude.  This prevents the (tiny) one-step
-                # residuals from pulling sigma down to ~0.1 and yields much
-                # wider, better-calibrated confidence intervals.
-                _sigma_source = str(getattr(cfg, "noise_sigma_source", "all"))
-                _has_multistep = (rollout_weight > 0 and rollout_steps > 0) or (loo_aux_weight > 0)
-                if _sigma_source == "rollout" and _has_multistep:
-                    _model_sigma = _model_sigma.detach()
-            else:
-                _model_sigma = None
-            one_step_loss = compute_dynamics_loss(
-                z_target[1:],
-                prior_mu[1:],
-                sigma_u,
-                u_var=uvar,
-                use_u_var_weighting=use_uvar,
-                u_var_scale=uvar_scale,
-                u_var_floor=uvar_floor,
-                model_sigma=_model_sigma,
-            )
-
-            use_rollout = rollout_weight > 0 and rollout_steps > 0 and rollout_starts > 0
-            use_loo_aux = loo_aux_weight > 0 and loo_aux_steps > 0
-            cached_states = None
-            if warmstart_rollout and (use_rollout or use_loo_aux):
-                cached_states = compute_teacher_forced_states(
-                    model,
-                    z_target,
-                    gating_data=gating_data,
-                    stim_data=stim_data,
-                )
-
-            rollout_loss_val = None
-            if use_rollout:
-                rollout_loss_val = compute_rollout_loss(
-                    model,
-                    z_target,
-                    sigma_u,
-                    rollout_steps=rollout_steps,
-                    rollout_starts=rollout_starts,
-                    gating_data=gating_data,
-                    stim_data=stim_data,
-                    cached_states=cached_states if warmstart_rollout else None,
-                    use_nll=model._learn_noise,
-                )
-
-            loo_loss_val = None
-            if use_loo_aux:
-                loo_loss_val = compute_loo_aux_loss(
-                    model,
-                    z_target,
-                    sigma_u,
-                    loo_steps=loo_aux_steps,
-                    loo_neurons=loo_aux_neurons,
-                    loo_starts=loo_aux_starts,
-                    gating_data=gating_data,
-                    stim_data=stim_data,
-                    cached_states=cached_states if warmstart_rollout else None,
-                    use_nll=model._learn_noise,
-                )
-
-            dynamics_loss = one_step_loss
-
-            if epoch in (0, cfg.num_epochs - 1):
-                with torch.no_grad():
-                    # Exclude frame 0 from posterior check (same reason
-                    # as the loss: prior_mu[0] == z_target[0] by construction).
-                    posterior_check(prior_mu[1:], z_target[1:])
-
-            loss = dynamics_loss
-            if rollout_loss_val is not None:
-                loss = loss + rollout_weight * rollout_loss_val
-            if loo_loss_val is not None:
-                loss = loss + loo_aux_weight * loo_loss_val
-            if ridge_b > 0 and model.d_ell > 0:
-                loss = loss + ridge_b * model.b.pow(2).mean()
-            if dynamics_l2 > 0:
-                dyn_l2_terms = [p.pow(2).mean() for p in model.parameters() if p.requires_grad]
-                if dyn_l2_terms:
-                    loss = loss + dynamics_l2 * torch.stack(dyn_l2_terms).mean()
-
-            # Noise regularisation: prevent sigma collapse to tiny values
-            _noise_reg = float(getattr(cfg, "noise_reg", 0.0) or 0.0)
-            if _noise_reg > 0 and model._learn_noise:
-                if model._noise_mode == "heteroscedastic":
-                    loss = loss + _noise_reg * (
-                        model._sigma_w.pow(2).mean()
-                        + model._sigma_b.pow(2).mean()
-                    )
-                else:
-                    loss = loss + _noise_reg * model._log_sigma_u.pow(2).mean()
-
-            # Ridge on synaptic edge weights (shrinks toward prior)
-            if ridge_W_sv > 0 and model._W_sv_raw.requires_grad:
-                W_sv_active = model.W_sv[model.T_sv > 0]
-                if W_sv_active.numel() > 0:
-                    loss = loss + ridge_W_sv * W_sv_active.pow(2).mean()
-            if ridge_W_dcv > 0 and model._W_dcv_raw.requires_grad:
-                W_dcv_active = model.W_dcv[model.T_dcv > 0]
-                if W_dcv_active.numel() > 0:
-                    loss = loss + ridge_W_dcv * W_dcv_active.pow(2).mean()
-
-            # Interaction L2: penalise network-driven component beyond AR(1)
-            if interaction_l2 > 0:
-                with torch.no_grad():
-                    lam = model.lambda_u.detach()
-                    I0_det = model.I0.detach()
-                    ar1_mu = (1.0 - lam) * z_target[:-1] + lam * I0_det
-                interaction = prior_mu[1:] - ar1_mu
-                loss = loss + interaction_l2 * interaction.pow(2).mean()
-
-            # Regularization toward init values (breaks lambda_u / I0 / alpha degeneracy)
-            if I0_reg > 0:
-                loss = loss + I0_reg * (model.I0 - I0_init_anchor).pow(2).mean()
-            if lambda_u_reg > 0:
-                # Penalise in raw-parameter space (≈ logit of normalised λ).
-                # Using the raw parameter directly avoids precision loss from
-                # computing logit(sigmoid(raw)) near the boundaries.
-                loss = loss + lambda_u_reg * (model._lambda_u_raw - lambda_u_raw_init_anchor).pow(2).mean()
-            if G_reg > 0 and model._G_raw.requires_grad:
-                # Regularize gap-junction conductance toward init.
-                # G errors can trade against synaptic alpha terms in the
-                # alpha-CV target (which subtracts L @ u_prev using current G).
-                loss = loss + G_reg * (model.G - G_init_anchor).pow(2).mean()
-            if tau_reg > 0:
-                # Regularize time constants in log space to keep ranks
-                # separated and near plausible initial values.
-                _tau_eps = 1e-6
-                if model.tau_sv.requires_grad and model.tau_sv.numel() > 0:
-                    loss = loss + tau_reg * (
-                        torch.log(model.tau_sv.clamp(min=_tau_eps))
-                        - torch.log(tau_sv_init_anchor.clamp(min=_tau_eps))
-                    ).pow(2).mean()
-                if model.tau_dcv.requires_grad and model.tau_dcv.numel() > 0:
-                    loss = loss + tau_reg * (
-                        torch.log(model.tau_dcv.clamp(min=_tau_eps))
-                        - torch.log(tau_dcv_init_anchor.clamp(min=_tau_eps))
-                    ).pow(2).mean()
-
-            # Network strength floor: one-sided penalty on G_rms * a_sv_rms
-            # Uses ratio-based (scale-invariant) shortfall so the penalty
-            # is effective regardless of the absolute magnitude of the target.
-            # penalty = weight * relu(1 - current/target)²
-            if net_floor_weight > 0 and net_floor_target > 0:
-                _cur_strength = model.G.pow(2).mean().sqrt() * model.a_sv.pow(2).mean().sqrt()
-                _target = _init_strength * net_floor_target
-                _ratio = _cur_strength / max(_target, 1e-12)
-                _rel_shortfall = torch.relu(1.0 - _ratio)
-                loss = loss + net_floor_weight * _rel_shortfall.pow(2)
-
-            beh_loss_val = None
-            if beh_decoder is not None and behavior_weight > 0.0:
-                beh_loss_val = compute_behaviour_loss(prior_mu, beh_decoder)
-                loss = loss + behavior_weight * beh_loss_val
-
-            apply_training_step(
-                loss,
-                optimiser,
-                params,
-                model,
-                cfg,
-                grad_clip=grad_clip,
-            )
-
-            rec = {"dynamics": dynamics_loss.item(), "total": loss.item()}
-            rec["one_step_loss"] = one_step_loss.item()
-            if rollout_loss_val is not None:
-                rec["rollout_loss"] = rollout_loss_val.item()
-            if loo_loss_val is not None:
-                rec["loo_loss"] = loo_loss_val.item()
-            if beh_loss_val is not None:
-                rec["behaviour_loss"] = beh_loss_val.item()
-            if model._learn_noise:
-                _sp = model.sigma_process.detach()
-                rec["sigma_process_median"] = float(_sp.median())
-                rec["sigma_process_mean"] = float(_sp.mean())
-            rec.update(_snapshot_params(model))
-            epoch_losses.append(rec)
-
-            parts = [f"dynamics={dynamics_loss.item():.4f}", f"total={loss.item():.4f}"]
-            if rollout_loss_val is not None:
-                parts.append(f"rollout={rollout_loss_val.item():.4f}")
-            if loo_loss_val is not None:
-                parts.append(f"loo={loo_loss_val.item():.4f}")
-            if beh_loss_val is not None:
-                parts.append(f"beh_loss={beh_loss_val.item():.4f}")
-            if model._learn_noise:
-                _sp = model.sigma_process.detach()
-                parts.append(f"σ_med={float(_sp.median()):.4f}")
-
-            # Log current decomposition (G, a_sv, network drive) every CV epoch
-            if _do_cv or (epoch + 1) % max(plot_every, 10) == 0:
-                with torch.no_grad():
-                    _G_rms = float(model.G.pow(2).mean().sqrt())
-                    _a_sv_rms = float(model.a_sv.pow(2).mean().sqrt()) if model.a_sv.numel() > 0 else 0.0
-                    _decomp, _ = _compute_input_decomposition(model, data)
-                    _dm = {
-                        "AR(1) residual\n(network should explain)": "AR1",
-                        "$\\lambda I_{gap}$": "λI_gap",
-                        "$\\lambda I_{sv}$": "λI_sv",
-                        "$\\lambda I_{dcv}$": "λI_dcv",
-                        "Network total": "net",
-                        "Model error\n(predicted \u2212 actual)": "err",
-                    }
-                    _dp = "  ".join(f"{_dm.get(k, k)}={v:.4f}" for k, v in _decomp.items() if k in _dm)
-                    parts.append(f"G_rms={_G_rms:.4f}  a_sv_rms={_a_sv_rms:.4f}  [{_dp}]")
-
-            print(f"[Stage2] Epoch {epoch + 1}/{cfg.num_epochs}: {'  '.join(parts)}")
-
-            if save_dir and plot_every > 0 and (epoch + 1) % plot_every == 0:
-                try:
-                    epoch_dir = Path(save_dir) / f"epoch_{epoch + 1:04d}"
-                    ev = generate_eval_loo_plots(
-                        model=model, data=data, cfg=cfg,
-                        epoch_losses=epoch_losses, save_dir=str(epoch_dir), show=False,
-                        decoder=beh_decoder,
-                        beh_all_baseline=beh_all_baseline,
-                        include_ridge_diagnostics=False,
-                    )
-                    if ev is not None:
-                        br2 = ev.get("beh_r2_model")
-                        if br2 is not None:
-                            epoch_losses[-1]["beh_r2_eval"] = br2
-                    print(f"[Stage2] Plots saved to {epoch_dir}/")
-                except Exception as e:
-                    print(f"[Stage2][warn] plotting failed at epoch {epoch + 1}: {e}")
-
-        # ---- save ----------------------------------------------------------------
-        params_final = snapshot_model_state(model)
-        results_h5 = None if save_dir is None else str(Path(save_dir) / "stage2_results.h5")
-        save_results_pt(cfg, z_target.detach(), params_final, output_path=results_h5)
-        if results_h5 is not None:
-            print(f"[Stage2] Training complete. Results saved to {results_h5}")
+        if cfg.behavior_weight > 0:
+            beh_all_baseline = behaviour_all_neurons_prediction(data)
         else:
-            print(f"[Stage2] Training complete. Results saved to {cfg.h5_path}")
+            beh_all_baseline = None
 
-        # ---- final evaluation ----------------------------------------------------
+        # ==== per-fold training loop ==========================================
+        for fi, (te_s, te_e) in enumerate(folds):
+            print(f"\n{'='*60}")
+            print(f"[Stage2-CV] Fold {fi+1}/{n_folds}  "
+                  f"test=[{te_s},{te_e})  ({te_e - te_s} frames held out)")
+            print(f"{'='*60}")
+
+            # ---- train_mask --------------------------------------------------
+            # Shape (T-1,): mask[i] corresponds to prediction target frame i+1.
+            train_mask = torch.ones(T - 1, dtype=torch.bool, device=device)
+            train_mask[te_s - 1 : te_e - 1] = False
+            n_train = int(train_mask.sum())
+            print(f"[fold {fi}] training on {n_train}/{T-1} frames")
+
+            # ---- build model -------------------------------------------------
+            sign_t = data.get("sign_t")
+            lambda_u_init = init_lambda_u(u_stage1, cfg)
+            model = Stage2ModelPT(
+                N, data["T_e"], data["T_sv"], data["T_dcv"], data["dt"],
+                cfg, device, d_ell=d_ell,
+                lambda_u_init=lambda_u_init,
+                sign_t=sign_t,
+            ).to(device)
+            init_all_from_data(model, u_stage1, cfg)
+
+            # ---- warm-start from a previous run (phase 1 → phase 2) ---------
+            if warm_start_dir is not None:
+                ws_path = Path(warm_start_dir) / f"fold_{fi}_state.pt"
+                if ws_path.exists():
+                    ws_state = torch.load(ws_path, map_location=device,
+                                          weights_only=True)
+                    with torch.no_grad():
+                        for name, val in ws_state.items():
+                            if hasattr(model, name):
+                                param = getattr(model, name)
+                                if isinstance(param, torch.Tensor) and param.shape == val.shape:
+                                    param.copy_(val.to(device))
+                    print(f"[fold {fi}] Warm-started from {ws_path}")
+                else:
+                    print(f"[fold {fi}] No warm-start file found at {ws_path}, "
+                          f"training from scratch")
+
+            # ---- snapshot anchors for regularisation -------------------------
+            with torch.no_grad():
+                lambda_u_raw_init_anchor = model._lambda_u_raw.detach().clone()
+                I0_init_anchor = model.I0.detach().clone()
+                tau_sv_init_anchor = model.tau_sv.detach().clone()
+                tau_dcv_init_anchor = model.tau_dcv.detach().clone()
+                # Snapshot the init network strength product for floor penalty
+                _init_G_rms = float(model.G.pow(2).mean().sqrt())
+                _init_a_sv_rms = float(model.a_sv.pow(2).mean().sqrt())
+                _init_strength = _init_G_rms * _init_a_sv_rms
+
+            # ---- optimiser ---------------------------------------------------
+            syn_lr_mult = float(getattr(cfg, "synaptic_lr_multiplier", 1.0) or 1.0)
+            syn_names = {"_a_sv_raw", "_a_dcv_raw", "_W_sv_raw", "_W_dcv_raw"}
+            syn_params = [p for n, p in model.named_parameters()
+                          if n in syn_names and p.requires_grad]
+            other_params = [p for n, p in model.named_parameters()
+                            if n not in syn_names and p.requires_grad]
+            param_groups = [{"params": other_params, "lr": cfg.learning_rate}]
+            if syn_params:
+                param_groups.append(
+                    {"params": syn_params, "lr": cfg.learning_rate * syn_lr_mult})
+            params = other_params + syn_params
+            optimiser = optim.Adam(param_groups)
+
+            z_target = u_stage1.to(device)
+            uvar = (u_var_stage1.to(device) if u_var_stage1 is not None
+                    else None)
+            stim_data = stim_data_raw
+
+            use_uvar = bool(getattr(cfg, "use_u_var_weighting", False))
+            uvar_scale = float(getattr(cfg, "u_var_scale", 1.0))
+            uvar_floor = float(getattr(cfg, "u_var_floor", 1e-8))
+
+            # ---- hyperparams for regularisation / aux losses -----------------
+            grad_clip = float(getattr(cfg, "grad_clip_norm", 0.0) or 0.0)
+            rollout_steps = int(getattr(cfg, "rollout_steps", 0) or 0)
+            rollout_weight = float(getattr(cfg, "rollout_weight", 0.0) or 0.0)
+            rollout_starts = int(getattr(cfg, "rollout_starts", 0) or 0)
+            warmstart_rollout = bool(getattr(cfg, "warmstart_rollout", False))
+            loo_aux_weight = float(getattr(cfg, "loo_aux_weight", 0.0) or 0.0)
+            loo_aux_steps = int(getattr(cfg, "loo_aux_steps", 20) or 20)
+            loo_aux_neurons = int(getattr(cfg, "loo_aux_neurons", 4) or 4)
+            loo_aux_starts = int(getattr(cfg, "loo_aux_starts", 1) or 1)
+            ridge_b = float(getattr(cfg, "ridge_b", 0.0) or 0.0)
+            dynamics_l2 = float(getattr(cfg, "dynamics_l2", 0.0) or 0.0)
+            I0_reg = float(getattr(cfg, "I0_reg", 0.0) or 0.0)
+            lambda_u_reg = float(getattr(cfg, "lambda_u_reg", 0.0) or 0.0)
+            tau_reg = float(getattr(cfg, "tau_reg", 0.0) or 0.0)
+            coupling_gate_reg = float(getattr(cfg, "coupling_gate_reg", 0.0) or 0.0)
+            net_floor_weight = float(getattr(cfg, "network_strength_floor", 0.0) or 0.0)
+            net_floor_target = float(getattr(cfg, "network_strength_target", 0.8) or 0.8)
+            behavior_weight = float(getattr(cfg, "behavior_weight", 0.0) or 0.0)
+
+            # ---- behaviour decoder (per fold) --------------------------------
+            beh_decoder = None
+            if behavior_weight > 0.0 and b_seq is not None:
+                beh_decoder = init_behaviour_decoder(data)
+                if beh_decoder is not None:
+                    if beh_decoder["type"] == "mlp":
+                        mlp_params = list(beh_decoder["model"].parameters())
+                        params.extend(mlp_params)
+                        optimiser.add_param_group(
+                            {"params": mlp_params, "lr": cfg.learning_rate})
+                    else:
+                        params.append(beh_decoder["W"])
+                        optimiser.add_param_group(
+                            {"params": [beh_decoder["W"]], "lr": cfg.learning_rate})
+
+            # ---- try to torch.compile the inner step for speed --------
+            try:
+                _dynamo = getattr(torch, '_dynamo', None)
+                if _dynamo is not None:
+                    _dynamo.config.suppress_errors = True
+                model._synaptic_current = torch.compile(
+                    model._synaptic_current, mode="reduce-overhead",
+                    disable=not torch.cuda.is_available())
+            except Exception:
+                pass  # graceful fallback if compile not supported
+
+            # ---- training loop (same losses/regularisations as train_stage2) -
+            for epoch in range(cfg.num_epochs):
+                # Re-convolve stimulus with learnable kernel
+                if stim_data_raw is not None and model.stim_kernel is not None:
+                    stim_data = model.convolve_stimulus(stim_data_raw)
+                    data["stim"] = stim_data
+                else:
+                    stim_data = stim_data_raw
+
+                optimiser.zero_grad()
+
+                # ---- noise injection on teacher-forced inputs --------
+                _input_noise = float(getattr(cfg, 'input_noise_sigma', 0.0) or 0.0)
+                if _input_noise > 0:
+                    z_noisy = z_target + _input_noise * torch.randn_like(z_target)
+                else:
+                    z_noisy = z_target
+
+                # ---- curriculum rollout scheduling --------
+                _curriculum = bool(getattr(cfg, 'rollout_curriculum', False))
+                if _curriculum and rollout_weight > 0:
+                    _K_start = int(getattr(cfg, 'rollout_K_start', 5))
+                    _K_end   = int(getattr(cfg, 'rollout_K_end', 30))
+                    _cur_s   = int(getattr(cfg, 'rollout_curriculum_start_epoch', 0))
+                    _cur_e   = int(getattr(cfg, 'rollout_curriculum_end_epoch', 100))
+                    if epoch < _cur_s:
+                        _K_cur = _K_start
+                    elif epoch >= _cur_e:
+                        _K_cur = _K_end
+                    else:
+                        frac = (epoch - _cur_s) / max(_cur_e - _cur_s, 1)
+                        _K_cur = int(_K_start + frac * (_K_end - _K_start))
+                    rollout_steps = _K_cur  # dynamically update for this epoch
+
+                # Use sequential prior_step loop (matches old compute_prior graph)
+                prior_mu = model._forward_sequence_fallback(
+                    z_noisy, gating_data=gating_data,
+                    stim_data=stim_data)
+
+                # Model sigma (learnable noise)
+                if model._learn_noise:
+                    if model._noise_mode == "heteroscedastic":
+                        _model_sigma = model.sigma_at(z_target[:-1])
+                    else:
+                        _model_sigma = model.sigma_at()
+                    use_rollout = (rollout_weight > 0 and rollout_steps > 0)
+                    use_loo_aux = loo_aux_weight > 0 and loo_aux_steps > 0
+                else:
+                    _model_sigma = None
+                    use_rollout = (rollout_weight > 0 and rollout_steps > 0
+                                   and rollout_starts > 0)
+                    use_loo_aux = loo_aux_weight > 0 and loo_aux_steps > 0
+
+                # ---- one-step loss with train_mask ---------------------------
+                one_step_loss = compute_dynamics_loss(
+                    z_target[1:], prior_mu[1:], sigma_u,
+                    u_var=uvar, use_u_var_weighting=use_uvar,
+                    u_var_scale=uvar_scale, u_var_floor=uvar_floor,
+                    model_sigma=_model_sigma,
+                    train_mask=train_mask,
+                )
+
+                # ---- auxiliary losses (rollout, LOO) -------------------------
+                cached_states = None
+                if warmstart_rollout and (use_rollout or use_loo_aux):
+                    cached_states = compute_teacher_forced_states(
+                        model, z_target,
+                        gating_data=gating_data, stim_data=stim_data)
+
+                rollout_loss_val = None
+                if use_rollout:
+                    rollout_loss_val = compute_rollout_loss(
+                        model, z_target, sigma_u,
+                        rollout_steps=rollout_steps,
+                        rollout_starts=rollout_starts,
+                        gating_data=gating_data, stim_data=stim_data,
+                        cached_states=(cached_states if warmstart_rollout
+                                       else None),
+                        use_nll=model._learn_noise)
+
+                loo_loss_val = None
+                if use_loo_aux:
+                    loo_loss_val = compute_loo_aux_loss(
+                        model, z_target, sigma_u,
+                        loo_steps=loo_aux_steps,
+                        loo_neurons=loo_aux_neurons,
+                        loo_starts=loo_aux_starts,
+                        gating_data=gating_data, stim_data=stim_data,
+                        cached_states=(cached_states if warmstart_rollout
+                                       else None),
+                        use_nll=model._learn_noise)
+
+                # ---- total loss + regularisation -----------------------------
+                loss = one_step_loss
+                if rollout_loss_val is not None:
+                    loss = loss + rollout_weight * rollout_loss_val
+                if loo_loss_val is not None:
+                    loss = loss + loo_aux_weight * loo_loss_val
+                if ridge_b > 0 and model.d_ell > 0:
+                    loss = loss + ridge_b * model.b.pow(2).mean()
+                if dynamics_l2 > 0:
+                    dyn_l2 = [p.pow(2).mean() for p in model.parameters()
+                              if p.requires_grad]
+                    if dyn_l2:
+                        loss = loss + dynamics_l2 * torch.stack(dyn_l2).mean()
+                # Noise regularisation
+                _noise_reg = float(getattr(cfg, "noise_reg", 0.0) or 0.0)
+                if _noise_reg > 0 and model._learn_noise:
+                    if model._noise_mode == "heteroscedastic":
+                        loss = loss + _noise_reg * (
+                            model._sigma_w.pow(2).mean()
+                            + model._sigma_b.pow(2).mean())
+                    else:
+                        loss = loss + _noise_reg * model._log_sigma_u.pow(2).mean()
+                # Targeted regularisers
+                if I0_reg > 0:
+                    loss = loss + I0_reg * (
+                        model.I0 - I0_init_anchor).pow(2).mean()
+                if lambda_u_reg > 0:
+                    loss = loss + lambda_u_reg * (
+                        model._lambda_u_raw
+                        - lambda_u_raw_init_anchor).pow(2).mean()
+                if tau_reg > 0:
+                    _eps = 1e-6
+                    if (model.tau_sv.requires_grad
+                            and model.tau_sv.numel() > 0):
+                        loss = loss + tau_reg * (
+                            torch.log(model.tau_sv.clamp(min=_eps))
+                            - torch.log(tau_sv_init_anchor.clamp(min=_eps))
+                        ).pow(2).mean()
+                    if (model.tau_dcv.requires_grad
+                            and model.tau_dcv.numel() > 0):
+                        loss = loss + tau_reg * (
+                            torch.log(model.tau_dcv.clamp(min=_eps))
+                            - torch.log(tau_dcv_init_anchor.clamp(min=_eps))
+                        ).pow(2).mean()
+                # Coupling gate L2 (pull logits toward 0 → gate≈0.5)
+                if coupling_gate_reg > 0 and hasattr(model, '_coupling_gate_raw'):
+                    loss = loss + coupling_gate_reg * model._coupling_gate_raw.pow(2).mean()
+                # Network strength floor (+ optional growth encouragement)
+                if net_floor_weight > 0 and net_floor_target > 0:
+                    _cur = (model.G.pow(2).mean().sqrt()
+                            * model.a_sv.pow(2).mean().sqrt())
+                    _tgt = _init_strength * net_floor_target
+                    _ratio = _cur / max(_tgt, 1e-12)
+                    # Collapse penalty: fires when strength drops below target
+                    loss = loss + net_floor_weight * torch.relu(
+                        1.0 - _ratio).pow(2)
+                    # Growth encouragement: gentle pull toward target (symmetric)
+                    # This prevents the network from stalling at a small fraction
+                    # of its initial strength.  Weight is 0.1× the floor weight
+                    # so it nudges without dominating the loss.
+                    loss = loss + 0.1 * net_floor_weight * (
+                        1.0 - _ratio).pow(2)
+                # Behaviour loss
+                beh_loss_val = None
+                if beh_decoder is not None and behavior_weight > 0.0:
+                    beh_loss_val = compute_behaviour_loss(
+                        prior_mu, beh_decoder)
+                    loss = loss + behavior_weight * beh_loss_val
+                # Behavior weight cap (Test 7: coupling gain ≈0.5-1%, weakest term)
+                _beh_cap = float(getattr(cfg, "behavior_weight_cap", 0.0) or 0.0)
+                if _beh_cap > 0 and hasattr(model, "b") and model.b.requires_grad:
+                    loss = loss + _beh_cap * model.b.abs().mean()
+                # Noise correlation factor regularisation
+                if hasattr(model, '_noise_V') and model.noise_corr_rank > 0:
+                    _noise_V_reg = float(getattr(cfg, "noise_reg", 0.0) or 0.0)
+                    if _noise_V_reg > 0:
+                        loss = loss + _noise_V_reg * model._noise_V.pow(2).mean()
+
+                apply_training_step(
+                    loss, optimiser, params, model, cfg,
+                    grad_clip=grad_clip)
+
+                # ---- logging (sparse) ----------------------------------------
+                if epoch == 0 or (epoch + 1) == cfg.num_epochs or (epoch + 1) % 10 == 0:
+                    parts = [f"dyn={one_step_loss.item():.4f}",
+                             f"total={loss.item():.4f}"]
+                    if rollout_loss_val is not None:
+                        parts.append(f"roll={rollout_loss_val.item():.4f}")
+                        if _curriculum:
+                            parts.append(f"K={rollout_steps}")
+                    if loo_loss_val is not None:
+                        parts.append(f"loo={loo_loss_val.item():.4f}")
+                    if beh_loss_val is not None:
+                        parts.append(f"beh={beh_loss_val.item():.4f}")
+                    if _input_noise > 0:
+                        parts.append(f"noise={_input_noise:.3f}")
+                    print(f"[fold {fi}] Epoch {epoch+1}/{cfg.num_epochs}: "
+                          f"{'  '.join(parts)}")
+
+            # ---- collect held-out predictions --------------------------------
+            model.eval()
+            with torch.no_grad():
+                prior_mu_full = _teacher_forced_prior(
+                    model,
+                    u_stage1.to(device),
+                    gating_data,
+                    stim_data if stim_data is not None else stim_data_raw,
+                )
+            pred_np = prior_mu_full.cpu().numpy()
+            pred_u_full[te_s:te_e] = pred_np[te_s:te_e]
+
+            # Held-out MSE for model selection
+            u_np = u_stage1.cpu().numpy()
+            test_mse = float(np.mean(
+                (u_np[te_s:te_e] - pred_np[te_s:te_e]) ** 2))
+            fold_test_mse.append(test_mse)
+            fold_states.append(snapshot_model_state(model))
+
+            # Save per-fold state for warm-starting (phase 1 → phase 2)
+            if save_dir is not None:
+                _fold_pt = Path(save_dir) / f"fold_{fi}_state.pt"
+                torch.save(fold_states[-1], _fold_pt)
+
+            # Per-fold R² on held-out frames
+            _fold_r2 = np.array([
+                _r2(u_np[te_s:te_e, i], pred_np[te_s:te_e, i])
+                for i in range(N)])
+            print(f"[fold {fi}] held-out MSE={test_mse:.6f}  "
+                  f"R² mean={np.nanmean(_fold_r2):.4f}  "
+                  f"median={np.nanmedian(_fold_r2):.4f}")
+
+        # ==== aggregate CV results ============================================
+        valid_mask = ~np.isnan(pred_u_full[:, 0])
+        u_np = u_stage1.cpu().numpy()
+        cv_r2 = np.array([
+            _r2(u_np[valid_mask, i], pred_u_full[valid_mask, i])
+            for i in range(N)])
+
+        print(f"\n{'='*60}")
+        print(f"[Stage2-CV] Cross-validated one-step R² ({n_folds} folds)")
+        print(f"  mean  = {np.nanmean(cv_r2):.4f}")
+        print(f"  median= {np.nanmedian(cv_r2):.4f}")
+        print(f"  std   = {np.nanstd(cv_r2):.4f}")
+        print(f"  min   = {np.nanmin(cv_r2):.4f}")
+        print(f"  max   = {np.nanmax(cv_r2):.4f}")
+        n_neg = int((cv_r2 < 0).sum())
+        print(f"  #negative = {n_neg}/{N}")
+        print(f"{'='*60}")
+
+        # ---- rebuild best-fold model for final evaluation --------------------
+        best_fi = int(np.argmin(fold_test_mse))
+        print(f"\n[Stage2-CV] Best fold = {best_fi} "
+              f"(held-out MSE = {fold_test_mse[best_fi]:.6f})")
+
+        lambda_u_init = init_lambda_u(u_stage1, cfg)
+
+        def _rebuild_model_from_state(state_dict):
+            """Rebuild a Stage2ModelPT and load *state_dict* parameters."""
+            m = Stage2ModelPT(
+                N, data["T_e"], data["T_sv"], data["T_dcv"], data["dt"],
+                cfg, device, d_ell=d_ell,
+                lambda_u_init=lambda_u_init,
+                sign_t=data.get("sign_t"),
+            ).to(device)
+            init_all_from_data(m, u_stage1, cfg)
+            with torch.no_grad():
+                for name, val in state_dict.items():
+                    if hasattr(m, name):
+                        param = getattr(m, name)
+                        if isinstance(param, torch.Tensor) and param.shape == val.shape:
+                            param.copy_(val)
+            m.eval()
+            return m
+
+        best_model = _rebuild_model_from_state(fold_states[best_fi])
+
+        # ==== Cross-validated LOO evaluation ==================================
+        _cv_onestep_for_subset = {"r2": cv_r2, "prior_mu": pred_u_full}
+        subset = choose_loo_subset(
+            data, _cv_onestep_for_subset,
+            subset_size=_cfg_val(cfg, "eval_loo_subset_size", 0, int),
+            subset_mode=str(getattr(cfg, "eval_loo_subset_mode", "variance")),
+            explicit_indices=(
+                None if getattr(cfg, "eval_loo_subset_neurons", None) is None
+                else list(cfg.eval_loo_subset_neurons)
+            ),
+            seed=_cfg_val(cfg, "eval_loo_subset_seed", 0, int),
+        )
+
+        cv_loo_r2 = None
+        cv_loo_r2_windowed = None
+        cv_loo_preds = None
+
+        if subset is not None and len(subset) > 0:
+            window_size = _cfg_val(cfg, "eval_loo_window_size", 0, int)
+            warmup_steps = _cfg_val(cfg, "eval_loo_warmup_steps", 40, int)
+            u_device = u_stage1.to(device)
+            gating_eval = data.get("gating")
+            stim_eval = data.get("stim")
+
+            # Allocate per-neuron prediction arrays (NaN = not yet filled)
+            loo_pred_full = {i: np.full(T, np.nan, dtype=np.float32)
+                            for i in subset}
+            loo_pred_w_full = (
+                {i: np.full(T, np.nan, dtype=np.float32) for i in subset}
+                if window_size > 0 else None
+            )
+
+            print(f"\n{'='*60}")
+            print(f"[Stage2-CV] Cross-validated LOO ({n_folds} folds, "
+                  f"{len(subset)} neurons) — BATCHED")
+            print(f"{'='*60}")
+
+            for fi, (te_s, te_e) in enumerate(folds):
+                fold_model = _rebuild_model_from_state(fold_states[fi])
+
+                # Batched: all LOO neurons in one pass (~N× faster)
+                batch_preds = loo_forward_simulate_batched(
+                    fold_model, u_device, subset, gating_eval, stim_eval,
+                    warmup_steps=warmup_steps)
+                for i in subset:
+                    loo_pred_full[i][te_s:te_e] = batch_preds[i][te_s:te_e]
+
+                if window_size > 0:
+                    batch_preds_w = loo_forward_simulate_batched_windowed(
+                        fold_model, u_device, subset, gating_eval, stim_eval,
+                        window_size=window_size, warmup_steps=warmup_steps)
+                    for i in subset:
+                        loo_pred_w_full[i][te_s:te_e] = batch_preds_w[i][te_s:te_e]
+
+                print(f"[Stage2-CV] LOO fold {fi+1}/{n_folds} done "
+                      f"(test=[{te_s},{te_e}), {len(subset)} neurons)")
+
+            # Compute CV LOO R²
+            cv_loo_r2 = np.full(N, np.nan, dtype=np.float32)
+            for i in subset:
+                valid = ~np.isnan(loo_pred_full[i])
+                if valid.sum() > 1:
+                    cv_loo_r2[i] = _r2(u_np[valid, i], loo_pred_full[i][valid])
+
+            cv_loo_preds = loo_pred_full
+            loo_valid = cv_loo_r2[np.isfinite(cv_loo_r2)]
+            print(f"\n{'='*60}")
+            print(f"[Stage2-CV] Cross-validated LOO R² ({n_folds} folds)")
+            if len(loo_valid) > 0:
+                print(f"  mean  = {np.nanmean(loo_valid):.4f}")
+                print(f"  median= {np.nanmedian(loo_valid):.4f}")
+                print(f"  std   = {np.nanstd(loo_valid):.4f}")
+                print(f"  min   = {np.nanmin(loo_valid):.4f}")
+                print(f"  max   = {np.nanmax(loo_valid):.4f}")
+                n_neg_loo = int((loo_valid < 0).sum())
+                print(f"  #negative = {n_neg_loo}/{len(loo_valid)}")
+            else:
+                print(f"  (no valid LOO neurons)")
+            print(f"{'='*60}")
+
+            if window_size > 0 and loo_pred_w_full is not None:
+                cv_loo_r2_windowed = np.full(N, np.nan, dtype=np.float32)
+                for i in subset:
+                    valid = ~np.isnan(loo_pred_w_full[i])
+                    if valid.sum() > 1:
+                        cv_loo_r2_windowed[i] = _r2(
+                            u_np[valid, i], loo_pred_w_full[i][valid])
+                loo_w_valid = cv_loo_r2_windowed[
+                    np.isfinite(cv_loo_r2_windowed)]
+                if len(loo_w_valid) > 0:
+                    print(f"[Stage2-CV] Windowed LOO R² (window={window_size})")
+                    print(f"  mean  = {np.nanmean(loo_w_valid):.4f}")
+                    print(f"  median= {np.nanmedian(loo_w_valid):.4f}")
+
+        # ---- save results ----------------------------------------------------
+        results_h5 = (None if save_dir is None
+                      else str(Path(save_dir) / "stage2_results.h5"))
+        params_final = fold_states[best_fi]
+        save_results_pt(cfg, u_stage1.to(device).detach(),
+                        params_final, output_path=results_h5)
+
+        # Save CV predictions & metrics
+        if save_dir is not None:
+            cv_path = Path(save_dir) / "cv_onestep.npz"
+            save_data = dict(
+                pred_u_full=pred_u_full,
+                cv_r2=cv_r2,
+                fold_test_mse=np.array(fold_test_mse),
+                folds=np.array(folds),
+                best_fold=best_fi,
+            )
+            if cv_loo_r2 is not None:
+                save_data["cv_loo_r2"] = cv_loo_r2
+                for i, pred in cv_loo_preds.items():
+                    save_data[f"loo_pred_{i}"] = pred
+            if cv_loo_r2_windowed is not None:
+                save_data["cv_loo_r2_windowed"] = cv_loo_r2_windowed
+            np.savez(cv_path, **save_data)
+            print(f"[Stage2-CV] CV predictions saved to {cv_path}")
+
+        # ---- final evaluation with best-fold model ---------------------------
         eval_result = None
-        if save_dir or show:
+        _skip_final = bool(getattr(cfg, "skip_final_eval", False))
+        if (save_dir or show) and not _skip_final:
             eval_result = generate_eval_loo_plots(
-                model=model, data=data, cfg=cfg,
-                epoch_losses=epoch_losses,
-                save_dir=save_dir or "plots/eval_loo", show=show,
-                decoder=beh_decoder,
+                model=best_model, data=data, cfg=cfg,
+                epoch_losses=[],
+                save_dir=save_dir or "plots/eval_cv", show=show,
+                decoder=None,
                 beh_all_baseline=beh_all_baseline,
             )
-            if eval_result is not None:
-                br2 = eval_result.get("beh_r2_model")
-                if br2 is not None:
-                    epoch_losses[-1]["beh_r2_eval"] = br2
 
-            return eval_result
+        # Inject CV metrics into eval_result
+        if eval_result is None:
+            eval_result = {}
+        eval_result["cv_onestep_r2"] = cv_r2
+        eval_result["cv_onestep_r2_mean"] = float(np.nanmean(cv_r2))
+        eval_result["cv_onestep_r2_median"] = float(np.nanmedian(cv_r2))
+        eval_result["cv_pred_u_full"] = pred_u_full
+        eval_result["fold_test_mse"] = fold_test_mse
+        eval_result["best_fold_idx"] = best_fi
+        if cv_loo_r2 is not None:
+            loo_valid = cv_loo_r2[np.isfinite(cv_loo_r2)]
+            eval_result["cv_loo_r2"] = cv_loo_r2
+            eval_result["cv_loo_r2_mean"] = float(np.nanmean(loo_valid)) if len(loo_valid) > 0 else float("nan")
+            eval_result["cv_loo_r2_median"] = float(np.nanmedian(loo_valid)) if len(loo_valid) > 0 else float("nan")
+        if cv_loo_r2_windowed is not None:
+            loo_w_valid = cv_loo_r2_windowed[np.isfinite(cv_loo_r2_windowed)]
+            eval_result["cv_loo_r2_windowed"] = cv_loo_r2_windowed
+            eval_result["cv_loo_r2_windowed_mean"] = float(np.nanmean(loo_w_valid)) if len(loo_w_valid) > 0 else float("nan")
+            eval_result["cv_loo_r2_windowed_median"] = float(np.nanmedian(loo_w_valid)) if len(loo_w_valid) > 0 else float("nan")
 
-    finally:  # close log tee
+        # Coupling gate diagnostics (if enabled)
+        if hasattr(best_model, 'has_coupling_gate') and best_model.has_coupling_gate:
+            eval_result["coupling_gate_values"] = best_model.coupling_gate_values.detach().cpu().numpy()
+
+        return eval_result
+
+    finally:
         if _tee is not None:
             _tee.close()
+
+
+# --------------------------------------------------------------------------- #
+#  Main entry point                                                             #
+# --------------------------------------------------------------------------- #
+
+
+def train_stage2(
+    cfg: Stage2PTConfig,
+    save_dir: str | None = None,
+    show: bool = False,
+    warm_start_dir: str | None = None,
+) -> Optional[dict]:
+    """Train Stage 2 with k-fold temporal CV for fair one-step and LOO R².
+
+    This is the main entry point.  It always uses temporal cross-validation
+    (``cfg.cv_folds`` folds, default 5) to produce out-of-sample one-step
+    and LOO R² metrics, matching the evaluation protocol of the Transformer
+    baseline.
+    """
+    return train_stage2_cv(cfg, save_dir=save_dir, show=show,
+                           warm_start_dir=warm_start_dir)

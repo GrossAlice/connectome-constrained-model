@@ -334,6 +334,12 @@ def _load_behaviour(
     b_np = _ensure_TN(np.array(f[behavior_ds], dtype=float))
     if b_np.shape[0] != T:
         raise ValueError(f"behaviour T={b_np.shape[0]}, expected {T}")
+    # Optionally truncate to first K eigenworm modes
+    n_modes_max = int(getattr(cfg, "behavior_n_modes", 0) or 0)
+    if n_modes_max > 0 and b_np.shape[1] > n_modes_max:
+        _io_logger.info("behaviour_truncated",
+                        original=b_np.shape[1], kept=n_modes_max)
+        b_np = b_np[:, :n_modes_max]
     result["behavior_dataset"] = behavior_ds
 
     result["b_mask"] = torch.tensor(

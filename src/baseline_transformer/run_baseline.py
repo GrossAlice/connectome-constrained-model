@@ -2,7 +2,7 @@
 
 Usage
 -----
-# Train + evaluate a single worm:
+# Train + evaluate a single worm (5-fold CV, joint neural+beh):
 python -m baseline_transformer.run_baseline \
     --h5 data/used/behaviour+neuronal\ activity\ atanas\ \(2023\)/2/worm0.h5 \
     --save_dir output_plots/transformer_baseline/single
@@ -13,11 +13,13 @@ python -m baseline_transformer.run_baseline \
     --save_dir output_plots/transformer_baseline/batch \
     --device cuda
 
-# Hyperparameter sweep:
+# Disable behaviour prediction (neural-only):
 python -m baseline_transformer.run_baseline \
-    --h5_dir "data/used/behaviour+neuronal activity atanas (2023)/2" \
-    --save_dir output_plots/transformer_baseline/sweep \
-    --sweep --device cuda
+    --h5 worm0.h5 --save_dir out --no_beh
+
+# Legacy single-split mode (no CV):
+python -m baseline_transformer.run_baseline \
+    --h5 worm0.h5 --save_dir out --no_cv
 """
 from __future__ import annotations
 
@@ -33,8 +35,12 @@ import numpy as np
 
 from .config import TransformerBaselineConfig
 from .dataset import discover_worm_files, load_worm_data
-from .evaluate import run_full_evaluation, save_evaluation
-from .train import train_single_worm
+from .evaluate import (
+    run_full_evaluation,
+    run_full_evaluation_cv,
+    save_evaluation,
+)
+from .train import train_single_worm, train_single_worm_cv
 
 
 def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -52,6 +58,15 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--eval_only", action="store_true", help="Only evaluate (load existing model)")
     p.add_argument("--loo_subset", type=int, default=20, help="LOO subset size (0=all)")
 
+    # CV and behaviour flags
+    p.add_argument("--no_cv", action="store_true",
+                   help="Disable cross-validation (use legacy 70/15/15 split)")
+    p.add_argument("--n_cv_folds", type=int, default=None, help="Number of CV folds")
+    p.add_argument("--no_beh", action="store_true",
+                   help="Disable behaviour input/prediction (neural only)")
+    p.add_argument("--n_beh_modes", type=int, default=None, help="Number of eigenworm modes")
+    p.add_argument("--w_beh", type=float, default=None, help="Weight on behaviour loss")
+
     # Override config fields
     p.add_argument("--d_model", type=int, default=None)
     p.add_argument("--n_heads", type=int, default=None)
@@ -64,16 +79,29 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--max_epochs", type=int, default=None)
     p.add_argument("--patience", type=int, default=None)
 
+    # Diffusion head
+    p.add_argument("--use_diffusion", action="store_true",
+                   help="Use diffusion denoising head instead of Gaussian NLL")
+
     return p.parse_args(argv)
 
 
 def _apply_overrides(cfg: TransformerBaselineConfig, args: argparse.Namespace) -> TransformerBaselineConfig:
     """Apply CLI overrides to config."""
     for field in ["d_model", "n_heads", "n_layers", "d_ff", "context_length",
-                  "dropout", "lr", "batch_size", "max_epochs", "patience"]:
+                  "dropout", "lr", "batch_size", "max_epochs", "patience",
+                  "n_cv_folds", "n_beh_modes", "w_beh"]:
         val = getattr(args, field, None)
         if val is not None:
             setattr(cfg, field, val)
+
+    if args.no_beh:
+        cfg.include_beh_input = False
+        cfg.predict_beh = False
+
+    if getattr(args, "use_diffusion", False):
+        cfg.use_diffusion = True
+
     return cfg
 
 
@@ -84,65 +112,88 @@ def _run_one_worm(
     device: str,
     loo_subset: int,
     eval_only: bool = False,
+    use_cv: bool = True,
 ) -> Dict[str, Any]:
     """Train (or load) + evaluate one worm."""
-    worm_data = load_worm_data(h5_path)
+    worm_data = load_worm_data(h5_path, n_beh_modes=cfg.n_beh_modes)
     worm_id = worm_data["worm_id"]
     u = worm_data["u"]
+    b = worm_data.get("b")
+    b_mask = worm_data.get("b_mask")
 
     print(f"\n{'='*60}")
     print(f"Worm: {worm_id}  (T={worm_data['T']}, N={worm_data['N_obs']})")
+    if b is not None:
+        print(f"  Behaviour: {b.shape[1]} modes, "
+              f"valid={np.mean(b_mask > 0.5):.1%}" if b_mask is not None else "")
+    print(f"  Mode: {'CV' if use_cv else 'single-split'}, "
+          f"predict_beh={cfg.predict_beh}, include_beh={cfg.include_beh_input}")
     print(f"{'='*60}")
 
     import torch
-    model_path = Path(save_dir) / worm_id / "model.pt"
 
-    if eval_only and model_path.exists():
-        # Load existing model
-        print(f"  Loading model from {model_path}")
-        from .model import build_model
-        model = build_model(worm_data["N_obs"], cfg, device=device)
-        state = torch.load(model_path, map_location=device, weights_only=True)
-        model.load_state_dict(state)
-        model.eval()
+    if use_cv:
+        # ---- 5-fold CV training ----
+        train_result = train_single_worm_cv(
+            u=u, cfg=cfg, device=device, verbose=True,
+            save_dir=save_dir, worm_id=worm_id,
+            b=b, b_mask=b_mask,
+        )
 
-        # Load split info
-        meta_path = Path(save_dir) / worm_id / "train_meta.json"
-        if meta_path.exists():
-            meta = json.loads(meta_path.read_text())
-            split = {k: tuple(v) for k, v in meta["split"].items()}
+        # Evaluate
+        eval_results = run_full_evaluation_cv(
+            train_result=train_result,
+            worm_data=worm_data,
+            cfg=cfg,
+            loo_subset_size=loo_subset,
+            verbose=True,
+        )
+    else:
+        # ---- Legacy single-split ----
+        model_path = Path(save_dir) / worm_id / "model.pt"
+
+        if eval_only and model_path.exists():
+            from .model import build_model
+            from .dataset import build_joint_state, temporal_train_val_test_split
+
+            x, x_mask, n_neural, n_beh = build_joint_state(
+                u, b, b_mask, include_beh=cfg.include_beh_input and cfg.predict_beh,
+            )
+            model = build_model(n_neural, cfg, device=device, n_beh=n_beh)
+            state = torch.load(model_path, map_location=device, weights_only=True)
+            model.load_state_dict(state)
+            model.eval()
+
+            meta_path = Path(save_dir) / worm_id / "train_meta.json"
+            if meta_path.exists():
+                meta = json.loads(meta_path.read_text())
+                split = {k: tuple(v) for k, v in meta["split"].items()}
+            else:
+                split = temporal_train_val_test_split(worm_data["T"], cfg.train_frac, cfg.val_frac)
+
+            train_result = {"model": model, "split": split, "cfg": cfg}
         else:
+            train_result = train_single_worm(
+                u=u, cfg=cfg, device=device, verbose=True,
+                save_dir=save_dir, worm_id=worm_id,
+                b=b, b_mask=b_mask,
+            )
+
+        model = train_result["model"]
+        model = model.to(device)
+        split = train_result.get("split")
+        if split is None:
             from .dataset import temporal_train_val_test_split
             split = temporal_train_val_test_split(worm_data["T"], cfg.train_frac, cfg.val_frac)
 
-        train_result = {"model": model, "split": split, "cfg": cfg}
-    else:
-        # Train
-        train_result = train_single_worm(
-            u=u,
+        eval_results = run_full_evaluation(
+            model=model,
+            worm_data=worm_data,
+            split=split,
             cfg=cfg,
-            device=device,
+            loo_subset_size=loo_subset,
             verbose=True,
-            save_dir=save_dir,
-            worm_id=worm_id,
         )
-
-    model = train_result["model"]
-    model = model.to(device)
-    split = train_result.get("split")
-    if split is None:
-        from .dataset import temporal_train_val_test_split
-        split = temporal_train_val_test_split(worm_data["T"], cfg.train_frac, cfg.val_frac)
-
-    # Evaluate
-    eval_results = run_full_evaluation(
-        model=model,
-        worm_data=worm_data,
-        split=split,
-        cfg=cfg,
-        loo_subset_size=loo_subset,
-        verbose=True,
-    )
 
     save_evaluation(eval_results, save_dir, worm_id)
     return eval_results
@@ -153,12 +204,12 @@ def _run_sweep(
     save_dir: str,
     device: str,
     loo_subset: int,
+    use_cv: bool = True,
 ) -> None:
     """Run hyperparameter sweep over the grid defined in config."""
     base_cfg = TransformerBaselineConfig()
     grid = base_cfg.sweep_grid
 
-    # Generate all combos
     import itertools
     keys = list(grid.keys())
     values = list(grid.values())
@@ -168,7 +219,6 @@ def _run_sweep(
     print(f"SWEEP: {len(combos)} configurations × {len(h5_files)} worms")
     print(f"{'='*60}")
 
-    # Use a small subset of worms for sweep (first 5 or all if fewer)
     sweep_files = h5_files[:min(5, len(h5_files))]
     print(f"  Using {len(sweep_files)} worms for sweep")
 
@@ -186,7 +236,8 @@ def _run_sweep(
         worm_r2s = []
         for h5_path in sweep_files:
             try:
-                result = _run_one_worm(h5_path, cfg, combo_dir, device, loo_subset)
+                result = _run_one_worm(h5_path, cfg, combo_dir, device,
+                                       loo_subset, use_cv=use_cv)
                 worm_r2s.append(result["onestep"]["r2_mean"])
             except Exception as e:
                 print(f"  ERROR: {e}")
@@ -202,14 +253,12 @@ def _run_sweep(
         all_results.append(summary)
         print(f"  → Mean one-step R² = {mean_r2:.4f}")
 
-    # Save sweep summary
     out = Path(save_dir)
     out.mkdir(parents=True, exist_ok=True)
     (out / "sweep_summary.json").write_text(
         json.dumps(all_results, indent=2, default=str)
     )
 
-    # Print best
     best = max(all_results, key=lambda x: x["mean_r2"] if np.isfinite(x["mean_r2"]) else -np.inf)
     print(f"\n{'='*60}")
     print(f"BEST CONFIG: {best['config']}")
@@ -226,7 +275,20 @@ def _aggregate_results(
     print(f"AGGREGATE RESULTS ({len(all_results)} worms)")
     print(f"{'='*60}")
 
-    header = f"{'Worm':<20} {'1-step':>8} {'LOO':>8} {'FreeRun':>8} {'Beh(M)':>8} {'Beh(GT)':>8}"
+    # Detect whether we have CV results (behaviour_direct) or legacy
+    has_direct_beh = any(
+        r.get("behaviour_direct", {}).get("r2_mean") is not None
+        for r in all_results
+    )
+
+    if has_direct_beh:
+        header = (f"{'Worm':<20} {'1-step':>8} {'BehDir':>8} "
+                  f"{'LOO':>8} {'LOO-W':>8} {'FreeRun':>8} "
+                  f"{'BehRdg':>8}")
+    else:
+        header = (f"{'Worm':<20} {'1-step':>8} {'LOO':>8} "
+                  f"{'LOO-W':>8} {'FreeRun':>8} {'Beh(M)':>8} {'Beh(GT)':>8}")
+
     print(header)
     print("-" * len(header))
 
@@ -235,45 +297,67 @@ def _aggregate_results(
         wid = r.get("worm_id", "?")
         os_r2 = r.get("onestep", {}).get("r2_mean", float("nan"))
         loo_r2 = r.get("loo", {}).get("r2_mean", float("nan"))
+        loo_w_r2 = r.get("loo_windowed", {}).get("r2_mean", float("nan"))
         fr_r2 = r.get("free_run", {}).get("r2_mean", float("nan"))
-        beh_m = r.get("behaviour", {}).get("r2_model_mean") or float("nan")
-        beh_gt = r.get("behaviour", {}).get("r2_gt_mean") or float("nan")
 
-        print(f"{wid:<20} {os_r2:>8.4f} {loo_r2:>8.4f} {fr_r2:>8.4f} {beh_m:>8.4f} {beh_gt:>8.4f}")
+        # Behaviour: prefer direct, fall back to ridge
+        beh_direct = r.get("onestep_beh", {}).get("r2_mean") or \
+                     r.get("behaviour_direct", {}).get("r2_mean") or float("nan")
+        beh_ridge = r.get("behaviour_ridge", {}).get("r2_model_mean") or \
+                    r.get("behaviour", {}).get("r2_model_mean") or float("nan")
+        beh_gt = r.get("behaviour_ridge", {}).get("r2_gt_mean") or \
+                 r.get("behaviour", {}).get("r2_gt_mean") or float("nan")
+
+        if has_direct_beh:
+            print(f"{wid:<20} {os_r2:>8.4f} {beh_direct:>8.4f} "
+                  f"{loo_r2:>8.4f} {loo_w_r2:>8.4f} {fr_r2:>8.4f} "
+                  f"{beh_ridge:>8.4f}")
+        else:
+            print(f"{wid:<20} {os_r2:>8.4f} {loo_r2:>8.4f} {loo_w_r2:>8.4f} "
+                  f"{fr_r2:>8.4f} {beh_ridge:>8.4f} {beh_gt:>8.4f}")
+
         rows.append({
             "worm_id": wid,
             "onestep_r2": os_r2,
+            "beh_direct_r2": beh_direct,
             "loo_r2": loo_r2,
+            "loo_windowed_r2": loo_w_r2,
             "free_run_r2": fr_r2,
-            "beh_model_r2": beh_m,
+            "beh_ridge_r2": beh_ridge,
             "beh_gt_r2": beh_gt,
         })
 
-    # Means
     def _safe_mean(key):
         vals = [r[key] for r in rows if np.isfinite(r[key])]
         return float(np.mean(vals)) if vals else float("nan")
 
     print("-" * len(header))
-    print(f"{'MEAN':<20} {_safe_mean('onestep_r2'):>8.4f} {_safe_mean('loo_r2'):>8.4f} "
-          f"{_safe_mean('free_run_r2'):>8.4f} {_safe_mean('beh_model_r2'):>8.4f} {_safe_mean('beh_gt_r2'):>8.4f}")
+    print(f"{'MEAN':<20} {_safe_mean('onestep_r2'):>8.4f} "
+          f"{_safe_mean('beh_direct_r2'):>8.4f} "
+          f"{_safe_mean('loo_r2'):>8.4f} "
+          f"{_safe_mean('loo_windowed_r2'):>8.4f} "
+          f"{_safe_mean('free_run_r2'):>8.4f} "
+          f"{_safe_mean('beh_ridge_r2'):>8.4f}")
 
-    # Save
     out = Path(save_dir)
     out.mkdir(parents=True, exist_ok=True)
     (out / "aggregate_results.json").write_text(json.dumps(rows, indent=2, default=str))
 
-    # Save as TSV too
     with open(out / "aggregate_results.tsv", "w") as f:
-        f.write("worm_id\tonestep_r2\tloo_r2\tfree_run_r2\tbeh_model_r2\tbeh_gt_r2\n")
+        f.write("worm_id\tonestep_r2\tbeh_direct_r2\tloo_r2\tloo_windowed_r2\t"
+                "free_run_r2\tbeh_ridge_r2\tbeh_gt_r2\n")
         for r in rows:
-            f.write(f"{r['worm_id']}\t{r['onestep_r2']:.6f}\t{r['loo_r2']:.6f}\t"
-                    f"{r['free_run_r2']:.6f}\t{r['beh_model_r2']:.6f}\t{r['beh_gt_r2']:.6f}\n")
+            f.write(f"{r['worm_id']}\t{r['onestep_r2']:.6f}\t"
+                    f"{r['beh_direct_r2']:.6f}\t{r['loo_r2']:.6f}\t"
+                    f"{r['loo_windowed_r2']:.6f}\t"
+                    f"{r['free_run_r2']:.6f}\t{r['beh_ridge_r2']:.6f}\t"
+                    f"{r['beh_gt_r2']:.6f}\n")
 
 
 def main(argv: Optional[List[str]] = None) -> None:
     args = _parse_args(argv)
     cfg = _apply_overrides(TransformerBaselineConfig(), args)
+    use_cv = not args.no_cv
 
     # Save config
     out = Path(args.save_dir)
@@ -292,11 +376,14 @@ def main(argv: Optional[List[str]] = None) -> None:
     print(f"Found {len(h5_files)} worm file(s)")
     print(f"Config: d_model={cfg.d_model}, n_layers={cfg.n_layers}, "
           f"n_heads={cfg.n_heads}, K={cfg.context_length}")
+    print(f"CV: {'off' if not use_cv else f'{cfg.n_cv_folds}-fold'}, "
+          f"predict_beh={cfg.predict_beh}, n_beh_modes={cfg.n_beh_modes}")
     print(f"Device: {args.device}")
     print(f"Save dir: {args.save_dir}")
 
     if args.sweep:
-        _run_sweep(h5_files, args.save_dir, args.device, args.loo_subset)
+        _run_sweep(h5_files, args.save_dir, args.device, args.loo_subset,
+                   use_cv=use_cv)
         return
 
     # Single run: train + evaluate all worms
@@ -309,6 +396,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             result = _run_one_worm(
                 h5_path, cfg, args.save_dir, args.device, args.loo_subset,
                 eval_only=args.eval_only,
+                use_cv=use_cv,
             )
             all_results.append(result)
         except Exception as e:

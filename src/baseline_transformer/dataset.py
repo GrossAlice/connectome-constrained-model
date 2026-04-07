@@ -20,6 +20,7 @@ __all__ = [
     "SlidingWindowDataset",
     "temporal_train_val_test_split",
     "contiguous_cv_folds",
+    "make_cv_folds",
     "load_worm_data",
     "discover_worm_files",
 ]
@@ -31,42 +32,57 @@ __all__ = [
 class SlidingWindowDataset(Dataset):
     """Sliding-window dataset: context K frames → predict next frame.
 
+    Handles a joint state ``x = [u, b]`` where ``u`` is neural activity
+    (always valid) and ``b`` is behaviour (may be partially masked).
+
     Parameters
     ----------
-    u : np.ndarray, shape (T, N)
-        Neural activity time series.
+    x : np.ndarray, shape (T, D)
+        Joint state: first ``n_neural`` columns are neural activity,
+        remaining ``n_beh`` columns are behaviour eigenworm amplitudes.
+    b_mask : np.ndarray, shape (T, n_beh) or None
+        Validity mask for the behaviour columns (1=valid, 0=invalid).
+        If None, all behaviour columns are treated as always valid.
+    n_neural : int
+        Number of neural columns in ``x``.
     context_length : int
-        Number of past frames in each context window.
+        Number of past frames in each context window (K).
     start, end : int
-        Time-range [start, end) to draw windows from. The first valid
-        window starts at ``start`` and predicts frame ``start + context_length``.
-        The last window predicts frame ``end - 1``.
+        Time-range [start, end) to draw windows from.
 
-    Each item is ``(context, target)`` where
-    * context : (K, N)  — frames [t - K + 1, ..., t]
-    * target  : (N,)    — frame t + 1
+    Each item is ``(context, target, target_mask)`` where
+    * context     : (K, D)     — frames [t-K, ..., t-1]
+    * target      : (D,)       — frame t
+    * target_mask : (D,)       — 1.0 for valid, 0.0 for invalid behaviour
     """
 
     def __init__(
         self,
-        u: np.ndarray,
+        x: np.ndarray,
+        n_neural: int,
         context_length: int,
         start: int = 0,
         end: Optional[int] = None,
+        b_mask: Optional[np.ndarray] = None,
     ) -> None:
-        assert u.ndim == 2, f"Expected (T, N), got {u.shape}"
-        T, N = u.shape
+        assert x.ndim == 2, f"Expected (T, D), got {x.shape}"
+        T, D = x.shape
         if end is None:
             end = T
-        self.u = u.astype(np.float32)
+        self.x = x.astype(np.float32)
         self.K = int(context_length)
-        self.N = N
+        self.D = D
+        self.n_neural = n_neural
+        self.n_beh = D - n_neural
 
-        # Valid prediction indices: we predict u[t] using u[t-K : t].
-        # So t must satisfy t >= K and t < end.
-        # Also t-K >= start  =>  t >= start + K.
+        # Build full-row mask: neural columns are always valid
+        self._mask = np.ones((T, D), dtype=np.float32)
+        if b_mask is not None and self.n_beh > 0:
+            self._mask[:, n_neural:] = b_mask.astype(np.float32)
+
+        # Valid prediction indices: predict x[t] from x[t-K : t].
         first_target = max(self.K, start + self.K)
-        last_target = end  # exclusive
+        last_target = end
         if last_target <= first_target:
             self._target_indices = np.array([], dtype=np.int64)
         else:
@@ -75,11 +91,12 @@ class SlidingWindowDataset(Dataset):
     def __len__(self) -> int:
         return len(self._target_indices)
 
-    def __getitem__(self, idx: int) -> Tuple[np.ndarray, np.ndarray]:
+    def __getitem__(self, idx: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         t = int(self._target_indices[idx])
-        context = self.u[t - self.K : t]      # (K, N)
-        target = self.u[t]                     # (N,)
-        return context, target
+        context = self.x[t - self.K : t]         # (K, D)
+        target = self.x[t]                        # (D,)
+        target_mask = self._mask[t]               # (D,)
+        return context, target, target_mask
 
 
 # ── Temporal splits ──────────────────────────────────────────────────────────
@@ -134,17 +151,90 @@ def contiguous_cv_folds(
     return folds
 
 
+def make_cv_folds(
+    T: int,
+    n_folds: int,
+    context_length: int,
+    val_frac_inner: float = 0.15,
+) -> List[Dict[str, Tuple[int, int]]]:
+    """Create *n_folds* contiguous temporal CV folds as (start, end) ranges.
+
+    Each fold dict has:
+        "test"  : (test_start, test_end) — held-out contiguous block
+        "train" : list of (start, end) tuples — training segments
+        "val"   : (val_start, val_end) — inner validation from training
+                  (last ``val_frac_inner`` of the training data)
+
+    The test regions tile the recording [K, T) without overlap.
+    """
+    K = context_length
+    usable = T - K  # first K frames are context-only
+    fold_size = usable // n_folds
+    remainder = usable - fold_size * n_folds
+
+    folds = []
+    cursor = K
+    for fi in range(n_folds):
+        # This fold's test region
+        size = fold_size + (1 if fi < remainder else 0)
+        te_s, te_e = cursor, cursor + size
+
+        # Training: everything outside test region (but >= K)
+        train_segments = []
+        if te_s > K:
+            train_segments.append((K, te_s))
+        if te_e < T:
+            train_segments.append((te_e, T))
+
+        # Inner val: carve off last val_frac_inner of total training frames
+        total_train = sum(e - s for s, e in train_segments)
+        val_size = max(1, int(total_train * val_frac_inner))
+
+        # Take val from the *end* of the last training segment
+        last_s, last_e = train_segments[-1]
+        val_s = last_e - val_size
+        val_e = last_e
+        # Shrink the last training segment
+        new_train_segments = list(train_segments)
+        if val_s > last_s:
+            new_train_segments[-1] = (last_s, val_s)
+        else:
+            # val eats the entire last segment — use previous one
+            new_train_segments.pop()
+            if new_train_segments:
+                ps, pe = new_train_segments[-1]
+                needed = val_size - (last_e - last_s)
+                new_val_s = pe - needed
+                val_s = new_val_s
+                new_train_segments[-1] = (ps, new_val_s)
+
+        folds.append({
+            "test": (te_s, te_e),
+            "train": new_train_segments,
+            "val": (val_s, val_e),
+        })
+        cursor = te_e
+
+    return folds
+
+
 # ── Per-worm data loader ────────────────────────────────────────────────────
 
 
 def load_worm_data(
     h5_path: str,
     device: str = "cpu",
+    n_beh_modes: int = 6,
 ) -> Dict[str, Any]:
     """Load a single worm's data for the Transformer baseline.
 
     Reads stage-1 deconvolved activity, neuron labels, behaviour targets,
     and motor neuron indices.  Does NOT load connectome matrices.
+
+    Parameters
+    ----------
+    n_beh_modes : int
+        Clip behaviour eigenworms to this many modes.
 
     Returns
     -------
@@ -228,6 +318,10 @@ def load_worm_data(
             if b_raw.shape[0] < b_raw.shape[1] and b_raw.shape[1] == T:
                 b_raw = b_raw.T
             if b_raw.shape[0] == T:
+                # Clip to n_beh_modes
+                n_modes_available = b_raw.shape[1]
+                n_modes = min(n_beh_modes, n_modes_available)
+                b_raw = b_raw[:, :n_modes]
                 b_mask = np.isfinite(b_raw).astype(np.float32)
                 b = np.nan_to_num(b_raw, nan=0.0).astype(np.float32)
 
@@ -251,6 +345,31 @@ def load_worm_data(
         "h5_path": str(path),
         "worm_id": worm_id,
     }
+
+
+def build_joint_state(
+    u: np.ndarray,
+    b: Optional[np.ndarray],
+    b_mask: Optional[np.ndarray],
+    include_beh: bool = True,
+) -> Tuple[np.ndarray, Optional[np.ndarray], int, int]:
+    """Build joint state ``x = [u, b]`` and corresponding mask.
+
+    Returns
+    -------
+    x      : (T, N+L) float32  joint state
+    x_mask : (T, L) float32 or None   mask for behaviour columns only
+    n_neural : int
+    n_beh    : int
+    """
+    n_neural = u.shape[1]
+    if include_beh and b is not None:
+        n_beh = b.shape[1]
+        x = np.concatenate([u, b], axis=1).astype(np.float32)
+        x_mask = b_mask if b_mask is not None else np.ones_like(b)
+        return x, x_mask, n_neural, n_beh
+    else:
+        return u.astype(np.float32), None, n_neural, 0
 
 
 def discover_worm_files(h5_dir: str) -> List[str]:

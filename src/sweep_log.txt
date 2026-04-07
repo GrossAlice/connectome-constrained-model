@@ -1,0 +1,308 @@
+nohup: ignoring input
+
+======================================================================
+Stage-2 Constraint-Feature Sweep
+  Worms:      ['2022-08-02-01']
+  Conditions: ['baseline', 'T2_linear_syn', 'T5_poly2', 'T5_poly3', 'T7_beh_cap_0.01', 'T7_beh_cap_0.1', 'T9_noise_rank5', 'T9_noise_rank10', 'coupling_gate', 'coupling_gate_reg0.1', 'per_neuron_tau', 'lowrank_r5', 'lowrank_r10', 'combo_lin_gate', 'combo_lin_poly2_noise5']
+  Total runs: 15
+  Epochs:     30
+  CV folds:   2
+  LOO subset: 8
+  Output:     output_plots/stage2/constraint_feature_sweep
+======================================================================
+
+
+######################################################################
+  [1/15] worm=2022-08-02-01  cond=baseline
+######################################################################
+
+[Stage2][subset_connectome] new='(123, 123)' original='(302, 302)'
+[Stage2][subset_connectome] new='(123, 123)' original='(302, 302)'
+[Stage2][subset_connectome] new='(123, 123)' original='(302, 302)'
+[Stage2][nt_sign_loaded] excitatory=60 inhibitory=23
+[Stage2][behaviour_truncated] kept=6 original=15
+[Stage2][motor_neurons_mapped] mapped=32 total=140
+
+============================================================
+[Stage2-CV] 2-fold temporal cross-validation
+[Stage2-CV] T=1600, N=123, epochs/fold=30
+  fold 0: test=[1, 801)  (800 frames)
+  fold 1: test=[801, 1600)  (799 frames)
+============================================================
+
+[Stage2][behaviour_all_neurons] r2=[0.6567197427039704, 0.1793700343791672, 0.31459748879394833, 0.4166216658247871, 0.1963194978306344, 0.16469778961665205]
+
+============================================================
+[Stage2-CV] Fold 1/2  test=[1,801)  (800 frames held out)
+============================================================
+[fold 0] training on 799/1599 frames
+[init] lambda_u (OLS): mean=0.1401, min=0.1010, max=0.3508
+[init] I0 (OLS): mean=-0.0018, min=-0.0231, max=0.0120
+[init] reversals: E_exc=2.3019, E_inh=-1.2633, E_dcv=-0.0008
+  boost=37.04
+[init] network_scale (OLS): AR1_rms=0.3554  net_rms=0.1191 (34%)
+[init]   G: β=6.0477, RMS=0.0888 (25% of AR1)
+[init]   a_sv: β=0.0009 → applied to W_sv, RMS=0.0711 (20% of AR1)
+[init]   a_dcv: β=0.0005 → applied to W_dcv, RMS=0.0355 (10% of AR1)
+  [behaviour-decoder/train] ridge-CV linear model fitted: 289 features → 6 modes (1600 valid frames, median λ=1797.404)
+  [behaviour-decoder/init] MLP decoder (289→128→128→6, 54,918 params, 1600 valid frames)
+[fold 0] Epoch 1/30: dyn=4.6144  total=40.3778  roll=24.1569  loo=10.4212  beh=11.7914
+[fold 0] Epoch 10/30: dyn=4.2092  total=49.4833  roll=13.8122  loo=30.6035  beh=8.5405
+[fold 0] Epoch 20/30: dyn=3.8604  total=31.1375  roll=16.2941  loo=10.2749  beh=7.0519
+[fold 0] Epoch 30/30: dyn=3.5496  total=25.5496  roll=15.3673  loo=6.0387  beh=5.9216
+[fold 0] held-out MSE=0.156353  R² mean=0.6626  median=0.7356
+
+============================================================
+[Stage2-CV] Fold 2/2  test=[801,1600)  (799 frames held out)
+============================================================
+[fold 1] training on 800/1599 frames
+[init] lambda_u (OLS): mean=0.1401, min=0.1010, max=0.3508
+[init] I0 (OLS): mean=-0.0018, min=-0.0231, max=0.0120
+[init] reversals: E_exc=2.3019, E_inh=-1.2633, E_dcv=-0.0008
+  boost=37.04
+[init] network_scale (OLS): AR1_rms=0.3554  net_rms=0.1191 (34%)
+[init]   G: β=6.0477, RMS=0.0888 (25% of AR1)
+[init]   a_sv: β=0.0009 → applied to W_sv, RMS=0.0711 (20% of AR1)
+[init]   a_dcv: β=0.0005 → applied to W_dcv, RMS=0.0355 (10% of AR1)
+  [behaviour-decoder/train] ridge-CV linear model fitted: 289 features → 6 modes (1600 valid frames, median λ=1797.404)
+  [behaviour-decoder/init] MLP decoder (289→128→128→6, 54,918 params, 1600 valid frames)
+[fold 1] Epoch 1/30: dyn=5.6629  total=36.6691  roll=20.6589  loo=9.0716  beh=12.6944
+[fold 1] Epoch 10/30: dyn=5.2980  total=59.7223  roll=18.1326  loo=35.3804  beh=9.0688
+[fold 1] Epoch 20/30: dyn=4.9544  total=35.7280  roll=18.4627  loo=11.5636  beh=7.4447
+[fold 1] Epoch 30/30: dyn=4.6527  total=26.3287  roll=15.4519  loo=5.5991  beh=6.2327
+[fold 1] held-out MSE=0.135696  R² mean=0.6814  median=0.7437
+
+============================================================
+[Stage2-CV] Cross-validated one-step R² (2 folds)
+  mean  = 0.7106
+  median= 0.7682
+  std   = 0.2445
+  min   = -0.5808
+  max   = 0.9700
+  #negative = 2/123
+============================================================
+
+[Stage2-CV] Best fold = 1 (held-out MSE = 0.135696)
+[init] lambda_u (OLS): mean=0.1401, min=0.1010, max=0.3508
+[init] I0 (OLS): mean=-0.0018, min=-0.0231, max=0.0120
+[init] reversals: E_exc=2.3019, E_inh=-1.2633, E_dcv=-0.0008
+  boost=37.04
+[init] network_scale (OLS): AR1_rms=0.3554  net_rms=0.1191 (34%)
+[init]   G: β=6.0477, RMS=0.0888 (25% of AR1)
+[init]   a_sv: β=0.0009 → applied to W_sv, RMS=0.0711 (20% of AR1)
+[init]   a_dcv: β=0.0005 → applied to W_dcv, RMS=0.0355 (10% of AR1)
+
+============================================================
+[Stage2-CV] Cross-validated LOO (2 folds, 8 neurons) — BATCHED
+============================================================
+[init] I0 (OLS): mean=-0.0018, min=-0.0231, max=0.0120
+[init] reversals: E_exc=2.3019, E_inh=-1.2633, E_dcv=-0.0008
+  boost=37.04
+[init] network_scale (OLS): AR1_rms=0.3554  net_rms=0.1191 (34%)
+[init]   G: β=6.0477, RMS=0.0888 (25% of AR1)
+[init]   a_sv: β=0.0009 → applied to W_sv, RMS=0.0711 (20% of AR1)
+[init]   a_dcv: β=0.0005 → applied to W_dcv, RMS=0.0355 (10% of AR1)
+[Stage2-CV] LOO fold 1/2 done (test=[1,801), 8 neurons)
+[init] I0 (OLS): mean=-0.0018, min=-0.0231, max=0.0120
+[init] reversals: E_exc=2.3019, E_inh=-1.2633, E_dcv=-0.0008
+  boost=37.04
+[init] network_scale (OLS): AR1_rms=0.3554  net_rms=0.1191 (34%)
+[init]   G: β=6.0477, RMS=0.0888 (25% of AR1)
+[init]   a_sv: β=0.0009 → applied to W_sv, RMS=0.0711 (20% of AR1)
+[init]   a_dcv: β=0.0005 → applied to W_dcv, RMS=0.0355 (10% of AR1)
+[Stage2-CV] LOO fold 2/2 done (test=[801,1600), 8 neurons)
+
+============================================================
+[Stage2-CV] Cross-validated LOO R² (2 folds)
+  mean  = 0.0846
+  median= 0.0383
+  std   = 0.1477
+  min   = 0.0009
+  max   = 0.4712
+  #negative = 0/8
+============================================================
+[Stage2-CV] Windowed LOO R² (window=50)
+  mean  = 0.0851
+  median= 0.0387
+[Stage2-CV] CV predictions saved to output_plots/stage2/constraint_feature_sweep/2022-08-02-01_baseline/cv_onestep.npz
+[Stage2][loo_start] n_neurons=8 n_samples=0 stochastic=False window_size=50 windowed=True
+[Stage2][loo_batched_done] n_neurons=8 variant='deterministic' warmup_steps=40
+[Stage2][loo_batched_done] n_neurons=8 variant='windowed'
+[Stage2][loo_progress] done=1 name='ASGL' neuron=3 r2=0.033728301255402715 r2_windowed=0.040602938623492624 total=8
+[Stage2][loo_progress] done=2 name='MI' neuron=112 r2=0.0006899510387011754 r2_windowed=0.0626864271187848 total=8
+[Stage2][loo_progress] done=3 name='ASGR' neuron=80 r2=0.0431481558286404 r2_windowed=0.03707712054447854 total=8
+[Stage2][loo_progress] done=4 name='OLQDL' neuron=121 r2=0.010088053993057122 r2_windowed=-0.016937446989202964 total=8
+[Stage2][loo_progress] done=5 name='M5' neuron=38 r2=0.06977292311976946 r2_windowed=0.03247699223134004 total=8
+[Stage2][loo_progress] done=6 name='RIFL' neuron=35 r2=0.005006263839211655 r2_windowed=-0.011149043953755156 total=8
+[Stage2][loo_progress] done=7 name='RIBL' neuron=36 r2=0.04418224596488041 r2_windowed=0.06481948026103879 total=8
+[Stage2][loo_progress] done=8 name='RIVL' neuron=31 r2=0.4720138910532652 r2_windowed=0.47320976649322266 total=8
+
+Tag                                       1-step  LOO-med   LOO-w  #pos   time
+------------------------------------------------------------------------------
+2022-08-02-01_baseline                    0.7682   0.0383  0.0387     8   1193s
+
+######################################################################
+  [2/15] worm=2022-08-02-01  cond=T2_linear_syn
+######################################################################
+
+[Stage2][subset_connectome] new='(123, 123)' original='(302, 302)'
+[Stage2][subset_connectome] new='(123, 123)' original='(302, 302)'
+[Stage2][subset_connectome] new='(123, 123)' original='(302, 302)'
+[Stage2][nt_sign_loaded] excitatory=60 inhibitory=23
+[Stage2][behaviour_truncated] kept=6 original=15
+[Stage2][motor_neurons_mapped] mapped=32 total=140
+
+============================================================
+[Stage2-CV] 2-fold temporal cross-validation
+[Stage2-CV] T=1600, N=123, epochs/fold=30
+  fold 0: test=[1, 801)  (800 frames)
+  fold 1: test=[801, 1600)  (799 frames)
+============================================================
+
+[Stage2][behaviour_all_neurons] r2=[0.6567197427039704, 0.1793700343791672, 0.31459748879394833, 0.4166216658247871, 0.1963194978306344, 0.16469778961665205]
+
+============================================================
+[Stage2-CV] Fold 1/2  test=[1,801)  (800 frames held out)
+============================================================
+[fold 0] training on 799/1599 frames
+[init] lambda_u (OLS): mean=0.1401, min=0.1010, max=0.3508
+[init] I0 (OLS): mean=-0.0018, min=-0.0231, max=0.0120
+[init] reversals: E_exc=2.3019, E_inh=-1.2633, E_dcv=-0.0008
+  boost=18.25
+[init] network_scale (OLS): AR1_rms=0.3554  net_rms=0.1192 (34%)
+[init]   G: β=2.4215, RMS=0.0355 (10% of AR1)
+[init]   a_sv: β=0.0013 → applied to W_sv, RMS=0.0711 (20% of AR1)
+[init]   a_dcv: β=0.0056 → applied to W_dcv, RMS=0.0888 (25% of AR1)
+  [behaviour-decoder/train] ridge-CV linear model fitted: 289 features → 6 modes (1600 valid frames, median λ=1797.404)
+  [behaviour-decoder/init] MLP decoder (289→128→128→6, 54,918 params, 1600 valid frames)
+[fold 0] Epoch 1/30: dyn=3.7525  total=769.8848  roll=723.6591  loo=41.1605  beh=13.0652
+[fold 0] Epoch 10/30: dyn=3.6948  total=357.4438  roll=304.7857  loo=48.0174  beh=9.4051
+[fold 0] Epoch 20/30: dyn=3.5914  total=349.4485  roll=331.0253  loo=14.0172  beh=8.1014
+[fold 0] Epoch 30/30: dyn=3.5024  total=42.0368  roll=27.1438  loo=10.6657  beh=7.2107
+[fold 0] held-out MSE=0.151799  R² mean=0.6950  median=0.7559
+
+============================================================
+[Stage2-CV] Fold 2/2  test=[801,1600)  (799 frames held out)
+============================================================
+[fold 1] training on 800/1599 frames
+[init] lambda_u (OLS): mean=0.1401, min=0.1010, max=0.3508
+[init] I0 (OLS): mean=-0.0018, min=-0.0231, max=0.0120
+[init] reversals: E_exc=2.3019, E_inh=-1.2633, E_dcv=-0.0008
+  boost=18.25
+[init] network_scale (OLS): AR1_rms=0.3554  net_rms=0.1192 (34%)
+[init]   G: β=2.4215, RMS=0.0355 (10% of AR1)
+[init]   a_sv: β=0.0013 → applied to W_sv, RMS=0.0711 (20% of AR1)
+[init]   a_dcv: β=0.0056 → applied to W_dcv, RMS=0.0888 (25% of AR1)
+  [behaviour-decoder/train] ridge-CV linear model fitted: 289 features → 6 modes (1600 valid frames, median λ=1797.404)
+  [behaviour-decoder/init] MLP decoder (289→128→128→6, 54,918 params, 1600 valid frames)
+[fold 1] Epoch 1/30: dyn=5.4124  total=466.4164  roll=397.4778  loo=62.2626  beh=12.5728
+[fold 1] Epoch 10/30: dyn=5.2646  total=118.9663  roll=90.8583  loo=21.9582  beh=8.8004
+[fold 1] Epoch 20/30: dyn=5.1534  total=199.7757  roll=153.3390  loo=40.5632  beh=7.1597
+[fold 1] Epoch 30/30: dyn=5.0820  total=138.5665  roll=97.0451  loo=35.8368  beh=5.9920
+[fold 1] held-out MSE=0.121818  R² mean=0.7414  median=0.7764
+
+============================================================
+[Stage2-CV] Cross-validated one-step R² (2 folds)
+  mean  = 0.7496
+  median= 0.8013
+  std   = 0.1792
+  min   = 0.0544
+  max   = 0.9743
+  #negative = 0/123
+============================================================
+
+[Stage2-CV] Best fold = 1 (held-out MSE = 0.121818)
+[init] lambda_u (OLS): mean=0.1401, min=0.1010, max=0.3508
+[init] I0 (OLS): mean=-0.0018, min=-0.0231, max=0.0120
+[init] reversals: E_exc=2.3019, E_inh=-1.2633, E_dcv=-0.0008
+  boost=18.25
+[init] network_scale (OLS): AR1_rms=0.3554  net_rms=0.1192 (34%)
+[init]   G: β=2.4215, RMS=0.0355 (10% of AR1)
+[init]   a_sv: β=0.0013 → applied to W_sv, RMS=0.0711 (20% of AR1)
+[init]   a_dcv: β=0.0056 → applied to W_dcv, RMS=0.0888 (25% of AR1)
+
+============================================================
+[Stage2-CV] Cross-validated LOO (2 folds, 8 neurons) — BATCHED
+============================================================
+[init] I0 (OLS): mean=-0.0018, min=-0.0231, max=0.0120
+[init] reversals: E_exc=2.3019, E_inh=-1.2633, E_dcv=-0.0008
+  boost=18.25
+[init] network_scale (OLS): AR1_rms=0.3554  net_rms=0.1192 (34%)
+[init]   G: β=2.4215, RMS=0.0355 (10% of AR1)
+[init]   a_sv: β=0.0013 → applied to W_sv, RMS=0.0711 (20% of AR1)
+[init]   a_dcv: β=0.0056 → applied to W_dcv, RMS=0.0888 (25% of AR1)
+[Stage2-CV] LOO fold 1/2 done (test=[1,801), 8 neurons)
+[init] I0 (OLS): mean=-0.0018, min=-0.0231, max=0.0120
+[init] reversals: E_exc=2.3019, E_inh=-1.2633, E_dcv=-0.0008
+  boost=18.25
+[init] network_scale (OLS): AR1_rms=0.3554  net_rms=0.1192 (34%)
+[init]   G: β=2.4215, RMS=0.0355 (10% of AR1)
+[init]   a_sv: β=0.0013 → applied to W_sv, RMS=0.0711 (20% of AR1)
+[init]   a_dcv: β=0.0056 → applied to W_dcv, RMS=0.0888 (25% of AR1)
+[Stage2-CV] LOO fold 2/2 done (test=[801,1600), 8 neurons)
+
+============================================================
+[Stage2-CV] Cross-validated LOO R² (2 folds)
+  mean  = 0.0554
+  median= 0.0228
+  std   = 0.0871
+  min   = 0.0020
+  max   = 0.2791
+  #negative = 0/8
+============================================================
+[Stage2-CV] Windowed LOO R² (window=50)
+  mean  = 0.0502
+  median= 0.0203
+[Stage2-CV] CV predictions saved to output_plots/stage2/constraint_feature_sweep/2022-08-02-01_T2_linear_syn/cv_onestep.npz
+[Stage2][loo_start] n_neurons=8 n_samples=0 stochastic=False window_size=50 windowed=True
+[Stage2][loo_batched_done] n_neurons=8 variant='deterministic' warmup_steps=40
+[Stage2][loo_batched_done] n_neurons=8 variant='windowed'
+[Stage2][loo_progress] done=1 name='ASGL' neuron=3 r2=0.033442173004791576 r2_windowed=0.011051663606385098 total=8
+[Stage2][loo_progress] done=2 name='MI' neuron=112 r2=0.0021156883181531194 r2_windowed=0.0635317896885439 total=8
+[Stage2][loo_progress] done=3 name='ASGR' neuron=80 r2=0.0423976375546512 r2_windowed=0.02035647684591424 total=8
+[Stage2][loo_progress] done=4 name='OLQDL' neuron=121 r2=0.00570874635334595 r2_windowed=-0.018568853218443593 total=8
+[Stage2][loo_progress] done=5 name='M5' neuron=38 r2=0.06600927906151821 r2_windowed=0.02113409384189957 total=8
+[Stage2][loo_progress] done=6 name='RIFL' neuron=35 r2=0.0024174197898680916 r2_windowed=-0.021295994886904035 total=8
+[Stage2][loo_progress] done=7 name='RIBL' neuron=36 r2=0.01272004700836038 r2_windowed=0.03463872047161487 total=8
+[Stage2][loo_progress] done=8 name='RIVL' neuron=31 r2=0.2789283836054315 r2_windowed=0.2951282040668105 total=8
+
+Tag                                       1-step  LOO-med   LOO-w  #pos   time
+------------------------------------------------------------------------------
+2022-08-02-01_baseline                    0.7682   0.0383  0.0387     8   1193s
+2022-08-02-01_T2_linear_syn               0.8013   0.0228  0.0203     8   1126s
+
+######################################################################
+  [3/15] worm=2022-08-02-01  cond=T5_poly2
+######################################################################
+
+[Stage2][subset_connectome] new='(123, 123)' original='(302, 302)'
+[Stage2][subset_connectome] new='(123, 123)' original='(302, 302)'
+[Stage2][subset_connectome] new='(123, 123)' original='(302, 302)'
+[Stage2][nt_sign_loaded] excitatory=60 inhibitory=23
+[Stage2][behaviour_truncated] kept=6 original=15
+[Stage2][motor_neurons_mapped] mapped=32 total=140
+
+============================================================
+[Stage2-CV] 2-fold temporal cross-validation
+[Stage2-CV] T=1600, N=123, epochs/fold=30
+  fold 0: test=[1, 801)  (800 frames)
+  fold 1: test=[801, 1600)  (799 frames)
+============================================================
+
+[Stage2][behaviour_all_neurons] r2=[0.6567197427039704, 0.1793700343791672, 0.31459748879394833, 0.4166216658247871, 0.1963194978306344, 0.16469778961665205]
+
+============================================================
+[Stage2-CV] Fold 1/2  test=[1,801)  (800 frames held out)
+============================================================
+[fold 0] training on 799/1599 frames
+[init] lambda_u (OLS): mean=0.1401, min=0.1010, max=0.3508
+[init] I0 (OLS): mean=-0.0018, min=-0.0231, max=0.0120
+[init] reversals: E_exc=2.3019, E_inh=-1.2633, E_dcv=-0.0008
+  boost=37.04
+[init] network_scale (OLS): AR1_rms=0.3554  net_rms=0.1191 (34%)
+[init]   G: β=6.0477, RMS=0.0888 (25% of AR1)
+[init]   a_sv: β=0.0009 → applied to W_sv, RMS=0.0711 (20% of AR1)
+[init]   a_dcv: β=0.0005 → applied to W_dcv, RMS=0.0355 (10% of AR1)
+  [behaviour-decoder/train] ridge-CV linear model fitted: 289 features → 6 modes (1600 valid frames, median λ=1797.404)
+  [behaviour-decoder/init] MLP decoder (289→128→128→6, 54,918 params, 1600 valid frames)
+[fold 0] Epoch 1/30: dyn=4.6144  total=47.1234  roll=20.2722  loo=20.9673  beh=12.6329
