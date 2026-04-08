@@ -3,7 +3,7 @@
 
 Runs stage2 with k-fold temporal CV on 2 worms, sweeping over:
   1. baseline        — current defaults (5τ sv, 5τ dcv, nonlinear, edge G)
-  2. linear          — linear_chemical_synapses=True
+  2. linear          — chemical_synapse_activation='identity'
   3. no_kernels      — r_sv=0, r_dcv=0 (gap junctions + AR1 only)
   4. no_kernels_lin  — gap-only + linear
   5. 2tau            — 2 tau_sv, 2 tau_dcv
@@ -42,7 +42,6 @@ def _make_conditions() -> OrderedDict:
 
     # 0. Baseline — current best defaults
     C["baseline"] = dict(
-        linear_chemical_synapses=False,
         edge_specific_G=True,
         learn_W_sv=True,
         learn_W_dcv=True,
@@ -57,7 +56,7 @@ def _make_conditions() -> OrderedDict:
     )
 
     # 1. Linear chemical synapses
-    C["linear"] = {**C["baseline"], "linear_chemical_synapses": True}
+    C["linear"] = {**C["baseline"], "chemical_synapse_activation": "identity"}
 
     # 2. No kernel dynamics — gap junctions + AR(1) only
     C["no_kernels"] = {
@@ -71,7 +70,7 @@ def _make_conditions() -> OrderedDict:
     }
 
     # 3. No kernels + linear
-    C["no_kernels_lin"] = {**C["no_kernels"], "linear_chemical_synapses": True}
+    C["no_kernels_lin"] = {**C["no_kernels"], "chemical_synapse_activation": "identity"}
 
     # 4. 2-tau model (faster kernels + slow kernel each channel)
     C["2tau"] = {
@@ -83,7 +82,7 @@ def _make_conditions() -> OrderedDict:
     }
 
     # 5. 2-tau + linear
-    C["2tau_linear"] = {**C["2tau"], "linear_chemical_synapses": True}
+    C["2tau_linear"] = {**C["2tau"], "chemical_synapse_activation": "identity"}
 
     # 6. Single tau per channel
     C["1tau"] = {
@@ -95,7 +94,7 @@ def _make_conditions() -> OrderedDict:
     }
 
     # 7. 1-tau + linear
-    C["1tau_linear"] = {**C["1tau"], "linear_chemical_synapses": True}
+    C["1tau_linear"] = {**C["1tau"], "chemical_synapse_activation": "identity"}
 
     # 8. Scalar G (instead of edge-specific)
     C["scalar_G"] = {**C["baseline"], "edge_specific_G": False}
@@ -123,7 +122,7 @@ def _make_conditions() -> OrderedDict:
     # 11. LOO aux + linear + 2tau  (combo of promising ideas)
     C["combo_lin_2tau_loo"] = {
         **C["2tau"],
-        "linear_chemical_synapses": True,
+        "chemical_synapse_activation": "identity",
         "loo_aux_weight": 1.0,
         "loo_aux_steps": 30,
         "loo_aux_neurons": 32,
@@ -187,7 +186,6 @@ def run_one(
     # Skip posture video & free-run stochastic to save time
     kw["make_posture_video"] = False
     kw["n_freerun_samples"] = 0
-    kw["n_sample_trajectories"] = 0
 
     cfg = make_config(worm_h5, **kw)
     # Monkey-patch skip_final_eval (not in dataclass but checked by train code)

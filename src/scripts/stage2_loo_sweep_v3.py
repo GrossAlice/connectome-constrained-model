@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Stage-2 LOO sweep v3 — coupling regularisation, coupling gate, learned
-reversals, per-neuron tau scale.
+"""Stage-2 LOO sweep v3 — coupling regularisation, learned reversals,
+per-neuron tau scale.
 
 Motivated by the neural-activity-decoder analysis:
   • Ridge self-only R²=0.84, adding linear neighbours HURTS (Δ=−0.13)
@@ -15,13 +15,10 @@ Conditions (all use v5 defaults as base):
   2. int_l2_10       — interaction_l2=0.1
   3. ridge_W         — ridge_W_sv=0.1, ridge_W_dcv=0.1 (shrink synaptic weights)
   4. G_reg           — G_reg=0.1 (anchor gap conductances)
-  5. gate            — coupling_gate=True (per-neuron gate on coupling)
-  6. gate_int_l2     — coupling_gate + interaction_l2=0.1
-  7. learn_E         — learn_reversals=True (conductance-based gating via E−u)
-  8. gate_E          — coupling_gate + learn_reversals
-  9. tau_scale       — per_neuron_tau_scale=True
- 10. gate_E_tau      — gate + E + tau_scale (full structural)
- 11. kitchen_sink    — gate + E + tau_scale + int_l2=0.1 + ridge_W=0.1
+  5. learn_E         — learn_reversals=True (conductance-based gating via E−u)
+  6. tau_scale       — per_neuron_tau_scale=True
+  7. E_tau           — E + tau_scale (full structural)
+  8. kitchen_sink    — E + tau_scale + int_l2=0.1 + ridge_W=0.1
 
 Usage:
     python -u -m scripts.stage2_loo_sweep_v3 \
@@ -48,7 +45,6 @@ def _v5_base() -> dict:
     """v5 defaults: the current best configuration."""
     return dict(
         # Dynamics
-        linear_chemical_synapses=False,
         edge_specific_G=False,
         learn_W_sv=True,
         learn_W_dcv=True,
@@ -74,10 +70,8 @@ def _v5_base() -> dict:
         ridge_W_dcv=0.0,
         G_reg=0.0,
         # New features (off by default)
-        coupling_gate=False,
         per_neuron_tau_scale=False,
         learn_reversals=False,
-        coupling_gate_reg=0.0,
     )
 
 
@@ -100,27 +94,9 @@ def _make_conditions() -> OrderedDict:
     # 4. Anchor gap junction conductances to init
     C["G_reg"] = {**B(), "G_reg": 0.1}
 
-    # --- Structural: coupling gate ---
-    # 5. Per-neuron coupling gate (neurons learn to accept/reject coupling)
-    C["gate"] = {**B(), "coupling_gate": True}
-
-    # 6. Gate + interaction L2 (gate selects, L2 shrinks remaining)
-    C["gate_int_l2"] = {
-        **B(),
-        "coupling_gate": True,
-        "interaction_l2": 0.1,
-    }
-
     # --- Structural: learned reversals (conductance-based gating) ---
     # 7. Learn E_sv per neuron: g*(E_i − u_i) → coupling shuts off when E≈u
     C["learn_E"] = {**B(), "learn_reversals": True}
-
-    # 8. Gate + learned reversals (two gating mechanisms)
-    C["gate_E"] = {
-        **B(),
-        "coupling_gate": True,
-        "learn_reversals": True,
-    }
 
     # --- Structural: per-neuron tau scale ---
     # 9. Per-neuron tau scale: tau_eff[j,r] = tau[r] * exp(s_j)
@@ -128,10 +104,9 @@ def _make_conditions() -> OrderedDict:
     C["tau_scale"] = {**B(), "per_neuron_tau_scale": True}
 
     # --- Combinations ---
-    # 10. Full structural (gate + E + tau_scale)
-    C["gate_E_tau"] = {
+    # 10. Full structural (E + tau_scale)
+    C["E_tau"] = {
         **B(),
-        "coupling_gate": True,
         "learn_reversals": True,
         "per_neuron_tau_scale": True,
     }
@@ -139,7 +114,6 @@ def _make_conditions() -> OrderedDict:
     # 11. Kitchen sink: structural + regularisation
     C["kitchen_sink"] = {
         **B(),
-        "coupling_gate": True,
         "learn_reversals": True,
         "per_neuron_tau_scale": True,
         "interaction_l2": 0.1,
@@ -198,7 +172,6 @@ def run_one(
     # Skip expensive eval extras
     kw["make_posture_video"] = False
     kw["n_freerun_samples"] = 0
-    kw["n_sample_trajectories"] = 0
 
     cfg = make_config(worm_h5, **kw)
     cfg.skip_final_eval = True
@@ -236,14 +209,6 @@ def run_one(
             summary["loo_q25"] = round(float(np.percentile(valid, 25)), 4) if len(valid) else None
             summary["loo_q75"] = round(float(np.percentile(valid, 75)), 4) if len(valid) else None
 
-        # Coupling gate statistics (if present)
-        gate_vals = result.get("coupling_gate_values")
-        if gate_vals is not None:
-            summary["gate_mean"] = round(float(gate_vals.mean()), 4)
-            summary["gate_min"] = round(float(gate_vals.min()), 4)
-            summary["gate_max"] = round(float(gate_vals.max()), 4)
-            summary["gate_std"] = round(float(gate_vals.std()), 4)
-
     return summary
 
 
@@ -276,7 +241,7 @@ def main():
 
     n_total = len(worm_paths) * len(conditions)
     print(f"\n{'='*72}")
-    print(f"Stage-2 LOO Sweep v3 — coupling gate / reversals / tau-scale / reg")
+    print(f"Stage-2 LOO Sweep v3 — reversals / tau-scale / reg")
     print(f"  Worms:      {args.worms}")
     print(f"  Conditions: {list(conditions.keys())}")
     print(f"  Total runs: {n_total}")
@@ -349,7 +314,7 @@ def main():
 
     # Final
     print(f"\n{'='*72}")
-    print(f"FINAL SUMMARY — v3 (coupling gate / reversals / tau-scale / reg)")
+    print(f"FINAL SUMMARY — v3 (reversals / tau-scale / reg)")
     print(f"{'='*72}")
     _print_summary_table(all_results)
 
@@ -361,7 +326,7 @@ def main():
 def _print_summary_table(results: list[dict]):
     header = (
         f"{'Condition':<18} {'1-step':>7} {'LOO-med':>8} {'LOO-w':>7} "
-        f"{'#pos':>5} {'gate':>6} {'time':>6}"
+        f"{'#pos':>5} {'time':>6}"
     )
     print(f"\n{header}")
     print("-" * len(header))
@@ -374,14 +339,12 @@ def _print_summary_table(results: list[dict]):
         loo_med = r.get("cv_loo_r2_median")
         loo_w = r.get("cv_loo_r2_windowed_median")
         n_pos = r.get("loo_n_positive", "?")
-        gate_m = r.get("gate_mean")
         elapsed = r.get("elapsed_s", 0)
         parts = [f"{cond:<18}"]
         parts.append(f"{onestep:>7.4f}" if onestep is not None else f"{'N/A':>7}")
         parts.append(f"{loo_med:>8.4f}" if loo_med is not None else f"{'N/A':>8}")
         parts.append(f"{loo_w:>7.4f}" if loo_w is not None else f"{'N/A':>7}")
         parts.append(f"{n_pos:>5}")
-        parts.append(f"{gate_m:>6.3f}" if gate_m is not None else f"{'—':>6}")
         parts.append(f"{elapsed:>5.0f}s")
         print(" ".join(parts))
 

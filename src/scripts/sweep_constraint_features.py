@@ -8,11 +8,9 @@ but never actually swept.  Each condition toggles ONE feature from the
 current defaults so we can measure its isolated effect.
 
 Features tested (from config.py comments):
-  Test 2  — linear_chemical_synapses  (σ(u) → identity)
   Test 5  — graph_poly_order > 1      (multi-hop gap propagation)
   Test 7  — behavior_weight_cap > 0   (L∞ cap on behaviour weights)
   Test 9  — noise_corr_rank > 0       (low-rank correlated noise)
-  Extra   — coupling_gate             (per-neuron coupling gate g_i)
   Extra   — per_neuron_tau_scale      (per-neuron tau multiplier)
   Extra   — lowrank_rank > 0          (non-connectome low-rank coupling)
 
@@ -51,10 +49,6 @@ def _make_conditions() -> OrderedDict:
     # ── 0. Baseline — current defaults ────────────────────────────────────
     C["baseline"] = {}
 
-    # ── Test 2: linear chemical synapses ──────────────────────────────────
-    # Config comment: "Ridge ≫ MLP ⇒ σ(u) in linear regime"
-    C["T2_linear_syn"] = dict(linear_chemical_synapses=True)
-
     # ── Test 5: multi-hop gap junction propagation ────────────────────────
     # Config comment: "lag plateau at K≈5-10 → multi-hop helps"
     C["T5_poly2"] = dict(graph_poly_order=2)
@@ -70,12 +64,6 @@ def _make_conditions() -> OrderedDict:
     C["T9_noise_rank5"]  = dict(noise_corr_rank=5)
     C["T9_noise_rank10"] = dict(noise_corr_rank=10)
 
-    # ── Coupling gate (per-neuron) ────────────────────────────────────────
-    # Config comment: "Neurons where neighbors hurt can close their gate"
-    C["coupling_gate"]        = dict(coupling_gate=True, coupling_gate_init=0.0)
-    C["coupling_gate_reg0.1"] = dict(coupling_gate=True, coupling_gate_init=0.0,
-                                     coupling_gate_reg=0.1)
-
     # ── Coupling dropout (regularise the connectome path) ─────────────────
     # Randomly zeros I_coupling per neuron during training.  Forces the model
     # to be robust to missing connectome inputs.
@@ -88,16 +76,9 @@ def _make_conditions() -> OrderedDict:
     C["lowrank_r5"]  = dict(lowrank_rank=5)
     C["lowrank_r10"] = dict(lowrank_rank=10)
 
-    # ── Combo: linear + coupling gate (both should help per comments) ─────
-    C["combo_lin_gate"] = dict(
-        linear_chemical_synapses=True,
-        coupling_gate=True,
-        coupling_gate_init=0.0,
-    )
-
     # ── Combo: linear + poly2 + noise rank 5 ─────────────────────────────
     C["combo_lin_poly2_noise5"] = dict(
-        linear_chemical_synapses=True,
+        chemical_synapse_activation="identity",
         graph_poly_order=2,
         noise_corr_rank=5,
     )
@@ -140,7 +121,6 @@ def run_one(
     # Speed-up: skip posture video / stochastic plots
     kw["make_posture_video"] = False
     kw["n_freerun_samples"] = 0
-    kw["n_sample_trajectories"] = 0
     # Speed-up: disable LOO aux and rollout during training
     kw["loo_aux_neurons"] = 0
     kw["loo_aux_weight"] = 0

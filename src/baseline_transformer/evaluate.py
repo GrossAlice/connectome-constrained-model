@@ -240,7 +240,7 @@ def loo_forward_simulate_single_windowed(
 ) -> np.ndarray:
     """LOO forward simulation with periodic re-seeding.
 
-    Matches ``stage2.evaluate.loo_forward_simulate_windowed`` semantics.
+    Matches ``stage2.evaluate.loo_forward_simulate_batched_windowed`` semantics.
     """
     device = next(model.parameters()).device
     T, D = x_gt.shape

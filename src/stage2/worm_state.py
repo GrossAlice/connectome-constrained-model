@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 
 from .config import Stage2PTConfig
-from .model import _reparam_fwd, _reparam_inv, _G_LO
+from .model import _reparam_fwd, _reparam_inv, _G_LO, _G_MAX, _G_INIT
 
 __all__ = ["WormState", "build_worm_states"]
 
@@ -22,7 +22,6 @@ class WormState(nn.Module):
 
         self.worm_id: str = worm_dict["worm_id"]
         self.dataset_type: str = worm_dict["dataset_type"]
-        self.has_stage1: bool = bool(worm_dict["has_stage1"])
         self.weight: float = float(worm_dict["weight"])
 
         T: int = int(worm_dict["T"])
@@ -37,7 +36,6 @@ class WormState(nn.Module):
         device = worm_dict["u"].device
 
         self.register_buffer("u_obs",     worm_dict["u"])           # (T, N)
-        self.register_buffer("obs_mask",  worm_dict["obs_mask"])    # (N,) bool
         self.register_buffer("obs_idx",   worm_dict["obs_idx"])     # (n_obs,) long
         self.register_buffer("unobs_idx", worm_dict["unobs_idx"])   # (n_unobs,) long
         self.register_buffer("val_mask",  worm_dict["val_mask"])    # (T,) bool
@@ -53,11 +51,6 @@ class WormState(nn.Module):
             self._log_sigma_u = None
             self.register_buffer("_sigma_u_buf", _sigma_u_init)     # (N,)
 
-        if worm_dict.get("u_var") is not None:
-            self.register_buffer("u_var", worm_dict["u_var"])       # (T, N)
-        else:
-            self.u_var: Optional[torch.Tensor] = None
-
         if worm_dict.get("behaviour") is not None:
             self.register_buffer("behaviour", worm_dict["behaviour"])
         else:
@@ -71,7 +64,6 @@ class WormState(nn.Module):
         # Per-worm G (lambda_u and I0 are shared on the model)
         self._per_worm_G: bool = bool(getattr(cfg, "per_worm_G", False))
         self._G_lo: float = _G_LO
-        from .model import _G_MAX, _G_INIT
         self._G_hi: Optional[float] = _G_MAX
 
         if self._per_worm_G:
@@ -140,8 +132,15 @@ class WormState(nn.Module):
         return self._sigma_u_buf
 
 
-    def assemble(self) -> torch.Tensor:
-        """Full (T, N_atlas) trajectory, differentiable through u_unobs (Step 1)."""
+    def assemble(self, detach: bool = False) -> torch.Tensor:
+        """Full (T, N_atlas) trajectory.
+
+        Parameters
+        ----------
+        detach : bool
+            If True, u_unobs is detached (Step 2 — model learning).
+            If False, gradient flows through u_unobs (Step 1 — trajectory inference).
+        """
         if not self._infer_unobserved:
             return self.u_obs
 
@@ -149,26 +148,12 @@ class WormState(nn.Module):
         device = self.u_obs.device
 
         if self._low_rank_unobs and self._low_rank_C is not None:
-            u_unobs = self._compute_low_rank_u_unobs()  # (T, N_unobs)
+            u_unobs = self._compute_low_rank_u_unobs()
         else:
-            u_unobs = self.u_unobs                       # (T, N_unobs)
+            u_unobs = self.u_unobs
 
-        zeros = torch.zeros(T, N, device=device, dtype=torch.float32)
-        u_unobs_full = zeros.index_copy(1, self.unobs_idx, u_unobs)
-        return self.u_obs + u_unobs_full
-
-    def assemble_detached(self) -> torch.Tensor:
-        """Full (T, N_atlas) trajectory with u_unobs detached (Step 2)."""
-        if not self._infer_unobserved:
-            return self.u_obs
-
-        T, N = self.T, self.N
-        device = self.u_obs.device
-
-        if self._low_rank_unobs and self._low_rank_C is not None:
-            u_unobs = self._compute_low_rank_u_unobs().detach()  # (T, N_unobs)
-        else:
-            u_unobs = self.u_unobs.detach()                       # (T, N_unobs)
+        if detach:
+            u_unobs = u_unobs.detach()
 
         zeros = torch.zeros(T, N, device=device, dtype=torch.float32)
         u_unobs_full = zeros.index_copy(1, self.unobs_idx, u_unobs)
@@ -221,7 +206,7 @@ class WormState(nn.Module):
         return (
             f"WormState(id={self.worm_id!r}, type={self.dataset_type!r}, "
             f"T={self.T}, N_obs={self.N_obs}, N_unobs={self.N_unobs}, "
-            f"stage1={self.has_stage1}, infer_unobs={self._infer_unobserved})"
+            f"infer_unobs={self._infer_unobserved})"
         )
 
 

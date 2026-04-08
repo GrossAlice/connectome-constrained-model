@@ -45,10 +45,19 @@ from stage2.io_h5 import load_data_pt
 from stage2.model import Stage2ModelPT
 from stage2.init_from_data import init_lambda_u, init_all_from_data
 from stage2.evaluate import (
-    loo_forward_simulate_windowed,
     loo_forward_simulate_batched_windowed,
     choose_loo_subset,
 )
+
+
+def loo_forward_simulate_windowed(model, u_all, held_out, gating, stim,
+                                  window_size=0, warmup_steps=0):
+    """Thin wrapper: single-neuron LOO via the batched function."""
+    result = loo_forward_simulate_batched_windowed(
+        model, u_all, [held_out], gating, stim,
+        window_size=window_size, warmup_steps=warmup_steps,
+    )
+    return result[held_out]
 from stage2.train import compute_dynamics_loss, snapshot_model_state
 
 
@@ -70,12 +79,15 @@ class JointMLP(nn.Module):
     """K*N → N joint MLP baseline."""
 
     def __init__(self, d_in: int, d_out: int,
-                 hidden: Tuple[int, ...] = (256,)):
+                 hidden: Tuple[int, ...] = (256,),
+                 dropout: float = 0.0):
         super().__init__()
         layers: list = []
         d = d_in
         for h in hidden:
             layers += [nn.Linear(d, h), nn.ReLU()]
+            if dropout > 0:
+                layers.append(nn.Dropout(dropout))
             d = h
         layers.append(nn.Linear(d, d_out))
         self.net = nn.Sequential(*layers)
@@ -1365,6 +1377,7 @@ def main():
     worm = Path(args.h5).stem
 
     # ── Build config & load data ──
+    # Use Stage2 defaults (sigmoid, 50ep, 3-fold CV, seed=42)
     cfg = make_config(
         args.h5,
         num_epochs=args.epochs,

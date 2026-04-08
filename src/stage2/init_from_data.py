@@ -104,17 +104,68 @@ def init_reversals(model: "Stage2ModelPT", u: torch.Tensor, baseline: torch.Tens
 
 # ── Connectivity-based weight initialisation ────────────────────────────
 
-def init_W_from_config(model: "Stage2ModelPT", cfg=None) -> None:
-    """No-op — kept for call-site compatibility.
+def _pairwise_abs_corr(u: torch.Tensor) -> torch.Tensor:
+    """Compute (N, N) pairwise |Pearson correlation| from neural traces.
 
-    Previously supported ``W_sv_init_mode`` and ``W_sv_normalize`` config
-    options.  Sweeps showed zero effect; the constructor's uniform default
-    is always used.
+    Parameters
+    ----------
+    u : (T, N) tensor of neural activity
+
+    Returns
+    -------
+    C : (N, N) symmetric matrix of absolute correlations
     """
-    pass
+    u_np = u.detach().cpu().float()
+    u_centered = u_np - u_np.mean(0, keepdim=True)
+    norms = u_centered.pow(2).sum(0).sqrt().clamp(min=1e-10)  # (N,)
+    C = (u_centered.T @ u_centered) / (norms.unsqueeze(1) * norms.unsqueeze(0))
+    return C.abs()
 
 
-def init_G_from_config(model: "Stage2ModelPT", cfg=None) -> None:
+def init_W_from_config(model: "Stage2ModelPT", cfg=None,
+                       u: Optional[torch.Tensor] = None) -> None:
+    """Apply correlation-weighted W initialisation for chemical synapses.
+
+    Modes (from ``cfg.W_init_mode``):
+
+    * ``uniform`` (default) — keep the constructor's constant W.
+    * ``corr_weighted`` — scale each edge's W by the empirical |corr(i,j)|,
+      so that functionally-coupled edges start with higher synaptic weight.
+    """
+    mode = str(getattr(cfg, "W_init_mode", "uniform")) if cfg else "uniform"
+    if mode == "uniform":
+        return
+    if mode != "corr_weighted" or u is None:
+        return
+
+    from .model import _reparam_inv
+    C = _pairwise_abs_corr(u).to(model.T_sv.device)
+
+    for attr in ("W_sv", "W_dcv"):
+        T_mat = getattr(model, f"T_{attr.split('_')[1]}")
+        mask = (T_mat > 0).float()
+        n_edges = mask.sum().item()
+        if n_edges == 0:
+            continue
+        # Scale current W values by relative |corr| (normalised to mean=1)
+        corr_edge = C * mask
+        mean_corr = corr_edge.sum() / max(n_edges, 1)
+        scale = torch.where(mask.bool(),
+                            corr_edge / mean_corr.clamp(min=1e-6),
+                            torch.ones_like(mask))
+        cur_W = getattr(model, attr)
+        new_W = (cur_W * scale).clamp(min=1e-6)
+        lo = getattr(model, f"_{attr}_lo")
+        hi = getattr(model, f"_{attr}_hi")
+        new_raw = _reparam_inv(new_W, lo, hi) * mask
+        with torch.no_grad():
+            getattr(model, f"_{attr}_raw").data.copy_(new_raw)
+        print(f"[init] {attr} (corr_weighted): mean_corr={mean_corr:.4f}, "
+              f"scale range=[{scale[mask.bool()].min():.2f}, {scale[mask.bool()].max():.2f}]")
+
+
+def init_G_from_config(model: "Stage2ModelPT", cfg=None,
+                       u: Optional[torch.Tensor] = None) -> None:
     """Apply connectivity-structure-based G initialisation for edge-specific G.
 
     Modes (from ``cfg.G_init_mode``):
@@ -122,6 +173,7 @@ def init_G_from_config(model: "Stage2ModelPT", cfg=None) -> None:
     * ``uniform`` (default) — keep the constructor's constant G.
     * ``log_counts`` — ``T_e·G = log₂(1+c)``.
     * ``sqrt_counts`` — ``T_e·G = √c``.
+    * ``corr_weighted`` — scale each edge's G by empirical |corr(i,j)|.
     """
     if not model.edge_specific_G:
         return  # scalar G has no mode switching
@@ -142,13 +194,44 @@ def init_G_from_config(model: "Stage2ModelPT", cfg=None) -> None:
         G_mat = torch.where(mask.bool(),
                             1.0 / safe_te.sqrt(),
                             torch.full_like(T_e, _G_INIT))
+    elif mode == "corr_weighted" and u is not None:
+        C = _pairwise_abs_corr(u).to(T_e.device)
+        corr_edge = C * mask
+        n_edges = mask.sum().item()
+        mean_corr = corr_edge.sum() / max(n_edges, 1)
+        # Scale default G by relative |corr| (normalised so mean=_G_INIT)
+        G_mat = torch.where(mask.bool(),
+                            _G_INIT * corr_edge / mean_corr.clamp(min=1e-6),
+                            torch.full_like(T_e, _G_INIT))
+        print(f"[init] G (corr_weighted): mean_corr={mean_corr:.4f}, "
+              f"G range=[{G_mat[mask.bool()].min():.4f}, {G_mat[mask.bool()].max():.4f}]")
     else:
         return
     G_mat = G_mat * mask
     G_raw = _reparam_inv(G_mat, model._G_lo, model._G_hi)
     with torch.no_grad():
         model._G_raw.data.copy_(G_raw)
-    print(f"[init] G ({mode}): mean(edges)={G_mat[mask.bool()].mean():.4f}")
+    if mode != "corr_weighted":  # corr_weighted already printed
+        print(f"[init] G ({mode}): mean(edges)={G_mat[mask.bool()].mean():.4f}")
+
+
+def init_corr_reg_mask(model: "Stage2ModelPT", u: torch.Tensor) -> None:
+    """Compute and register a correlation-based regularisation mask.
+
+    Stores ``_corr_reg_mask`` as a buffer on the model: an (N, N) matrix
+    with values ``(1 - |corr(i,j)|)`` for connected edges (any type) and
+    0 for non-edges.  Used by train.py when ``corr_reg_weight > 0`` to
+    penalise low-correlation edges more heavily.
+    """
+    C = _pairwise_abs_corr(u).to(model.T_sv.device)
+    # Any-type connectivity mask
+    any_conn = ((model.T_sv > 0) | (model.T_dcv > 0) | (model.T_e > 0)).float()
+    reg_mask = (1.0 - C) * any_conn
+    model.register_buffer("_corr_reg_mask", reg_mask, persistent=False)
+    n_edges = any_conn.sum().item()
+    mean_penalty = reg_mask.sum() / max(n_edges, 1)
+    print(f"[init] corr_reg_mask: {int(n_edges)} edges, "
+          f"mean penalty weight={mean_penalty:.3f}")
 
 
 def _collect_current_patterns(
@@ -228,7 +311,10 @@ def _apply_scales(
             if cur.numel() == 0:
                 continue
             from .model import _reparam_inv
-            model._G_raw.data.copy_(_reparam_inv(cur * b, model._G_lo, model._G_hi))
+            new_raw = _reparam_inv(cur * b, model._G_lo, model._G_hi)
+            if hasattr(model, "_G_mask"):
+                new_raw = new_raw * model._G_mask
+            model._G_raw.data.copy_(new_raw)
             print(f"[init]   G: \u03b2={b:.4f}, RMS={rms_after:.4f} ({frac:.0%} of AR1)")
         elif name in _AMP_TO_W:
             # Absorb the scale into W rather than collapsing a_sv/a_dcv
@@ -308,8 +394,12 @@ def init_network_scale(model: "Stage2ModelPT", u: torch.Tensor,
 
 
 def init_all_from_data(model: "Stage2ModelPT", u: torch.Tensor, cfg=None):
-    init_W_from_config(model, cfg)
-    init_G_from_config(model, cfg)
+    init_W_from_config(model, cfg, u=u)
+    init_G_from_config(model, cfg, u=u)
     baseline = init_I0(model, u)
     init_reversals(model, u, baseline, cfg)
     init_network_scale(model, u, cfg)
+    # Optionally pre-compute correlation-weighted regularisation mask
+    corr_reg = float(getattr(cfg, "corr_reg_weight", 0.0) or 0.0) if cfg else 0.0
+    if corr_reg > 0:
+        init_corr_reg_mask(model, u)

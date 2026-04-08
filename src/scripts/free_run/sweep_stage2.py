@@ -64,7 +64,6 @@ class SweepConfig:
     noise_corr_rank: int = 0
     lowrank_rank: int = 0
     graph_poly_order: int = 2
-    linear_chemical_synapses: bool = False
     coupling_gate: bool = True
     # Generation
     temperature: float = 1.0        # scale noise at inference time
@@ -187,7 +186,6 @@ def _train_stage2(
         grad_clip_norm=1.0,
         noise_corr_rank=sc.noise_corr_rank,
         lowrank_rank=sc.lowrank_rank,
-        linear_chemical_synapses=sc.linear_chemical_synapses,
         input_noise_sigma=sc.input_noise_sigma,
     )
     data = _s2_load_data(cfg)

@@ -34,7 +34,7 @@ sys.path.insert(0, str(ROOT))
 from atlas_transformer.config import AtlasTransformerConfig
 from atlas_transformer.model import build_atlas_model
 from atlas_transformer.dataset import load_atlas_worm_data
-from stage2.evaluate import _r2
+from stage2._utils import _r2
 from stage2.io_multi import _load_full_atlas
 
 

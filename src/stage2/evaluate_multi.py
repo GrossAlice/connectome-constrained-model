@@ -5,11 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
-from .evaluate import (
-    _get_clip_bounds,
-    _clamp,
-    _per_neuron_metrics,
-)
+from ._utils import _get_clip_bounds, _clamp, _per_neuron_metrics
 from .model import Stage2ModelPT
 from .worm_state import WormState
 
@@ -43,6 +39,7 @@ def _teacher_forced_prior_worm(
         I0  = model.I0.detach()          # shared on model, not per-worm
         G   = ws.G.detach() if ws.G is not None else None
         b   = ws.b.detach() if ws.b is not None else None
+        model.reset_lag_history()
         for t in range(1, T):
             g = ws.gating[t - 1]
             s = ws.stim[t - 1] if ws.stim is not None else None
@@ -75,6 +72,7 @@ def _loo_simulate_worm(
     s_dcv = torch.zeros(N, model.r_dcv, device=device, dtype=u_all.dtype)
 
     with torch.no_grad():
+        model.reset_lag_history()
         for t in range(T - 1):
             u_t      = u_all[t].clone()
             u_t[held_out] = u_pred[t]               # replace with recursive pred
@@ -115,7 +113,7 @@ def compute_onestep_worm(
         ``val_t``      (T_val,)    — evaluation time indices used
     """
     device  = next(model.parameters()).device
-    u       = ws.assemble_detached().to(device)  # (T, N_atlas)
+    u       = ws.assemble(detach=True).to(device)  # (T, N_atlas)
     prior_mu = _teacher_forced_prior_worm(model, ws, u)
 
     u_np  = u.cpu().numpy()
@@ -169,7 +167,7 @@ def run_loo_worm(
         ``val_t``    (T_val,)
     """
     device  = next(model.parameters()).device
-    u       = ws.assemble_detached().to(device)
+    u       = ws.assemble(detach=True).to(device)
     u_np    = u.cpu().numpy()
     N_atlas = u.shape[1]
     T       = u.shape[0]
@@ -227,7 +225,7 @@ def compute_freerun_worm(
         ``val_t``   (T_val,)
     """
     device = next(model.parameters()).device
-    u      = ws.assemble_detached().to(device)   # (T, N_atlas)
+    u      = ws.assemble(detach=True).to(device)   # (T, N_atlas)
     T, N   = u.shape
     lo, hi = _get_clip_bounds(model)
 
@@ -242,6 +240,7 @@ def compute_freerun_worm(
     s_dcv = torch.zeros(N, model.r_dcv, device=device, dtype=u.dtype)
 
     with torch.no_grad():
+        model.reset_lag_history()
         for t in range(1, T):
             g = ws.gating[t - 1]
             s = ws.stim[t - 1] if ws.stim is not None else None
@@ -309,7 +308,7 @@ def run_multi_worm_evaluation(
 
         obs = list(ws.obs_idx.cpu().numpy())
         if loo_subset_size > 0 and len(obs) > loo_subset_size:
-            u_full = ws.assemble_detached().cpu().numpy()
+            u_full = ws.assemble(detach=True).cpu().numpy()
             var_obs = np.nanvar(u_full[:, obs], axis=0)
             top_k   = np.argsort(var_obs)[::-1][:loo_subset_size]
             loo_subset = [obs[k] for k in top_k]

@@ -12,7 +12,6 @@ from typing import Dict, Any, Optional
 from pathlib import Path
 
 from .behavior_decoder_eval import (
-    behaviour_all_neurons_prediction,
     compute_behaviour_loss,
     init_behaviour_decoder,
 )
@@ -24,15 +23,10 @@ from .plot_eval import generate_eval_loo_plots
 __all__ = [
     "train_stage2",
     "train_stage2_cv",
-    # Used by train_multi.py:
     "compute_dynamics_loss",
     "snapshot_model_state",
 ]
 
-
-# --------------------------------------------------------------------------- #
-#  Variance and loss utilities (merged from train_utils.py)                     #
-# --------------------------------------------------------------------------- #
 
 def effective_variance(
     sigma_u: torch.Tensor,
@@ -44,11 +38,10 @@ def effective_variance(
     u_var_floor: float = 1e-8,
 ) -> torch.Tensor:
     sigma_u2 = sigma_u.view(1, -1) ** 2
-    if (not bool(use_u_var_weighting)) or (u_var is None):
+    if not use_u_var_weighting or u_var is None:
         return sigma_u2.expand(T, -1)
-
-    uv = torch.clamp(u_var, min=float(u_var_floor))
-    return sigma_u2 + float(u_var_scale) * uv
+    uv = torch.clamp(u_var, min=u_var_floor)
+    return sigma_u2 + u_var_scale * uv
 
 
 def compute_dynamics_loss(
@@ -63,33 +56,8 @@ def compute_dynamics_loss(
     model_sigma: Optional[torch.Tensor] = None,
     train_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Dynamics loss: weighted MSE *or* Gaussian NLL when *model_sigma* is given.
-
-    When *model_sigma* (shape ``(N,)`` or ``(T, N)``) is provided the loss is
-    the proper Gaussian negative-log-likelihood::
-
-        NLL = 0.5 * [ (y - mu)^2 / sigma^2  +  log(sigma^2) ]
-
-    averaged over valid elements.  The ``log(sigma^2)`` term lets the model
-    learn per-neuron noise levels: neurons with large irreducible residuals
-    get larger sigma, reducing their gradient magnitude; well-predicted
-    neurons get tighter sigma, sharpening the loss.
-
-    For *heteroscedastic* models, *model_sigma* has shape ``(T, N)`` where
-    each row is the state-dependent noise for that time step.
-
-    Parameters
-    ----------
-    train_mask : optional bool tensor, shape ``(T,)``
-        If provided, only include time steps where ``train_mask[t]`` is True
-        in the loss.  Used for k-fold CV training where held-out time steps
-        must be excluded from the gradient.
-    """
     T = target.shape[0]
-
     if model_sigma is not None:
-        # --- Gaussian NLL path (learnable noise) ---
-        # model_sigma is (N,) [homoscedastic] or (T, N) [heteroscedastic]
         if model_sigma.dim() == 1:
             sigma2 = (model_sigma.view(1, -1) ** 2).expand(T, -1)
         else:
@@ -104,7 +72,6 @@ def compute_dynamics_loss(
         nll = 0.5 * (resid2 / sigma2 + torch.log(sigma2))
         return torch.where(valid, nll, torch.zeros_like(nll)).sum() / valid.sum().clamp(min=1)
 
-    # --- Original weighted-MSE path ---
     var_eff = effective_variance(
         sigma_u,
         T,
@@ -135,34 +102,17 @@ def compute_rollout_loss(
     cached_states: Optional[dict] = None,
     use_nll: bool = False,
 ) -> torch.Tensor:
-    """Short-horizon rollout loss over K-step free-running predictions.
-
-    Picks *rollout_starts* random starting times, runs the model for
-    *rollout_steps* steps without teacher forcing, and computes the
-    variance-normalised MSE against the ground truth trajectory.
-
-    When *use_nll* is True (and the model has a learnable noise head),
-    uses Gaussian NLL with ``model.sigma_at(u)`` so that the noise
-    parameters are trained on multi-step rollout residuals — not only
-    on one-step teacher-forced residuals.  This yields wider (and more
-    calibrated) uncertainty bands during evaluation.
-
-    If *cached_states* is provided (from :func:`compute_teacher_forced_states`),
-    synaptic states are warm-started from the teacher-forced trajectory
-    instead of being initialized to zero.
-    """
     T, N = u_target.shape
     device = u_target.device
     K = rollout_steps
     if K <= 0 or T <= K + 1:
         return torch.tensor(0.0, device=device)
 
-    # Choose random starting indices in [0, T - K - 1]
     max_start = T - K - 1
     n_starts = min(rollout_starts, max_start + 1)
     t0s = torch.randperm(max_start + 1, device=device)[:n_starts]
 
-    sigma2 = (sigma_u ** 2).squeeze()  # (N,)
+    sigma2 = (sigma_u ** 2).squeeze()
     total_loss = torch.tensor(0.0, device=device)
     n_valid = 0
 
@@ -170,7 +120,6 @@ def compute_rollout_loss(
         t0 = int(t0s[t0_idx].item())
         u_cur = u_target[t0]
 
-        # Warm-start synaptic states from cached teacher-forced trajectory
         if cached_states is not None:
             s_sv = cached_states["s_sv"][t0].clone()
             s_dcv = cached_states["s_dcv"][t0].clone()
@@ -178,12 +127,10 @@ def compute_rollout_loss(
             s_sv = torch.zeros(N, model.r_sv, device=device)
             s_dcv = torch.zeros(N, model.r_dcv, device=device)
 
-        # Warm-start MLP context history from teacher-forced trajectory
-        if hasattr(model, 'init_mlp_history'):
-            model.init_mlp_history(u_target, t0)
-        # Warm-start lag history from teacher-forced trajectory
         if hasattr(model, 'init_lag_history'):
             model.init_lag_history(u_target, t0)
+        if hasattr(model, 'init_fir_history'):
+            model.init_fir_history(u_target, t0, gating=gating_data)
 
         seg_loss = torch.tensor(0.0, device=device)
         seg_count = 0
@@ -199,14 +146,14 @@ def compute_rollout_loss(
             ok = torch.isfinite(resid2)
             if ok.any():
                 if use_nll:
-                    sig = model.sigma_at(u_cur)          # (N,)
+                    sig = model.sigma_at(u_cur)
                     var = sig ** 2
                     nll = 0.5 * (resid2 / var + var.log())
                     seg_loss = seg_loss + nll[ok].mean()
                 else:
                     seg_loss = seg_loss + (resid2[ok] / sigma2[ok]).mean()
                 seg_count += 1
-            u_cur = u_next  # free-running: use own prediction
+            u_cur = u_next
 
         if seg_count > 0:
             total_loss = total_loss + seg_loss / seg_count
@@ -225,18 +172,6 @@ def compute_teacher_forced_states(
     stim_data: Optional[torch.Tensor] = None,
     cached_params: Optional[dict] = None,
 ) -> dict:
-    """Run a teacher-forced pass and cache synaptic states at each time step.
-
-    Returns a dict with:
-        s_sv  : (T, N, r_sv)  — synaptic SV states *before* each step
-        s_dcv : (T, N, r_dcv) — synaptic DCV states *before* each step
-
-    These can be used to warm-start rollout segments or neuron-dropout
-    segments so that the synaptic trace state is realistic rather than zero.
-
-    If *cached_params* is provided (from ``model.precompute_params()``),
-    reparameterized parameters are reused instead of recomputed per step.
-    """
     T, N = u.shape
     device = u.device
     r_sv, r_dcv = model.r_sv, model.r_dcv
@@ -249,10 +184,6 @@ def compute_teacher_forced_states(
 
     ones = torch.ones(N, device=device)
 
-    # Reset MLP history so prior_step builds it up from t=0
-    if hasattr(model, 'reset_mlp_history'):
-        model.reset_mlp_history()
-    # Reset lag history so prior_step builds it up from t=0
     if hasattr(model, 'reset_lag_history'):
         model.reset_lag_history()
 
@@ -263,7 +194,6 @@ def compute_teacher_forced_states(
             g = gating_data[t] if gating_data is not None else ones
             s = stim_data[t] if stim_data is not None else None
             _, s_sv, s_dcv = model.prior_step(u[t], s_sv, s_dcv, g, s)
-        # Last time step gets the final states
         s_sv_cache[T - 1] = s_sv
         s_dcv_cache[T - 1] = s_dcv
 
@@ -283,17 +213,6 @@ def compute_loo_aux_loss(
     cached_states: Optional[dict] = None,
     use_nll: bool = False,
 ) -> torch.Tensor:
-    """LOO auxiliary loss: hold out random neurons and free-run them.
-
-    For each sampled neuron *i* and start time *t0*, all neurons except *i*
-    are clamped to ground truth while neuron *i* runs autonomously for
-    *loo_steps* steps.  The loss is the variance-normalised MSE of the
-    held-out neuron's trajectory — exactly what the LOO evaluation measures,
-    but differentiable and short-horizon.
-
-    When *use_nll* is True, uses Gaussian NLL with ``model.sigma_at(u)``
-    so that the noise parameters learn from multi-step LOO residuals.
-    """
     T, N = u_target.shape
     device = u_target.device
     K = min(loo_steps, T - 2)
@@ -301,8 +220,6 @@ def compute_loo_aux_loss(
         return torch.tensor(0.0, device=device)
 
     sigma2 = (sigma_u ** 2).squeeze()
-
-    # Sample held-out neurons and start times
     n_neurons = min(loo_neurons, N)
     neuron_ids = torch.randperm(N, device=device)[:n_neurons]
     max_start = max(T - K - 1, 0)
@@ -317,7 +234,6 @@ def compute_loo_aux_loss(
         for si in range(n_starts):
             t0 = int(t0s[si].item())
 
-            # Warm-start synaptic states from teacher-forced trajectory
             if cached_states is not None:
                 s_sv = cached_states["s_sv"][t0].clone()
                 s_dcv = cached_states["s_dcv"][t0].clone()
@@ -325,20 +241,17 @@ def compute_loo_aux_loss(
                 s_sv = torch.zeros(N, model.r_sv, device=device)
                 s_dcv = torch.zeros(N, model.r_dcv, device=device)
 
-            # Warm-start MLP context history
-            if hasattr(model, 'init_mlp_history'):
-                model.init_mlp_history(u_target, t0)
-            # Warm-start lag history
             if hasattr(model, 'init_lag_history'):
                 model.init_lag_history(u_target, t0)
+            if hasattr(model, 'init_fir_history'):
+                model.init_fir_history(u_target, t0, gating=gating_data)
 
-            u_pred_i = u_target[t0, i]  # seed with true IC
+            u_pred_i = u_target[t0, i]
             seg_loss = torch.tensor(0.0, device=device)
             seg_count = 0
 
             for k in range(K):
                 t = t0 + k
-                # Clamp all neurons to GT, substitute held-out neuron
                 u_t = u_target[t].clone()
                 u_t[i] = u_pred_i
 
@@ -346,12 +259,11 @@ def compute_loo_aux_loss(
                 s = stim_data[t] if stim_data is not None else None
                 u_next, s_sv, s_dcv = model.prior_step(u_t, s_sv, s_dcv, g, s)
 
-                # Only compute loss for the held-out neuron
                 target_i = u_target[t + 1, i]
                 resid2 = (u_next[i] - target_i) ** 2
                 if torch.isfinite(resid2):
                     if use_nll:
-                        sig_i = model.sigma_at(u_t)[i]     # scalar
+                        sig_i = model.sigma_at(u_t)[i]
                         var_i = sig_i ** 2
                         nll_i = 0.5 * (resid2 / var_i + var_i.log())
                         seg_loss = seg_loss + nll_i
@@ -359,7 +271,7 @@ def compute_loo_aux_loss(
                         seg_loss = seg_loss + resid2 / sigma2[i].clamp(min=1e-8)
                     seg_count += 1
 
-                u_pred_i = u_next[i]  # free-running for the held-out neuron
+                u_pred_i = u_next[i]
 
             if seg_count > 0:
                 total_loss = total_loss + seg_loss / seg_count
@@ -375,24 +287,12 @@ def snapshot_model_state(model: Stage2ModelPT) -> Dict[str, torch.Tensor]:
     with torch.no_grad():
         params_final["W_sv"] = model.W_sv.detach().cpu()
         params_final["W_dcv"] = model.W_dcv.detach().cpu()
-        # Store constrained values alongside raw parameters
         for attr in ("lambda_u", "G", "a_sv", "a_dcv", "tau_sv", "tau_dcv"):
             params_final[attr] = getattr(model, attr).detach().cpu()
-        # Per-neuron process noise (always present, but only meaningful
-        # when learn_noise is True)
         params_final["sigma_process"] = model.sigma_process.detach().cpu()
-        # Low-rank correlated noise factor
         if getattr(model, 'noise_corr_rank', 0) > 0:
             params_final["noise_V"] = model._noise_V.detach().cpu()
-        # Config flags
-        params_final["linear_chemical_synapses"] = torch.tensor(
-            int(model.linear_chemical_synapses))
     return params_final
-
-
-# --------------------------------------------------------------------------- #
-#  Formatting helpers                                                           #
-# --------------------------------------------------------------------------- #
 
 
 def _fmt(x: torch.Tensor) -> str:
@@ -437,15 +337,7 @@ def apply_training_step(
         _clamp_params(model, cfg)
 
 
-# --------------------------------------------------------------------------- #
-#  Parameter clamping                                                           #
-# --------------------------------------------------------------------------- #
-
 def _clamp_params(model: Stage2ModelPT, cfg: Stage2PTConfig) -> None:
-    # Reparameterized parameters (lambda_u, G, a_sv/dcv, tau_sv/dcv, W_sv/dcv)
-    # are bounded by construction via sigmoid / softplus — no clamping needed.
-
-    # Stimulus weights are plain nn.Parameters → clamp if cfg specifies bounds.
     if model.d_ell > 0:
         b_min = getattr(cfg, "b_min", None)
         b_max = getattr(cfg, "b_max", None)
@@ -455,24 +347,23 @@ def _clamp_params(model: Stage2ModelPT, cfg: Stage2PTConfig) -> None:
             model.b.data.clamp_(min=lo, max=hi)
 
 
-# --------------------------------------------------------------------------- #
-#  Logging                                                                      #
-# --------------------------------------------------------------------------- #
-
 class _TeeWriter:
-    """Duplicate stdout to a file, preserving original stdout."""
 
     def __init__(self, log_path: str | Path):
         self._file = open(log_path, "w", buffering=1)
         self._stdout = sys.stdout
+        self._closed = False
 
     def write(self, msg: str):
+        if self._closed:
+            return self._stdout.write(msg)
         self._stdout.write(msg)
         self._file.write(msg)
 
     def flush(self):
         self._stdout.flush()
-        self._file.flush()
+        if not self._closed:
+            self._file.flush()
 
     def isatty(self):
         return False
@@ -481,12 +372,14 @@ class _TeeWriter:
         return self._stdout.fileno()
 
     def close(self):
-        self._file.close()
+        if not self._closed:
+            self._closed = True
+            self._file.flush()
+            self._file.close()
         sys.stdout = self._stdout
 
 
 def _config_to_dict(cfg: Stage2PTConfig) -> dict:
-    """Serialize full config to a JSON-safe dict."""
     out: dict = {}
     for sec_name in ("data", "dynamics", "stimulus", "behavior", "train", "eval", "output", "multi"):
         sub = getattr(cfg, sec_name, None)
@@ -495,7 +388,6 @@ def _config_to_dict(cfg: Stage2PTConfig) -> dict:
         sec_dict: dict = {}
         for f in dataclasses.fields(sub):
             v = getattr(sub, f.name)
-            # Convert non-serializable types
             if isinstance(v, Path):
                 v = str(v)
             elif isinstance(v, tuple):
@@ -506,7 +398,6 @@ def _config_to_dict(cfg: Stage2PTConfig) -> dict:
 
 
 def _save_run_config(cfg: Stage2PTConfig, save_dir: str | Path) -> Path:
-    """Write the complete run config as JSON into *save_dir*/run_config.json."""
     p = Path(save_dir) / "run_config.json"
     with open(p, "w") as f:
         json.dump(_config_to_dict(cfg), f, indent=2, default=str)
@@ -560,29 +451,20 @@ def _log_init_params(model: Stage2ModelPT, cfg: Stage2PTConfig) -> None:
     rev_tag = "train" if cfg.learn_reversals else "fixed"
     print(f"  E_sv ({rev_tag}): {_fmt(model.E_sv)}")
     print(f"  E_dcv ({rev_tag}): {_fmt(model.E_dcv)}")
-    # beta_interaction frozen at 1.0
     trainable = [n for n, p in model.named_parameters() if p.requires_grad]
     print(f"[Stage2] Trainable: {', '.join(trainable) or '(none)'}")
 
 
-# --------------------------------------------------------------------------- #
-#  Parameter snapshot (for trajectory plots)                                    #
-# --------------------------------------------------------------------------- #
-
 @torch.no_grad()
 def _snapshot_params(model) -> dict:
-    """Return a dict of scalar summaries of every tracked model parameter."""
     snap: dict = {}
 
-    # Gap-junction conductance
     G = model.G
     snap["G"] = float(G.mean())
 
-    # Synaptic kernel amplitudes (RMS)
     snap["a_sv_rms"] = float(model.a_sv.pow(2).mean().sqrt()) if model.a_sv.numel() > 0 else 0.0
     snap["a_dcv_rms"] = float(model.a_dcv.pow(2).mean().sqrt()) if model.a_dcv.numel() > 0 else 0.0
 
-    # Leak rate λ_u
     lam = model.lambda_u
     if lam.numel() > 0:
         snap["lambda_u_min"] = float(lam.min())
@@ -593,7 +475,6 @@ def _snapshot_params(model) -> dict:
         snap["lambda_u_min"] = snap["lambda_u_max"] = 0.0
         snap["lambda_u_med"] = snap["lambda_u_mean"] = 0.0
 
-    # Tonic drive I0
     I0 = model.I0
     snap["I0_rms"] = float(I0.pow(2).mean().sqrt()) if I0.numel() > 0 else 0.0
     snap["I0_absmax"] = float(I0.abs().max()) if I0.numel() > 0 else 0.0
@@ -620,7 +501,6 @@ def _snapshot_params(model) -> dict:
     _active_weight_stats(model.W_sv, model.T_sv, "W_sv")
     _active_weight_stats(model.W_dcv, model.T_dcv, "W_dcv")
 
-    # Reversal potentials
     E_sv = model.E_sv
     if E_sv.numel() > 1:
         snap["E_sv_mean"] = float(E_sv.mean())
@@ -631,14 +511,11 @@ def _snapshot_params(model) -> dict:
         snap["E_sv_mean"] = snap["E_sv_min"] = snap["E_sv_max"] = val
     snap["E_dcv"] = float(model.E_dcv.mean())
 
-    # Time constants τ (already in seconds) — store as lists for multi-rank
     snap["tau_sv"] = model.tau_sv.tolist() if model.tau_sv.numel() > 0 else []
     snap["tau_dcv"] = model.tau_dcv.tolist() if model.tau_dcv.numel() > 0 else []
 
-    # Stimulus weights ‖b‖
     snap["b_norm"] = float(model.b.pow(2).sum().sqrt()) if model.b.numel() > 0 else 0.0
 
-    # Stimulus kernel
     if model.stim_kernel is not None:
         h = F.softplus(model.stim_kernel)
         snap["stim_kernel_peak"] = float(h.max())
@@ -650,17 +527,8 @@ def _snapshot_params(model) -> dict:
     return snap
 
 
-# --------------------------------------------------------------------------- #
-#  K-fold temporal CV for one-step R²                                           #
-# --------------------------------------------------------------------------- #
-
 def _make_temporal_folds(T: int, n_folds: int):
-    """Partition prediction frames 1..T-1 into *n_folds* contiguous blocks.
-
-    Returns list of (test_start, test_end) with 1-based frame indices,
-    i.e. each block covers prediction targets u[test_start : test_end].
-    """
-    n_frames = T - 1  # frames 1..T-1
+    n_frames = T - 1
     fold_size = n_frames // n_folds
     remainder = n_frames - fold_size * n_folds
     folds = []
@@ -678,26 +546,10 @@ def train_stage2_cv(
     show: bool = False,
     warm_start_dir: str | None = None,
 ) -> Optional[dict]:
-    """Train Stage 2 with k-fold temporal CV for fair one-step **and LOO** R².
-
-    For each fold the model is trained from scratch with the held-out
-    time steps excluded from the dynamics loss (via ``train_mask``).
-    Teacher-forced predictions on the held-out frames are stitched into
-    a full ``(T, N)`` array and used to compute cross-validated R².
-
-    After all folds are trained, LOO forward simulations are run per-fold
-    on each fold's model, collecting held-out frame predictions.  The
-    stitched LOO trajectories give properly cross-validated LOO R².
-
-    The best-fold model (lowest held-out MSE) is kept for free-run /
-    current-decomposition evaluation, giving a complete set of metrics
-    comparable to the Transformer baseline.
-    """
     from .init_from_data import init_lambda_u, init_all_from_data
     from .evaluate import (
-        _teacher_forced_prior, compute_onestep,
-        loo_forward_simulate, loo_forward_simulate_windowed,
-        loo_forward_simulate_batched, loo_forward_simulate_batched_windowed,
+        _teacher_forced_prior,
+        loo_forward_simulate_batched,
         choose_loo_subset,
     )
     from ._utils import _r2, _cfg_val
@@ -705,7 +557,6 @@ def train_stage2_cv(
     n_folds = cfg.cv_folds
     assert n_folds >= 2, f"cv_folds must be >= 2, got {n_folds}"
 
-    # ---- reproducibility seed ------------------------------------------------
     _seed = int(getattr(cfg, "seed", 0) or 0)
     if _seed > 0:
         import random
@@ -716,13 +567,11 @@ def train_stage2_cv(
             torch.cuda.manual_seed_all(_seed)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
-        # Force ALL ops deterministic (catches backward-pass atomics)
         torch.use_deterministic_algorithms(True, warn_only=True)
         import os as _os
         _os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
         print(f"[Stage2-CV] Deterministic mode: seed={_seed}")
 
-    # ---- data ----------------------------------------------------------------
     data = load_data_pt(cfg)
     data["_cfg"] = cfg
 
@@ -753,7 +602,6 @@ def train_stage2_cv(
         _tee = None
 
     try:
-        # ---- fold setup ------------------------------------------------------
         folds = _make_temporal_folds(T, n_folds)
         pred_u_full = np.full((T, N), np.nan, dtype=np.float32)
         fold_test_mse = []
@@ -766,26 +614,17 @@ def train_stage2_cv(
             print(f"  fold {fi}: test=[{s}, {e})  ({e-s} frames)")
         print(f"{'='*60}\n")
 
-        if cfg.behavior_weight > 0:
-            beh_all_baseline = behaviour_all_neurons_prediction(data)
-        else:
-            beh_all_baseline = None
-
-        # ==== per-fold training loop ==========================================
         for fi, (te_s, te_e) in enumerate(folds):
             print(f"\n{'='*60}")
             print(f"[Stage2-CV] Fold {fi+1}/{n_folds}  "
                   f"test=[{te_s},{te_e})  ({te_e - te_s} frames held out)")
             print(f"{'='*60}")
 
-            # ---- train_mask --------------------------------------------------
-            # Shape (T-1,): mask[i] corresponds to prediction target frame i+1.
             train_mask = torch.ones(T - 1, dtype=torch.bool, device=device)
             train_mask[te_s - 1 : te_e - 1] = False
             n_train = int(train_mask.sum())
             print(f"[fold {fi}] training on {n_train}/{T-1} frames")
 
-            # ---- build model -------------------------------------------------
             sign_t = data.get("sign_t")
             lambda_u_init = init_lambda_u(u_stage1, cfg)
             model = Stage2ModelPT(
@@ -796,7 +635,6 @@ def train_stage2_cv(
             ).to(device)
             init_all_from_data(model, u_stage1, cfg)
 
-            # ---- warm-start from a previous run (phase 1 → phase 2) ---------
             if warm_start_dir is not None:
                 ws_path = Path(warm_start_dir) / f"fold_{fi}_state.pt"
                 if ws_path.exists():
@@ -813,18 +651,15 @@ def train_stage2_cv(
                     print(f"[fold {fi}] No warm-start file found at {ws_path}, "
                           f"training from scratch")
 
-            # ---- snapshot anchors for regularisation -------------------------
             with torch.no_grad():
                 lambda_u_raw_init_anchor = model._lambda_u_raw.detach().clone()
                 I0_init_anchor = model.I0.detach().clone()
                 tau_sv_init_anchor = model.tau_sv.detach().clone()
                 tau_dcv_init_anchor = model.tau_dcv.detach().clone()
-                # Snapshot the init network strength product for floor penalty
                 _init_G_rms = float(model.G.pow(2).mean().sqrt())
                 _init_a_sv_rms = float(model.a_sv.pow(2).mean().sqrt())
                 _init_strength = _init_G_rms * _init_a_sv_rms
 
-            # ---- optimiser ---------------------------------------------------
             syn_lr_mult = float(getattr(cfg, "synaptic_lr_multiplier", 1.0) or 1.0)
             syn_names = {"_a_sv_raw", "_a_dcv_raw", "_W_sv_raw", "_W_dcv_raw"}
             syn_params = [p for n, p in model.named_parameters()
@@ -847,7 +682,6 @@ def train_stage2_cv(
             uvar_scale = float(getattr(cfg, "u_var_scale", 1.0))
             uvar_floor = float(getattr(cfg, "u_var_floor", 1e-8))
 
-            # ---- hyperparams for regularisation / aux losses -----------------
             grad_clip = float(getattr(cfg, "grad_clip_norm", 0.0) or 0.0)
             rollout_steps = int(getattr(cfg, "rollout_steps", 0) or 0)
             rollout_weight = float(getattr(cfg, "rollout_weight", 0.0) or 0.0)
@@ -859,15 +693,14 @@ def train_stage2_cv(
             loo_aux_starts = int(getattr(cfg, "loo_aux_starts", 1) or 1)
             ridge_b = float(getattr(cfg, "ridge_b", 0.0) or 0.0)
             dynamics_l2 = float(getattr(cfg, "dynamics_l2", 0.0) or 0.0)
+            corr_reg_weight = float(getattr(cfg, "corr_reg_weight", 0.0) or 0.0)
             I0_reg = float(getattr(cfg, "I0_reg", 0.0) or 0.0)
             lambda_u_reg = float(getattr(cfg, "lambda_u_reg", 0.0) or 0.0)
             tau_reg = float(getattr(cfg, "tau_reg", 0.0) or 0.0)
-            coupling_gate_reg = float(getattr(cfg, "coupling_gate_reg", 0.0) or 0.0)
             net_floor_weight = float(getattr(cfg, "network_strength_floor", 0.0) or 0.0)
             net_floor_target = float(getattr(cfg, "network_strength_target", 0.8) or 0.8)
             behavior_weight = float(getattr(cfg, "behavior_weight", 0.0) or 0.0)
 
-            # ---- behaviour decoder (per fold) --------------------------------
             beh_decoder = None
             if behavior_weight > 0.0 and b_seq is not None:
                 beh_decoder = init_behaviour_decoder(data)
@@ -882,36 +715,35 @@ def train_stage2_cv(
                         optimiser.add_param_group(
                             {"params": [beh_decoder["W"]], "lr": cfg.learning_rate})
 
-            # ---- try to torch.compile the inner step for speed --------
             try:
-                _dynamo = getattr(torch, '_dynamo', None)
-                if _dynamo is not None:
-                    _dynamo.config.suppress_errors = True
-                model._synaptic_current = torch.compile(
-                    model._synaptic_current, mode="reduce-overhead",
-                    disable=not torch.cuda.is_available())
+                if torch.cuda.is_available():
+                    _dynamo = getattr(torch, '_dynamo', None)
+                    if _dynamo is not None:
+                        _dynamo.config.suppress_errors = True
+                    model.forward_sequence = torch.compile(
+                        model.forward_sequence, mode="reduce-overhead")
+                    model._synaptic_current = torch.compile(
+                        model._synaptic_current, mode="reduce-overhead")
             except Exception:
-                pass  # graceful fallback if compile not supported
+                pass
 
-            # ---- training loop (same losses/regularisations as train_stage2) -
+            _use_amp = (bool(getattr(cfg, "use_mixed_precision", False))
+                        and device.type == "cuda")
+
             for epoch in range(cfg.num_epochs):
-                # Re-convolve stimulus with learnable kernel
                 if stim_data_raw is not None and model.stim_kernel is not None:
                     stim_data = model.convolve_stimulus(stim_data_raw)
-                    data["stim"] = stim_data
                 else:
                     stim_data = stim_data_raw
 
                 optimiser.zero_grad()
 
-                # ---- noise injection on teacher-forced inputs --------
                 _input_noise = float(getattr(cfg, 'input_noise_sigma', 0.0) or 0.0)
                 if _input_noise > 0:
                     z_noisy = z_target + _input_noise * torch.randn_like(z_target)
                 else:
                     z_noisy = z_target
 
-                # ---- curriculum rollout scheduling --------
                 _curriculum = bool(getattr(cfg, 'rollout_curriculum', False))
                 if _curriculum and rollout_weight > 0:
                     _K_start = int(getattr(cfg, 'rollout_K_start', 5))
@@ -925,20 +757,23 @@ def train_stage2_cv(
                     else:
                         frac = (epoch - _cur_s) / max(_cur_e - _cur_s, 1)
                         _K_cur = int(_K_start + frac * (_K_end - _K_start))
-                    rollout_steps = _K_cur  # dynamically update for this epoch
+                    rollout_steps = _K_cur
 
-                # Use sequential prior_step loop (matches old compute_prior graph)
-                prior_mu = model._forward_sequence_fallback(
+                _amp_ctx = torch.autocast(
+                    device.type, dtype=torch.bfloat16, enabled=_use_amp)
+                _amp_ctx.__enter__()
+
+                prior_mu = model.forward_sequence(
                     z_noisy, gating_data=gating_data,
                     stim_data=stim_data)
 
-                # Model sigma (learnable noise)
                 if model._learn_noise:
                     if model._noise_mode == "heteroscedastic":
                         _model_sigma = model.sigma_at(z_target[:-1])
                     else:
                         _model_sigma = model.sigma_at()
-                    use_rollout = (rollout_weight > 0 and rollout_steps > 0)
+                    use_rollout = (rollout_weight > 0 and rollout_steps > 0
+                                   and rollout_starts > 0)
                     use_loo_aux = loo_aux_weight > 0 and loo_aux_steps > 0
                 else:
                     _model_sigma = None
@@ -946,7 +781,6 @@ def train_stage2_cv(
                                    and rollout_starts > 0)
                     use_loo_aux = loo_aux_weight > 0 and loo_aux_steps > 0
 
-                # ---- one-step loss with train_mask ---------------------------
                 one_step_loss = compute_dynamics_loss(
                     z_target[1:], prior_mu[1:], sigma_u,
                     u_var=uvar, use_u_var_weighting=use_uvar,
@@ -955,7 +789,6 @@ def train_stage2_cv(
                     train_mask=train_mask,
                 )
 
-                # ---- auxiliary losses (rollout, LOO) -------------------------
                 cached_states = None
                 if warmstart_rollout and (use_rollout or use_loo_aux):
                     cached_states = compute_teacher_forced_states(
@@ -985,7 +818,6 @@ def train_stage2_cv(
                                        else None),
                         use_nll=model._learn_noise)
 
-                # ---- total loss + regularisation -----------------------------
                 loss = one_step_loss
                 if rollout_loss_val is not None:
                     loss = loss + rollout_weight * rollout_loss_val
@@ -998,7 +830,21 @@ def train_stage2_cv(
                               if p.requires_grad]
                     if dyn_l2:
                         loss = loss + dynamics_l2 * torch.stack(dyn_l2).mean()
-                # Noise regularisation
+                if corr_reg_weight > 0 and hasattr(model, "_corr_reg_mask"):
+                    _crm = model._corr_reg_mask
+                    _cr_loss = torch.tensor(0.0, device=device)
+                    for attr in ("W_sv", "W_dcv"):
+                        W = getattr(model, attr)
+                        T_mat = getattr(model, f"T_{attr.split('_')[1]}")
+                        mask = (T_mat > 0).float()
+                        if W.numel() > 0 and mask.sum() > 0:
+                            _cr_loss = _cr_loss + (W.pow(2) * _crm * mask).sum() / mask.sum()
+                    if model.edge_specific_G:
+                        G = model.G
+                        mask_e = (model.T_e > 0).float()
+                        if mask_e.sum() > 0:
+                            _cr_loss = _cr_loss + (G.pow(2) * _crm * mask_e).sum() / mask_e.sum()
+                    loss = loss + corr_reg_weight * _cr_loss
                 _noise_reg = float(getattr(cfg, "noise_reg", 0.0) or 0.0)
                 if _noise_reg > 0 and model._learn_noise:
                     if model._noise_mode == "heteroscedastic":
@@ -1007,7 +853,6 @@ def train_stage2_cv(
                             + model._sigma_b.pow(2).mean())
                     else:
                         loss = loss + _noise_reg * model._log_sigma_u.pow(2).mean()
-                # Targeted regularisers
                 if I0_reg > 0:
                     loss = loss + I0_reg * (
                         model.I0 - I0_init_anchor).pow(2).mean()
@@ -1029,45 +874,34 @@ def train_stage2_cv(
                             torch.log(model.tau_dcv.clamp(min=_eps))
                             - torch.log(tau_dcv_init_anchor.clamp(min=_eps))
                         ).pow(2).mean()
-                # Coupling gate L2 (pull logits toward 0 → gate≈0.5)
-                if coupling_gate_reg > 0 and hasattr(model, '_coupling_gate_raw'):
-                    loss = loss + coupling_gate_reg * model._coupling_gate_raw.pow(2).mean()
-                # Network strength floor (+ optional growth encouragement)
                 if net_floor_weight > 0 and net_floor_target > 0:
                     _cur = (model.G.pow(2).mean().sqrt()
                             * model.a_sv.pow(2).mean().sqrt())
                     _tgt = _init_strength * net_floor_target
                     _ratio = _cur / max(_tgt, 1e-12)
-                    # Collapse penalty: fires when strength drops below target
                     loss = loss + net_floor_weight * torch.relu(
                         1.0 - _ratio).pow(2)
-                    # Growth encouragement: gentle pull toward target (symmetric)
-                    # This prevents the network from stalling at a small fraction
-                    # of its initial strength.  Weight is 0.1× the floor weight
-                    # so it nudges without dominating the loss.
                     loss = loss + 0.1 * net_floor_weight * (
                         1.0 - _ratio).pow(2)
-                # Behaviour loss
                 beh_loss_val = None
                 if beh_decoder is not None and behavior_weight > 0.0:
                     beh_loss_val = compute_behaviour_loss(
                         prior_mu, beh_decoder)
                     loss = loss + behavior_weight * beh_loss_val
-                # Behavior weight cap (Test 7: coupling gain ≈0.5-1%, weakest term)
                 _beh_cap = float(getattr(cfg, "behavior_weight_cap", 0.0) or 0.0)
                 if _beh_cap > 0 and hasattr(model, "b") and model.b.requires_grad:
                     loss = loss + _beh_cap * model.b.abs().mean()
-                # Noise correlation factor regularisation
                 if hasattr(model, '_noise_V') and model.noise_corr_rank > 0:
                     _noise_V_reg = float(getattr(cfg, "noise_reg", 0.0) or 0.0)
                     if _noise_V_reg > 0:
                         loss = loss + _noise_V_reg * model._noise_V.pow(2).mean()
 
+                _amp_ctx.__exit__(None, None, None)
+
                 apply_training_step(
                     loss, optimiser, params, model, cfg,
                     grad_clip=grad_clip)
 
-                # ---- logging (sparse) ----------------------------------------
                 if epoch == 0 or (epoch + 1) == cfg.num_epochs or (epoch + 1) % 10 == 0:
                     parts = [f"dyn={one_step_loss.item():.4f}",
                              f"total={loss.item():.4f}"]
@@ -1084,7 +918,6 @@ def train_stage2_cv(
                     print(f"[fold {fi}] Epoch {epoch+1}/{cfg.num_epochs}: "
                           f"{'  '.join(parts)}")
 
-            # ---- collect held-out predictions --------------------------------
             model.eval()
             with torch.no_grad():
                 prior_mu_full = _teacher_forced_prior(
@@ -1096,19 +929,16 @@ def train_stage2_cv(
             pred_np = prior_mu_full.cpu().numpy()
             pred_u_full[te_s:te_e] = pred_np[te_s:te_e]
 
-            # Held-out MSE for model selection
             u_np = u_stage1.cpu().numpy()
             test_mse = float(np.mean(
                 (u_np[te_s:te_e] - pred_np[te_s:te_e]) ** 2))
             fold_test_mse.append(test_mse)
             fold_states.append(snapshot_model_state(model))
 
-            # Save per-fold state for warm-starting (phase 1 → phase 2)
             if save_dir is not None:
                 _fold_pt = Path(save_dir) / f"fold_{fi}_state.pt"
                 torch.save(fold_states[-1], _fold_pt)
 
-            # Per-fold R² on held-out frames
             _fold_r2 = np.array([
                 _r2(u_np[te_s:te_e, i], pred_np[te_s:te_e, i])
                 for i in range(N)])
@@ -1116,7 +946,6 @@ def train_stage2_cv(
                   f"R² mean={np.nanmean(_fold_r2):.4f}  "
                   f"median={np.nanmedian(_fold_r2):.4f}")
 
-        # ==== aggregate CV results ============================================
         valid_mask = ~np.isnan(pred_u_full[:, 0])
         u_np = u_stage1.cpu().numpy()
         cv_r2 = np.array([
@@ -1134,7 +963,6 @@ def train_stage2_cv(
         print(f"  #negative = {n_neg}/{N}")
         print(f"{'='*60}")
 
-        # ---- rebuild best-fold model for final evaluation --------------------
         best_fi = int(np.argmin(fold_test_mse))
         print(f"\n[Stage2-CV] Best fold = {best_fi} "
               f"(held-out MSE = {fold_test_mse[best_fi]:.6f})")
@@ -1142,14 +970,19 @@ def train_stage2_cv(
         lambda_u_init = init_lambda_u(u_stage1, cfg)
 
         def _rebuild_model_from_state(state_dict):
-            """Rebuild a Stage2ModelPT and load *state_dict* parameters."""
+            import io as _io
             m = Stage2ModelPT(
                 N, data["T_e"], data["T_sv"], data["T_dcv"], data["dt"],
                 cfg, device, d_ell=d_ell,
                 lambda_u_init=lambda_u_init,
                 sign_t=data.get("sign_t"),
             ).to(device)
-            init_all_from_data(m, u_stage1, cfg)
+            _prev_stdout = sys.stdout
+            sys.stdout = _io.StringIO()
+            try:
+                init_all_from_data(m, u_stage1, cfg)
+            finally:
+                sys.stdout = _prev_stdout
             with torch.no_grad():
                 for name, val in state_dict.items():
                     if hasattr(m, name):
@@ -1159,9 +992,11 @@ def train_stage2_cv(
             m.eval()
             return m
 
-        best_model = _rebuild_model_from_state(fold_states[best_fi])
+        best_model = None
 
-        # ==== Cross-validated LOO evaluation ==================================
+        from .evaluate import compute_free_run
+        from .plot_eval import _compute_input_decomposition
+
         _cv_onestep_for_subset = {"r2": cv_r2, "prior_mu": pred_u_full}
         subset = choose_loo_subset(
             data, _cv_onestep_for_subset,
@@ -1174,95 +1009,156 @@ def train_stage2_cv(
             seed=_cfg_val(cfg, "eval_loo_subset_seed", 0, int),
         )
 
-        cv_loo_r2 = None
-        cv_loo_r2_windowed = None
-        cv_loo_preds = None
-
-        if subset is not None and len(subset) > 0:
+        _skip_cv_loo = bool(getattr(cfg, "skip_cv_loo", False))
+        do_loo = (not _skip_cv_loo) and subset is not None and len(subset) > 0
+        loo_pred_full = None
+        if do_loo:
             window_size = _cfg_val(cfg, "eval_loo_window_size", 0, int)
+            if window_size <= 0:
+                window_size = 50
             warmup_steps = _cfg_val(cfg, "eval_loo_warmup_steps", 40, int)
-            u_device = u_stage1.to(device)
-            gating_eval = data.get("gating")
-            stim_eval = data.get("stim")
-
-            # Allocate per-neuron prediction arrays (NaN = not yet filled)
             loo_pred_full = {i: np.full(T, np.nan, dtype=np.float32)
                             for i in subset}
-            loo_pred_w_full = (
-                {i: np.full(T, np.nan, dtype=np.float32) for i in subset}
-                if window_size > 0 else None
-            )
 
-            print(f"\n{'='*60}")
-            print(f"[Stage2-CV] Cross-validated LOO ({n_folds} folds, "
-                  f"{len(subset)} neurons) — BATCHED")
-            print(f"{'='*60}")
+        u_free_cv = np.full((T, N), np.nan, dtype=np.float32)
+        decomp_summaries = []
+        decomp_per_neurons = []
 
-            for fi, (te_s, te_e) in enumerate(folds):
-                fold_model = _rebuild_model_from_state(fold_states[fi])
+        u_device = u_stage1.to(device)
+        gating_eval = data.get("gating")
+        stim_eval_raw = stim_data_raw
 
-                # Batched: all LOO neurons in one pass (~N× faster)
-                batch_preds = loo_forward_simulate_batched(
-                    fold_model, u_device, subset, gating_eval, stim_eval,
-                    warmup_steps=warmup_steps)
-                for i in subset:
-                    loo_pred_full[i][te_s:te_e] = batch_preds[i][te_s:te_e]
+        print(f"\n{'='*60}")
+        print(f"[Stage2-CV] Cross-validated evaluation ({n_folds} folds)")
+        if do_loo:
+            print(f"  LOO: {len(subset)} neurons, window={window_size}")
+        print(f"  Free-run + current decomposition per fold")
+        print(f"{'='*60}")
 
-                if window_size > 0:
-                    batch_preds_w = loo_forward_simulate_batched_windowed(
+        _parallel_eval = (bool(getattr(cfg, "parallel_folds", False))
+                          and torch.cuda.is_available())
+
+        fold_models = []
+        for fi in range(n_folds):
+            fold_models.append(_rebuild_model_from_state(fold_states[fi]))
+            if fi == best_fi:
+                best_model = fold_models[-1]
+
+        _skip_fr = bool(getattr(cfg, 'skip_free_run', False))
+
+        def _eval_one_fold(fi, te_s, te_e):
+            import contextlib
+            fold_model = fold_models[fi]
+            if stim_eval_raw is not None and fold_model.stim_kernel is not None:
+                stim_eval = fold_model.convolve_stimulus(stim_eval_raw)
+            else:
+                stim_eval = stim_eval_raw
+            _stream = torch.cuda.Stream() if _parallel_eval else None
+            _ctx = (torch.cuda.stream(_stream)
+                    if _stream is not None else contextlib.nullcontext())
+            with _ctx, torch.no_grad():
+                loo_slice = None
+                if do_loo:
+                    batch_preds = loo_forward_simulate_batched(
                         fold_model, u_device, subset, gating_eval, stim_eval,
                         window_size=window_size, warmup_steps=warmup_steps)
-                    for i in subset:
-                        loo_pred_w_full[i][te_s:te_e] = batch_preds_w[i][te_s:te_e]
+                    loo_slice = {i: batch_preds[i][te_s:te_e].copy()
+                                 for i in subset}
+                if not _skip_fr:
+                    fr = compute_free_run(fold_model, data)
+                    fr_slice = fr["u_free"][te_s:te_e].copy()
+                    d_summary, d_per_neuron = _compute_input_decomposition(
+                        fold_model, data)
+                else:
+                    fr_slice = np.full((te_e - te_s, N), np.nan, dtype=np.float32)
+                    d_summary, d_per_neuron = {}, np.array([])
+            if _stream is not None:
+                _stream.synchronize()
+            print(f"[Stage2-CV] Fold {fi+1}/{n_folds} eval done "
+                  f"(test=[{te_s},{te_e}))")
+            return loo_slice, fr_slice, d_summary, d_per_neuron
 
-                print(f"[Stage2-CV] LOO fold {fi+1}/{n_folds} done "
-                      f"(test=[{te_s},{te_e}), {len(subset)} neurons)")
+        if _parallel_eval:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=min(n_folds, 4)) as _pool:
+                _futures = [
+                    _pool.submit(_eval_one_fold, fi, te_s, te_e)
+                    for fi, (te_s, te_e) in enumerate(folds)
+                ]
+                _fold_results = [f.result() for f in _futures]
+        else:
+            _fold_results = [
+                _eval_one_fold(fi, te_s, te_e)
+                for fi, (te_s, te_e) in enumerate(folds)
+            ]
 
-            # Compute CV LOO R²
+        for fi, (te_s, te_e) in enumerate(folds):
+            loo_slice, fr_slice, d_summary, d_per_neuron = _fold_results[fi]
+            if do_loo and loo_slice is not None:
+                for i in subset:
+                    loo_pred_full[i][te_s:te_e] = loo_slice[i]
+            u_free_cv[te_s:te_e] = fr_slice
+            decomp_summaries.append(d_summary)
+            decomp_per_neurons.append(d_per_neuron)
+
+        cv_loo_r2 = None
+        cv_loo_preds = None
+        if do_loo:
             cv_loo_r2 = np.full(N, np.nan, dtype=np.float32)
             for i in subset:
                 valid = ~np.isnan(loo_pred_full[i])
                 if valid.sum() > 1:
                     cv_loo_r2[i] = _r2(u_np[valid, i], loo_pred_full[i][valid])
-
             cv_loo_preds = loo_pred_full
             loo_valid = cv_loo_r2[np.isfinite(cv_loo_r2)]
-            print(f"\n{'='*60}")
-            print(f"[Stage2-CV] Cross-validated LOO R² ({n_folds} folds)")
+            print(f"\n[Stage2-CV] LOO R² (window={window_size})")
             if len(loo_valid) > 0:
-                print(f"  mean  = {np.nanmean(loo_valid):.4f}")
-                print(f"  median= {np.nanmedian(loo_valid):.4f}")
-                print(f"  std   = {np.nanstd(loo_valid):.4f}")
-                print(f"  min   = {np.nanmin(loo_valid):.4f}")
-                print(f"  max   = {np.nanmax(loo_valid):.4f}")
-                n_neg_loo = int((loo_valid < 0).sum())
-                print(f"  #negative = {n_neg_loo}/{len(loo_valid)}")
-            else:
-                print(f"  (no valid LOO neurons)")
-            print(f"{'='*60}")
+                print(f"  mean={np.nanmean(loo_valid):.4f}  "
+                      f"median={np.nanmedian(loo_valid):.4f}  "
+                      f"#neg={int((loo_valid < 0).sum())}/{len(loo_valid)}")
 
-            if window_size > 0 and loo_pred_w_full is not None:
-                cv_loo_r2_windowed = np.full(N, np.nan, dtype=np.float32)
-                for i in subset:
-                    valid = ~np.isnan(loo_pred_w_full[i])
-                    if valid.sum() > 1:
-                        cv_loo_r2_windowed[i] = _r2(
-                            u_np[valid, i], loo_pred_w_full[i][valid])
-                loo_w_valid = cv_loo_r2_windowed[
-                    np.isfinite(cv_loo_r2_windowed)]
-                if len(loo_w_valid) > 0:
-                    print(f"[Stage2-CV] Windowed LOO R² (window={window_size})")
-                    print(f"  mean  = {np.nanmean(loo_w_valid):.4f}")
-                    print(f"  median= {np.nanmedian(loo_w_valid):.4f}")
+        seed_steps = int(getattr(cfg, "eval_free_run_seed_steps", 16) or 16)
+        valid_fr = ~np.isnan(u_free_cv[:, 0])
+        valid_fr[:seed_steps] = False
+        cv_fr_r2 = np.full(N, np.nan, dtype=np.float32)
+        for i in range(N):
+            if valid_fr.sum() > 1:
+                cv_fr_r2[i] = _r2(u_np[valid_fr, i], u_free_cv[valid_fr, i])
+        fr_valid = cv_fr_r2[np.isfinite(cv_fr_r2)]
+        print(f"\n[Stage2-CV] Free-run R² (stitched, seed={seed_steps})")
+        if len(fr_valid) > 0:
+            print(f"  mean={np.nanmean(fr_valid):.4f}  "
+                  f"median={np.nanmedian(fr_valid):.4f}  "
+                  f"#neg={int((fr_valid < 0).sum())}/{len(fr_valid)}")
 
-        # ---- save results ----------------------------------------------------
+        cv_free_run = {
+            "u_free": u_free_cv,
+            "r2": cv_fr_r2,
+            "corr": np.full(N, np.nan),
+            "rmse": np.full(N, np.nan),
+            "motor_idx": np.array([], dtype=int),
+            "seed_steps": seed_steps,
+            "eval_range": (seed_steps, T),
+            "mode": "autonomous",
+        }
+
+        avg_decomp_summary: Dict[str, float] = {}
+        if decomp_summaries and decomp_summaries[0]:
+            for key in decomp_summaries[0]:
+                avg_decomp_summary[key] = float(np.mean(
+                    [d[key] for d in decomp_summaries]))
+        avg_decomp_per_neuron = (np.mean(decomp_per_neurons, axis=0)
+                                 if decomp_per_neurons and len(decomp_per_neurons[0]) > 0
+                                 else np.array([]))
+        cv_decomposition = (avg_decomp_summary, avg_decomp_per_neuron)
+        print(f"{'='*60}")
+
         results_h5 = (None if save_dir is None
                       else str(Path(save_dir) / "stage2_results.h5"))
         params_final = fold_states[best_fi]
         save_results_pt(cfg, u_stage1.to(device).detach(),
                         params_final, output_path=results_h5)
 
-        # Save CV predictions & metrics
         if save_dir is not None:
             cv_path = Path(save_dir) / "cv_onestep.npz"
             save_data = dict(
@@ -1271,35 +1167,47 @@ def train_stage2_cv(
                 fold_test_mse=np.array(fold_test_mse),
                 folds=np.array(folds),
                 best_fold=best_fi,
+                cv_fr_r2=cv_fr_r2,
+                u_free_cv=u_free_cv,
             )
             if cv_loo_r2 is not None:
                 save_data["cv_loo_r2"] = cv_loo_r2
                 for i, pred in cv_loo_preds.items():
                     save_data[f"loo_pred_{i}"] = pred
-            if cv_loo_r2_windowed is not None:
-                save_data["cv_loo_r2_windowed"] = cv_loo_r2_windowed
             np.savez(cv_path, **save_data)
             print(f"[Stage2-CV] CV predictions saved to {cv_path}")
 
-        # ---- final evaluation with best-fold model ---------------------------
         eval_result = None
         _skip_final = bool(getattr(cfg, "skip_final_eval", False))
         if (save_dir or show) and not _skip_final:
+            _precomputed: dict = {
+                "onestep": {"r2": cv_r2, "prior_mu": pred_u_full,
+                            "corr": np.full(N, np.nan),
+                            "rmse": np.full(N, np.nan),
+                            "r2_delta": np.full(N, np.nan),
+                            "corr_delta": np.full(N, np.nan),
+                            "ar1_mu": np.full_like(pred_u_full, np.nan)},
+                "free_run": cv_free_run,
+                "decomposition": cv_decomposition,
+            }
+            if cv_loo_preds is not None:
+                _precomputed["loo"] = {"pred": cv_loo_preds, "r2": cv_loo_r2}
             eval_result = generate_eval_loo_plots(
                 model=best_model, data=data, cfg=cfg,
                 epoch_losses=[],
                 save_dir=save_dir or "plots/eval_cv", show=show,
-                decoder=None,
-                beh_all_baseline=beh_all_baseline,
+                precomputed=_precomputed,
             )
 
-        # Inject CV metrics into eval_result
         if eval_result is None:
             eval_result = {}
         eval_result["cv_onestep_r2"] = cv_r2
         eval_result["cv_onestep_r2_mean"] = float(np.nanmean(cv_r2))
         eval_result["cv_onestep_r2_median"] = float(np.nanmedian(cv_r2))
         eval_result["cv_pred_u_full"] = pred_u_full
+        eval_result["cv_fr_r2"] = cv_fr_r2
+        eval_result["cv_fr_r2_mean"] = float(np.nanmean(fr_valid)) if len(fr_valid) > 0 else float("nan")
+        eval_result["cv_fr_r2_median"] = float(np.nanmedian(fr_valid)) if len(fr_valid) > 0 else float("nan")
         eval_result["fold_test_mse"] = fold_test_mse
         eval_result["best_fold_idx"] = best_fi
         if cv_loo_r2 is not None:
@@ -1307,15 +1215,6 @@ def train_stage2_cv(
             eval_result["cv_loo_r2"] = cv_loo_r2
             eval_result["cv_loo_r2_mean"] = float(np.nanmean(loo_valid)) if len(loo_valid) > 0 else float("nan")
             eval_result["cv_loo_r2_median"] = float(np.nanmedian(loo_valid)) if len(loo_valid) > 0 else float("nan")
-        if cv_loo_r2_windowed is not None:
-            loo_w_valid = cv_loo_r2_windowed[np.isfinite(cv_loo_r2_windowed)]
-            eval_result["cv_loo_r2_windowed"] = cv_loo_r2_windowed
-            eval_result["cv_loo_r2_windowed_mean"] = float(np.nanmean(loo_w_valid)) if len(loo_w_valid) > 0 else float("nan")
-            eval_result["cv_loo_r2_windowed_median"] = float(np.nanmedian(loo_w_valid)) if len(loo_w_valid) > 0 else float("nan")
-
-        # Coupling gate diagnostics (if enabled)
-        if hasattr(best_model, 'has_coupling_gate') and best_model.has_coupling_gate:
-            eval_result["coupling_gate_values"] = best_model.coupling_gate_values.detach().cpu().numpy()
 
         return eval_result
 
@@ -1324,23 +1223,11 @@ def train_stage2_cv(
             _tee.close()
 
 
-# --------------------------------------------------------------------------- #
-#  Main entry point                                                             #
-# --------------------------------------------------------------------------- #
-
-
 def train_stage2(
     cfg: Stage2PTConfig,
     save_dir: str | None = None,
     show: bool = False,
     warm_start_dir: str | None = None,
 ) -> Optional[dict]:
-    """Train Stage 2 with k-fold temporal CV for fair one-step and LOO R².
-
-    This is the main entry point.  It always uses temporal cross-validation
-    (``cfg.cv_folds`` folds, default 5) to produce out-of-sample one-step
-    and LOO R² metrics, matching the evaluation protocol of the Transformer
-    baseline.
-    """
     return train_stage2_cv(cfg, save_dir=save_dir, show=show,
                            warm_start_dir=warm_start_dir)

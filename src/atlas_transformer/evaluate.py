@@ -28,7 +28,7 @@ import sys
 _SRC = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_SRC))
 
-from stage2.evaluate import _r2
+from stage2._utils import _r2
 from baseline_transformer.evaluate import (
     build_lagged_features_np,
     valid_lag_mask_np,

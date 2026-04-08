@@ -179,7 +179,6 @@ def _train_stage2_fast(
         learning_rate=0.001,
         learn_noise=True,
         noise_mode="heteroscedastic",
-        coupling_gate=True,
         graph_poly_order=2,
         behavior_weight=0.0,   # decode behaviour separately
         rollout_weight=rollout_weight,

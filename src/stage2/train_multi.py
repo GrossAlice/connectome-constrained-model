@@ -48,6 +48,8 @@ def _forward_pass_worm(
     G   = worm.G          # scalar or None
     b   = worm.b          # (N,) or None
 
+    model.reset_lag_history()
+
     for t in range(T - 1):
         g = worm.gating[t]                                        # (N,)
         s = worm.stim[t] if worm.stim is not None else None       # (N,) or None
@@ -235,6 +237,9 @@ def _rollout_loss_worm(
         s_sv  = torch.zeros(N, model.r_sv,  device=device, dtype=u_full.dtype)
         s_dcv = torch.zeros(N, model.r_dcv, device=device, dtype=u_full.dtype)
 
+        if hasattr(model, 'init_lag_history'):
+            model.init_lag_history(u_full, t0)
+
         seg_loss  = torch.tensor(0.0, device=device)
         seg_count = 0
 
@@ -308,7 +313,7 @@ def _val_loss_worm(
     model: Stage2ModelPT, worm: WormState
 ) -> float:
     """One-step MSE on validation time-points (detached, no grad)."""
-    u_full   = worm.assemble_detached()
+    u_full   = worm.assemble(detach=True)
     prior_mu = _forward_pass_worm(model, worm, u_full)
     val_mask = worm.val_mask
     if not val_mask.any():
@@ -554,7 +559,7 @@ def _train_multi_worm_inner(
 
     def _build_worm_plot_data(ws: WormState) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
         """Build (worm_data, worm_decoder) for generate_eval_loo_plots."""
-        u_full = ws.assemble_detached().detach()
+        u_full = ws.assemble(detach=True).detach()
         beh_t = ws.behaviour
         worm_data = {
             "u_stage1":      u_full,
@@ -616,7 +621,7 @@ def _train_multi_worm_inner(
         tr_losses: Dict[str, float] = {}
 
         for worm in worm_states:
-            u_full = worm.assemble_detached()           # u_unobs treated as fixed data
+            u_full = worm.assemble(detach=True)           # u_unobs treated as fixed data
             pm     = _forward_pass_worm(model, worm, u_full)
             tm     = worm.train_mask()
             w      = worm.weight

@@ -9,13 +9,15 @@ from typing import Dict, Any, Optional, Tuple
 import matplotlib.colors as mcolors
 
 from .model import Stage2ModelPT
-from .evaluate import _pearson, _r2, run_full_evaluation
-from .worm_state import WormState
+from ._utils import _r2, _pearson, _cfg_val
+from .evaluate import (
+    compute_onestep, compute_free_run,
+    run_loo_all, choose_loo_subset,
+)
 from . import get_stage2_logger
 
 __all__ = [
     "generate_eval_loo_plots",
-    "run_full_evaluation",
     "generate_multi_worm_plots",
     "plot_r2_three_metrics",
     "plot_merged_summary_slide",
@@ -330,6 +332,7 @@ def plot_summary_slide(
     save_dir: str,
     epoch_losses: Optional[list] = None,
     beh_all: Optional[Dict[str, Any]] = None,
+    precomputed_decomp: Optional[Tuple[Dict[str, float], np.ndarray]] = None,
 ):
     import matplotlib.pyplot as plt
     from matplotlib.gridspec import GridSpec
@@ -441,52 +444,65 @@ def plot_summary_slide(
         ax.text(0.5, 0.5, "No behaviour",
                 ha="center", va="center", fontsize=14)
 
+    # F. Multistep rollout – skip if no epoch_losses (CV path: model evaluated
+    # on training data would leak; proper CV rollout is in free-run R²).
     ax = fig.add_subplot(gs[1, 1])
-    steps_list = (1, 5, 10, 20)
-    device = next(model.parameters()).device
-    u = data["u_stage1"].to(device)
-    gating = data.get("gating")
-    stim = data.get("stim")
+    if epoch_losses:
+        steps_list = (1, 5, 10, 20)
+        device = next(model.parameters()).device
+        u = data["u_stage1"].to(device)
+        gating = data.get("gating")
+        stim = data.get("stim")
 
-    g_default = torch.ones(N, device=device) if gating is None else None
-    with torch.no_grad():
-        s_sv_all = torch.zeros(T, N, model.r_sv, device=device)
-        s_dcv_all = torch.zeros(T, N, model.r_dcv, device=device)
-        s_sv_w = torch.zeros(N, model.r_sv, device=device)
-        s_dcv_w = torch.zeros(N, model.r_dcv, device=device)
-        for t in range(T):
-            s_sv_all[t], s_dcv_all[t] = s_sv_w, s_dcv_w
-            g = gating[t] if gating is not None else g_default
-            s = stim[t] if stim is not None else None
-            _, s_sv_w, s_dcv_w = model.prior_step(
-                u[t], s_sv_w, s_dcv_w, g, s)
-
-    medians_raw = []
-    for K in steps_list:
-        stride = max(1, K // 2)
-        preds_raw = np.zeros_like(u_np)
-        counts = np.zeros(T)
+        g_default = torch.ones(N, device=device) if gating is None else None
         with torch.no_grad():
-            for t0 in range(0, T - K, stride):
-                u_t_raw = u[t0]
-                sv_r, dcv_r = s_sv_all[t0].clone(), s_dcv_all[t0].clone()
-                for k in range(1, K + 1):
-                    g = (gating[t0 + k - 1] if gating is not None
-                         else g_default)
-                    s = stim[t0 + k - 1] if stim is not None else None
-                    u_t_raw, sv_r, dcv_r = model.prior_step(u_t_raw, sv_r, dcv_r, g, s)
-                preds_raw[t0 + K] += u_t_raw.cpu().numpy()
-                counts[t0 + K] += 1
-        v = counts > 0
-        preds_raw[v] /= counts[v, None]
-        r2_k_raw = np.array([_r2(u_np[v, i], preds_raw[v, i]) for i in range(N)])
-        medians_raw.append(np.nanmedian(r2_k_raw))
-    ax.plot(steps_list, medians_raw, color=_COL_CV, marker="o",
-            ls="-", lw=2.5, markersize=7, label="Model")
-    ax.axhline(0, color="gray", lw=0.8, ls=":")
-    ax.legend(frameon=False, fontsize=11)
-    _style(ax, xlabel="Horizon K (steps)", ylabel="Median R\u00b2",
-           title="F. Multistep Rollout")
+            s_sv_all = torch.zeros(T, N, model.r_sv, device=device)
+            s_dcv_all = torch.zeros(T, N, model.r_dcv, device=device)
+            s_sv_w = torch.zeros(N, model.r_sv, device=device)
+            s_dcv_w = torch.zeros(N, model.r_dcv, device=device)
+            for t in range(T):
+                s_sv_all[t], s_dcv_all[t] = s_sv_w, s_dcv_w
+                g = gating[t] if gating is not None else g_default
+                s = stim[t] if stim is not None else None
+                _, s_sv_w, s_dcv_w = model.prior_step(
+                    u[t], s_sv_w, s_dcv_w, g, s)
+
+        medians_raw = []
+        for K in steps_list:
+            stride = max(1, K // 2)
+            preds_raw = np.zeros_like(u_np)
+            counts = np.zeros(T)
+            with torch.no_grad():
+                for t0 in range(0, T - K, stride):
+                    u_t_raw = u[t0]
+                    sv_r, dcv_r = s_sv_all[t0].clone(), s_dcv_all[t0].clone()
+                    for k in range(1, K + 1):
+                        g = (gating[t0 + k - 1] if gating is not None
+                             else g_default)
+                        s = stim[t0 + k - 1] if stim is not None else None
+                        u_t_raw, sv_r, dcv_r = model.prior_step(u_t_raw, sv_r, dcv_r, g, s)
+                    preds_raw[t0 + K] += u_t_raw.cpu().numpy()
+                    counts[t0 + K] += 1
+            v = counts > 0
+            preds_raw[v] /= counts[v, None]
+            r2_k_raw = np.array([_r2(u_np[v, i], preds_raw[v, i]) for i in range(N)])
+            medians_raw.append(np.nanmedian(r2_k_raw))
+        ax.plot(steps_list, medians_raw, color=_COL_CV, marker="o",
+                ls="-", lw=2.5, markersize=7, label="Model")
+        ax.axhline(0, color="gray", lw=0.8, ls=":")
+        ax.legend(frameon=False, fontsize=11)
+        _style(ax, xlabel="Horizon K (steps)", ylabel="Median R\u00b2",
+               title="F. Multistep Rollout")
+    else:
+        fr_med = np.nanmedian(r2_fr[np.isfinite(r2_fr)]) if np.any(np.isfinite(r2_fr)) else float("nan")
+        ax.text(0.5, 0.55, f"Free-run R\u00b2\nmedian = {fr_med:.3f}",
+                ha="center", va="center", fontsize=18, fontweight="bold",
+                transform=ax.transAxes)
+        ax.text(0.5, 0.25, "(CV-stitched autonomous rollout)",
+                ha="center", va="center", fontsize=12, color="0.4",
+                transform=ax.transAxes)
+        ax.set_axis_off()
+        _style(ax, title="F. Free-run Summary")
 
     # G-H. Kernel amplitudes – one panel per synapse type (SV / DCV)
     with torch.no_grad():
@@ -562,7 +578,15 @@ def plot_summary_slide(
 
     # I. Input decomposition
     ax = fig.add_subplot(gs[2, 0])
-    decomp, per_neuron_rms = _compute_input_decomposition(model, data)
+    if (precomputed_decomp is not None
+            and isinstance(precomputed_decomp, (list, tuple))
+            and len(precomputed_decomp) == 2
+            and isinstance(precomputed_decomp[1], np.ndarray)
+            and precomputed_decomp[1].ndim == 2
+            and precomputed_decomp[1].shape[0] > 0):
+        decomp, per_neuron_rms = precomputed_decomp
+    else:
+        decomp, per_neuron_rms = _compute_input_decomposition(model, data)
     labels_d = list(decomp.keys())
     vals_d = [decomp[k] for k in labels_d]
     colours_d = [_COL_RAW, _COL_DATA, _COL_CV, _COL_FR, "#ff7f0e", "#333333", "0.55"]
@@ -959,8 +983,8 @@ def generate_eval_loo_plots(
     show: bool = False,
     decoder=None,
     beh_all_baseline=None,
+    precomputed: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Run full evaluation, then render the three diagnostic figures."""
     import matplotlib
 
     if not show:
@@ -969,29 +993,52 @@ def generate_eval_loo_plots(
     setup_plot_style()
     Path(save_dir).mkdir(parents=True, exist_ok=True)
 
-    results = run_full_evaluation(model, data, cfg, decoder=decoder,
-                                  beh_all_baseline=beh_all_baseline)
+    data["_cfg"] = cfg
+    pre = precomputed or {}
 
-    onestep  = results["onestep"]
-    loo      = results["loo"]
-    free_run = results["free_run"]
-    beh      = results.get("beh")
-    beh_all  = results.get("beh_all")
+    onestep = pre.get("onestep") or compute_onestep(model, data)
+    free_run = pre.get("free_run") or compute_free_run(model, data)
+
+    loo = pre.get("loo")
+    if loo is None:
+        subset = choose_loo_subset(
+            data, onestep,
+            subset_size=_cfg_val(cfg, "eval_loo_subset_size", 0, int),
+            subset_mode=str(getattr(cfg, "eval_loo_subset_mode", "variance")),
+            explicit_indices=(
+                None if getattr(cfg, "eval_loo_subset_neurons", None) is None
+                else list(cfg.eval_loo_subset_neurons)
+            ),
+            seed=_cfg_val(cfg, "eval_loo_subset_seed", 0, int),
+        )
+        loo = run_loo_all(
+            model, data, subset=subset,
+            window_size=_cfg_val(cfg, "eval_loo_window_size", 0, int),
+            warmup_steps=_cfg_val(cfg, "eval_loo_warmup_steps", 0, int),
+        )
+
+    beh, beh_all = None, beh_all_baseline
+    if decoder is not None:
+        from .behavior_decoder_eval import evaluate_training_decoder
+        beh = evaluate_training_decoder(decoder, data, onestep)
+        if beh_all is None:
+            from .behavior_decoder_eval import behaviour_all_neurons_prediction
+            beh_all = behaviour_all_neurons_prediction(data)
+
+    decomp = pre.get("decomposition")
 
     plot_summary_slide(model, data, onestep, loo, free_run, beh,
                        save_dir, epoch_losses=epoch_losses,
-                       beh_all=beh_all)
+                       beh_all=beh_all,
+                       precomputed_decomp=decomp)
     plot_parameter_trajectories(epoch_losses, save_dir, cfg=cfg)
-    plot_prediction_traces(data, onestep, loo, free_run, save_dir,
-                           freerun_stoch=results.get("freerun_stoch"))
+    plot_prediction_traces(data, onestep, loo, free_run, save_dir)
 
     return {
-        "beh": beh,
-        "beh_r2_model": results.get("beh_r2_model"),
         "onestep": onestep,
         "loo": loo,
         "free_run": free_run,
-        "freerun_stoch": results.get("freerun_stoch"),
+        "beh": beh,
         "beh_all": beh_all,
     }
 

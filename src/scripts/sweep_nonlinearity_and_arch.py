@@ -12,7 +12,6 @@ non-connectome interactions, (3) missing neurons (~170/302 unobserved).
 This sweep tests:
   A. Nonlinearities — φ(u) in the synaptic current equation
      sigmoid (default), tanh, softplus, relu, elu, swish, shifted_sigmoid, identity
-  B. Residual MLP — I_mlp = MLP(u) added to dynamics (capture non-connectome paths)
   C. Low-rank coupling — V @ tanh(U @ u) (parameterised non-connectome interactions)
   D. Learned reversals — per-neuron E_sv instead of fixed
   E. Noise correlation rank — low-rank correlated noise (shared unmodeled inputs)
@@ -75,26 +74,7 @@ def build_conditions(epochs: int = 30) -> OrderedDict:
         chemical_synapse_activation="shifted_sigmoid",
     )
     C["A7_identity"] = dict(
-        linear_chemical_synapses=True,
-    )
-
-    # ─────────── GROUP B: Residual MLP ───────────
-    # Small MLP correction term on top of connectome dynamics
-    C["B1_mlp_h32"] = dict(
-        residual_mlp_hidden=32,
-        residual_mlp_layers=2,
-    )
-    C["B2_mlp_h64"] = dict(
-        residual_mlp_hidden=64,
-        residual_mlp_layers=2,
-    )
-    C["B3_mlp_h128"] = dict(
-        residual_mlp_hidden=128,
-        residual_mlp_layers=2,
-    )
-    C["B4_mlp_h64_3L"] = dict(
-        residual_mlp_hidden=64,
-        residual_mlp_layers=3,
+        chemical_synapse_activation="identity",
     )
 
     # ─────────── GROUP C: Low-rank coupling ───────────
@@ -138,24 +118,12 @@ def build_conditions(epochs: int = 30) -> OrderedDict:
     )
 
     # ─────────── GROUP H: Best combos ───────────
-    # Combo: tanh + residual MLP
-    C["H1_tanh_mlp64"] = dict(
-        chemical_synapse_activation="tanh",
-        residual_mlp_hidden=64,
-    )
-    # Combo: swish + residual MLP
-    C["H2_swish_mlp64"] = dict(
-        chemical_synapse_activation="swish",
-        residual_mlp_hidden=64,
-    )
     # Combo: residual MLP + low-rank
     C["H3_mlp64_lr10"] = dict(
-        residual_mlp_hidden=64,
         lowrank_rank=10,
     )
     # Combo: residual MLP + rollout
     C["H4_mlp64_rollout"] = dict(
-        residual_mlp_hidden=64,
         rollout_weight=0.3,
         rollout_steps=15,
         rollout_starts=4,
@@ -163,22 +131,14 @@ def build_conditions(epochs: int = 30) -> OrderedDict:
     # Combo: tanh + mlp + low-rank + rollout (kitchen sink)
     C["H5_tanh_mlp64_lr10_ro"] = dict(
         chemical_synapse_activation="tanh",
-        residual_mlp_hidden=64,
         lowrank_rank=10,
         rollout_weight=0.3,
         rollout_steps=15,
         rollout_starts=4,
     )
-    # Combo: learned reversals + residual MLP
-    C["H6_rev_mlp64"] = dict(
-        learn_reversals=True,
-        reversal_mode="per_neuron",
-        residual_mlp_hidden=64,
-    )
     # Combo: noise rank + residual MLP
     C["H7_noise5_mlp64"] = dict(
         noise_corr_rank=5,
-        residual_mlp_hidden=64,
     )
 
     return C

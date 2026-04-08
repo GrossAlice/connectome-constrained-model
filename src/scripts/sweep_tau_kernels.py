@@ -69,7 +69,6 @@ class TauSweepConfig:
     per_neuron_tau_scale: bool = False
     # Other dynamics settings (keep defaults unless noted)
     per_neuron_amplitudes: bool = True
-    coupling_gate: bool = True
     graph_poly_order: int = 2
     # Epochs
     num_epochs: int = 30
@@ -201,20 +200,6 @@ def build_sweep_configs(epochs: int = 30) -> List[TauSweepConfig]:
         num_epochs=epochs,
     ))
 
-    # ── L: No coupling gate (test if gate is masking kernel effects) ──
-    cfgs.append(TauSweepConfig(
-        name="L_no_gate_learn",
-        description="Learn taus + longer init, NO coupling gate",
-        tau_sv_init=(2.0, 8.0),
-        tau_dcv_init=(5.0, 15.0),
-        a_sv_init=(1.5, 0.5),
-        a_dcv_init=(0.15, 0.05),
-        fix_tau_sv=False,
-        fix_tau_dcv=False,
-        coupling_gate=False,
-        num_epochs=epochs,
-    ))
-
     # ── M: Wide tau span fixed (test range hypothesis) ──
     cfgs.append(TauSweepConfig(
         name="M_wide_span",
@@ -260,7 +245,6 @@ def run_one_config(
         fix_tau_dcv=sc.fix_tau_dcv,
         per_neuron_tau_scale=sc.per_neuron_tau_scale,
         per_neuron_amplitudes=sc.per_neuron_amplitudes,
-        coupling_gate=sc.coupling_gate,
         graph_poly_order=sc.graph_poly_order,
         # Standard dynamics settings
         learn_lambda_u=True,
@@ -327,12 +311,6 @@ def run_one_config(
                         raw = state[raw_key]
                         tau_val = _reparam_fwd(raw, _TAU_LO, None)
                         metrics[f"fold{fold_i}_tau_{prefix}"] = tau_val.tolist()
-                # Extract coupling gate values
-                if "_coupling_gate_raw" in state:
-                    gate = torch.sigmoid(state["_coupling_gate_raw"])
-                    metrics[f"fold{fold_i}_gate_mean"] = float(gate.mean())
-                    metrics[f"fold{fold_i}_gate_min"] = float(gate.min())
-                    metrics[f"fold{fold_i}_gate_max"] = float(gate.max())
                 # Extract tau scale if present
                 if "_tau_scale_log" in state:
                     ts = torch.exp(state["_tau_scale_log"])
@@ -417,15 +395,6 @@ def print_summary(all_results: List[Dict], dt: float):
                   f"mean={r['fold0_tau_scale_mean']:.3f}  "
                   f"range=[{r['fold0_tau_scale_min']:.3f}, "
                   f"{r['fold0_tau_scale_max']:.3f}]")
-
-    # Print gate stats
-    for r in sorted_results:
-        if "fold0_gate_mean" in r:
-            nm = r["name"]
-            print(f"  {nm}: coupling gate "
-                  f"mean={r['fold0_gate_mean']:.3f}  "
-                  f"range=[{r['fold0_gate_min']:.3f}, "
-                  f"{r['fold0_gate_max']:.3f}]")
 
     print()
     best = sorted_results[0]
@@ -575,8 +544,7 @@ def main():
         r_dcv = len(c.tau_dcv_init)
         fix_str = "fixed" if c.fix_tau_sv else "LEARN"
         pnt = " +per-neuron-τ" if c.per_neuron_tau_scale else ""
-        gate = " -gate" if not c.coupling_gate else ""
-        print(f"    {c.name}: r_sv={r_sv} r_dcv={r_dcv} τ={fix_str}{pnt}{gate}")
+        print(f"    {c.name}: r_sv={r_sv} r_dcv={r_dcv} τ={fix_str}{pnt}")
     print()
 
     # Run sweep

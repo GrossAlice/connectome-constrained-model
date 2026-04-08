@@ -142,8 +142,8 @@ def _init_shared_from_population(
     init_reversals(model, u_best, I0_avg, cfg)
 
     # W / G structure init
-    init_W_from_config(model, cfg)
-    init_G_from_config(model, cfg)
+    init_W_from_config(model, cfg, u=u_best)
+    init_G_from_config(model, cfg, u=u_best)
 
     # Network scale from population-average residuals
     # Use population-averaged teacher-forced residuals for OLS scale

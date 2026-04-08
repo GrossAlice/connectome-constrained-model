@@ -257,7 +257,7 @@ def _cv_ridge_nb_freerun(u, b, K_n, K_b, reclamp_every=RECLAMP_FRAMES):
         mu_b, sig_b = b[tr].mean(0), b[tr].std(0) + 1e-8
         b_n = ((b - mu_b) / sig_b).astype(np.float32)
 
-        X_u = _build_lagged(u_n, K_n, include_current=True)  # Include current neural timepoint
+        X_u = _build_lagged(u_n, K_n, include_current=False)  # Lags only — predict b[t+1] from u[t]
         X_b = _build_lagged(b_n, K_b)
         X = np.concatenate([X_u, X_b], axis=1)
         
@@ -275,8 +275,8 @@ def _cv_ridge_nb_freerun(u, b, K_n, K_b, reclamp_every=RECLAMP_FRAMES):
                 b_running[ts:t] = b_n[ts:t]
             
             X_b_t = np.concatenate([b_running[t - lag] for lag in range(1, K_b + 1)])
-            # Include current neural timepoint first, then lags 1..K_n
-            X_u_t = np.concatenate([u_n[t]] + [u_n[t - lag] for lag in range(1, K_n + 1)])
+            # Lags 1..K_n only — no current neural frame
+            X_u_t = np.concatenate([u_n[t - lag] for lag in range(1, K_n + 1)])
             X_t = np.concatenate([X_u_t, X_b_t])[None, :]
             pred_beh = model.predict(X_t)[0]
             pred_b_fold[i] = pred_beh
@@ -312,8 +312,8 @@ def _cv_ridge_n_freerun(u, b, K_n):
         mu_b, sig_b = b[tr].mean(0), b[tr].std(0) + 1e-8
         b_n = ((b - mu_b) / sig_b).astype(np.float32)
 
-        # Neural-only features (include current timepoint)
-        X_u = _build_lagged(u_n, K_n, include_current=True)
+        # Neural-only features — lags only, no current frame
+        X_u = _build_lagged(u_n, K_n, include_current=False)
         
         # Target is behavior - use RidgeCV for optimal alpha selection
         model = Ridge(alpha=1000.0).fit(X_u[tr], b_n[tr])
@@ -471,7 +471,7 @@ def _cv_mlp_nb_freerun(u, b, K_n, K_b, device, reclamp_every=RECLAMP_FRAMES):
         mu_u, sig_u = u[tr].mean(0), u[tr].std(0) + 1e-8
         u_n = ((u - mu_u) / sig_u).astype(np.float32)
         
-        X_u = _build_lagged(u_n, K_n, include_current=True)  # Include current neural timepoint
+        X_u = _build_lagged(u_n, K_n, include_current=False)  # Lags only — predict b[t+1] from u[t]
         
         seg_before = np.arange(warmup, ts)
         seg_after_start = te + max_K
@@ -526,8 +526,8 @@ def _cv_mlp_n_freerun(u, b, K_n, device):
         mu_b, sig_b = b[tr].mean(0), b[tr].std(0) + 1e-8
         b_n = ((b - mu_b) / sig_b).astype(np.float32)
 
-        # Neural-only features (include current timepoint)
-        X_u = _build_lagged(u_n, K_n, include_current=True)
+        # Neural-only features — lags only, no current frame
+        X_u = _build_lagged(u_n, K_n, include_current=False)
         
         mlp = _train_mlp_fast(X_u[tr], b_n[tr], Kw, device)
 
@@ -616,7 +616,7 @@ def _train_transformer(X_win, y_target, n_neural, n_beh, K, device, use_small=Fa
 def _cv_trf_nb_freerun(u, b, K_n, K_b, device, use_small=False, reclamp_every=RECLAMP_FRAMES):
     """Transformer: n+b context → BEHAVIOR ONLY, free-run with re-clamping.
     
-    Neural context includes current timepoint: u[t-K:t+1] (K+1 timesteps).
+    Neural context uses lags only: u[t-K:t] (K timesteps, no current frame).
     Behavior context uses lags only: b[t-K_b:t] (K_b timesteps).
     """
     T, N, Kw = u.shape[0], u.shape[1], b.shape[1]
@@ -634,14 +634,14 @@ def _cv_trf_nb_freerun(u, b, K_n, K_b, device, use_small=False, reclamp_every=RE
 
         X_win = []
         for t in tr:
-            # Include current neural timepoint: u[t-K:t+1] -> K+1 timesteps
-            ctx_u = u_n[t - K:t + 1]  # Shape: (K+1, N)
-            if K_b < K + 1:
-                ctx_b = np.zeros((K + 1, Kw), dtype=np.float32)
+            # Lags only — no current neural frame: u[t-K:t] -> K timesteps
+            ctx_u = u_n[t - K:t]  # Shape: (K, N)
+            if K_b < K:
+                ctx_b = np.zeros((K, Kw), dtype=np.float32)
                 ctx_b[-(K_b):] = b_n[t - K_b:t] if K_b > 0 else np.zeros((0, Kw))
             else:
-                ctx_b = np.zeros((K + 1, Kw), dtype=np.float32)
-                ctx_b[:K] = b_n[t - K:t]  # Behavior lags only (no current)
+                ctx_b = np.zeros((K, Kw), dtype=np.float32)
+                ctx_b[:K] = b_n[t - K:t]
             ctx = np.concatenate([ctx_u, ctx_b], axis=1)
             X_win.append(ctx)
         X_win = np.stack(X_win)
@@ -649,7 +649,7 @@ def _cv_trf_nb_freerun(u, b, K_n, K_b, device, use_small=False, reclamp_every=RE
         # Target is BEHAVIOR ONLY
         y_tr_beh = b_n[tr]
 
-        model = _train_transformer(X_win, y_tr_beh, n_neural=N, n_beh=Kw, K=K+1, device=device, use_small=use_small)
+        model = _train_transformer(X_win, y_tr_beh, n_neural=N, n_beh=Kw, K=K, device=device, use_small=use_small)
 
         pred_b_fold = np.zeros((te - ts, Kw), dtype=np.float32)
         b_running = b_n.copy()
@@ -659,9 +659,9 @@ def _cv_trf_nb_freerun(u, b, K_n, K_b, device, use_small=False, reclamp_every=RE
             if reclamp_every is not None and i > 0 and i % reclamp_every == 0:
                 b_running[ts:t] = b_n[ts:t]
             
-            # Include current neural timepoint
-            ctx_u = u_n[t - K:t + 1]  # Shape: (K+1, N)
-            ctx_b = np.zeros((K + 1, Kw), dtype=np.float32)
+            # Lags only — no current neural frame
+            ctx_u = u_n[t - K:t]  # Shape: (K, N)
+            ctx_b = np.zeros((K, Kw), dtype=np.float32)
             if K_b > 0:
                 ctx_b[-(K_b):] = b_running[t - K_b:t]
             ctx = np.concatenate([ctx_u, ctx_b], axis=1)[None, ...]
@@ -682,7 +682,7 @@ def _cv_trf_nb_freerun(u, b, K_n, K_b, device, use_small=False, reclamp_every=RE
 def _cv_trf_n_freerun(u, b, K_n, device, use_small=False):
     """Transformer: neural-only context → behavior (direct prediction).
     
-    Neural context includes current timepoint: u[t-K:t+1] (K+1 timesteps).
+    Neural context uses lags only: u[t-K:t] (K timesteps, no current frame).
     """
     T, N, Kw = u.shape[0], u.shape[1], b.shape[1]
     warmup = K_n
@@ -696,17 +696,17 @@ def _cv_trf_n_freerun(u, b, K_n, device, use_small=False):
         mu_b, sig_b = b[tr].mean(0), b[tr].std(0) + 1e-8
         b_n = ((b - mu_b) / sig_b).astype(np.float32)
 
-        # Include current neural timepoint: u[t-K:t+1] -> K+1 timesteps
-        X_win = np.stack([u_n[t - K_n:t + 1] for t in tr])  # Shape: (len(tr), K+1, N)
-        X_win_padded = np.concatenate([X_win, np.zeros((len(tr), K_n + 1, Kw), dtype=np.float32)], axis=-1)
+        # Lags only — no current neural frame: u[t-K:t] -> K timesteps
+        X_win = np.stack([u_n[t - K_n:t] for t in tr])  # Shape: (len(tr), K, N)
+        X_win_padded = np.concatenate([X_win, np.zeros((len(tr), K_n, Kw), dtype=np.float32)], axis=-1)
         
         y_tr_beh = b_n[tr]
 
-        model = _train_transformer(X_win_padded, y_tr_beh, n_neural=N, n_beh=Kw, K=K_n + 1, device=device, use_small=use_small)
+        model = _train_transformer(X_win_padded, y_tr_beh, n_neural=N, n_beh=Kw, K=K_n, device=device, use_small=use_small)
 
-        # Include current neural timepoint for test
-        X_test = np.stack([u_n[t - K_n:t + 1] for t in range(ts, te)])
-        X_test_padded = np.concatenate([X_test, np.zeros((te - ts, K_n + 1, Kw), dtype=np.float32)], axis=-1)
+        # Lags only for test — no current neural frame
+        X_test = np.stack([u_n[t - K_n:t] for t in range(ts, te)])
+        X_test_padded = np.concatenate([X_test, np.zeros((te - ts, K_n, Kw), dtype=np.float32)], axis=-1)
         
         with torch.no_grad():
             ctx_t = torch.tensor(X_test_padded, dtype=torch.float32)
@@ -1140,10 +1140,7 @@ def run_evaluation(u, b, device, K_VALUES, run_name, label, out, worm_id, h5_pat
     ridge_coef_stats = {}
     
     for K_n in K_VALUES:
-        if "Kb1" in run_name:
-            K_b = 1
-        else:
-            K_b = K_n
+        K_b = 1  # Always Kb=1
             
         print(f"\n  K_n={K_n}, K_b={K_b}")
         print(f"  {'-'*50}")
