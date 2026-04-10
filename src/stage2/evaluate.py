@@ -80,7 +80,10 @@ def compute_free_run(model: Stage2ModelPT, data: Dict[str, Any]) -> Dict[str, An
         s_sv = torch.zeros(N, model.r_sv, device=device)
         s_dcv = torch.zeros(N, model.r_dcv, device=device)
         model.reset_lag_history()
-
+        if hasattr(model, 'reset_synapse_lag_history'):
+            model.reset_synapse_lag_history()
+        if hasattr(model, 'reset_iir_delay_history'):
+            model.reset_iir_delay_history()
         for t in range(1, seed_steps):
             g = gating[t - 1] if gating is not None else ones
             s = stim[t - 1] if stim is not None else None
@@ -141,6 +144,10 @@ def free_run_stochastic(
             s_sv = torch.zeros(N, model.r_sv, device=device)
             s_dcv = torch.zeros(N, model.r_dcv, device=device)
             model.reset_lag_history()
+            if hasattr(model, 'reset_synapse_lag_history'):
+                model.reset_synapse_lag_history()
+            if hasattr(model, 'reset_iir_delay_history'):
+                model.reset_iir_delay_history()
             for t in range(T - 1):
                 g = gating[t] if gating is not None else ones
                 s = stim[t] if stim is not None else None
@@ -247,11 +254,22 @@ def loo_forward_simulate_batched(
 
     lag_K = getattr(model, '_lag_order', 0)
     lag_nbr = lag_K > 0 and getattr(model, '_lag_neighbor', False)
+    lag_nbr_per_type = lag_K > 0 and getattr(model, '_lag_nbr_per_type', False)
+    lag_nbr_act = str(getattr(model, '_lag_nbr_act', 'none')) if lag_K > 0 else 'none'
     if lag_K > 0:
         lag_alpha = model._lag_alpha.detach()              # (K, N)
         if lag_nbr:
-            lag_nbr_mask = model._lag_nbr_mask.detach()    # (N, N)
-            lag_G_eff = (model._lag_G * lag_nbr_mask.unsqueeze(0)).detach()  # (K, N, N)
+            if lag_nbr_per_type:
+                # Per-type: list of (prefix, G_eff) tuples
+                _lag_per_type_list = []
+                for prefix in getattr(model, '_lag_nbr_types', []):
+                    G_p = getattr(model, f'_lag_G_{prefix}').detach()
+                    mask_p = getattr(model, f'_lag_nbr_mask_{prefix}').detach()
+                    G_eff_p = (G_p * mask_p.unsqueeze(0))  # (K, N, N)
+                    _lag_per_type_list.append((prefix, G_eff_p))
+            else:
+                lag_nbr_mask = model._lag_nbr_mask.detach()    # (N, N)
+                lag_G_eff = (model._lag_G * lag_nbr_mask.unsqueeze(0)).detach()  # (K, N, N)
 
     batch_range = torch.arange(B, device=device)
     ws = T if window_size <= 0 else window_size
@@ -304,7 +322,27 @@ def loo_forward_simulate_batched(
             I_lag = (lag_alpha.unsqueeze(0) * lag_buf).sum(1)  # (1,K,N)*(B,K,N)->sum->(B,N)
             # Neighbor-lag: sparse connectome matmul per lag order
             if lag_nbr:
-                I_lag = I_lag + torch.einsum('kij,bkj->bi', lag_G_eff, lag_buf)
+                if lag_nbr_per_type:
+                    # Apply activation to buffer for chemical types
+                    if lag_nbr_act in ('none', 'identity', ''):
+                        buf_act = lag_buf
+                    elif lag_nbr_act == 'sigmoid':
+                        buf_act = torch.sigmoid(lag_buf)
+                    elif lag_nbr_act == 'softplus':
+                        import torch.nn.functional as _F
+                        buf_act = _F.softplus(lag_buf)
+                    elif lag_nbr_act == 'tanh':
+                        buf_act = torch.tanh(lag_buf)
+                    elif lag_nbr_act == 'relu':
+                        import torch.nn.functional as _F
+                        buf_act = _F.relu(lag_buf)
+                    else:
+                        buf_act = lag_buf
+                    for prefix, G_eff_p in _lag_per_type_list:
+                        buf_p = lag_buf if prefix == 'e' else buf_act
+                        I_lag = I_lag + torch.einsum('kij,bkj->bi', G_eff_p, buf_p)
+                else:
+                    I_lag = I_lag + torch.einsum('kij,bkj->bi', lag_G_eff, lag_buf)
 
         I_stim = torch.zeros(B, N, device=device)
         if model.d_ell > 0 and stim_t is not None:
@@ -460,6 +498,10 @@ def compute_current_decomposition(
         s_sv_state = torch.zeros(N, model.r_sv, device=device)
         s_dcv_state = torch.zeros(N, model.r_dcv, device=device)
         model.reset_lag_history()
+        if hasattr(model, 'reset_synapse_lag_history'):
+            model.reset_synapse_lag_history()
+        if hasattr(model, 'reset_iir_delay_history'):
+            model.reset_iir_delay_history()
         lam, dt = model.lambda_u.detach(), model.dt
         L = model.laplacian()
         ones = torch.ones(N, device=device)

@@ -92,6 +92,25 @@ def _apply_dff(f, x, sample_rate_hz, method, q, window_sec, eps):
 
 # ── Public API ──
 
+def _apply_f_over_f0(x, sample_rate_hz, method, q, window_sec, eps):
+    """Compute F/F₀ — ratio baseline correction (signal stays positive)."""
+    q = float(np.clip(q, 1e-6, 1 - 1e-6))
+    eps = float(max(eps, 1e-12))
+    method = str(method).strip().lower()
+
+    if method == "quantile":
+        f0 = _quantile_cols(x, q)
+        f0 = np.where(np.isfinite(f0), f0, np.nanmedian(x, axis=0))
+        return x / np.maximum(np.abs(f0[None, :]), eps)
+
+    if method == "rolling_quantile":
+        hw = max(1, int(round(0.5 * float(window_sec) * float(sample_rate_hz))))
+        f0 = _rolling_quantile_baseline(x, q, hw)
+        return x / np.maximum(np.abs(f0), eps)
+
+    raise ValueError(f"Unknown f0_method='{method}' for F/F₀")
+
+
 def load_traces_and_regressor(cfg: Stage1Config) -> np.ndarray:
     with h5py.File(cfg.h5_path, "r") as f:
         if cfg.trace_dataset not in f:
@@ -100,6 +119,9 @@ def load_traces_and_regressor(cfg: Stage1Config) -> np.ndarray:
         if cfg.use_dff:
             X = _apply_dff(f, X, cfg.sample_rate_hz, cfg.f0_method,
                            cfg.f0_quantile, cfg.f0_window_sec, cfg.f0_eps)
+        elif getattr(cfg, 'use_f_over_f0', False):
+            X = _apply_f_over_f0(X, cfg.sample_rate_hz, cfg.f0_method,
+                                 cfg.f0_quantile, cfg.f0_window_sec, cfg.f0_eps)
     return X
 
 

@@ -1,10 +1,15 @@
 """Connectome-informed initialization and regularization for unobserved neurons.
 
-Three improvements over the zeros-init baseline:
+Four improvements over the zeros-init baseline:
 
 1. **Connectome-informed init** — use the gap-junction graph (T_e) to initialise
    u_unobs as a weighted average of observed neurons, so the dynamics optimiser
    starts from a reasonable trajectory rather than zeros.
+
+1b. **SV/DCV-informed init** — extend #1 to also use chemical synapse matrices
+    (T_sv, T_dcv).  Observed traces are convolved with the IIR synaptic kernel
+    before mixing, so the initialised unobserved trajectories reflect the
+    temporal filtering that the dynamics model will apply.
 
 2. **Low-rank mixing matrix** — optionally parameterise
        u_unobs(t) = u_obs(t) @ C        C: (N_obs, N_unobs)
@@ -17,9 +22,11 @@ Three improvements over the zeros-init baseline:
 """
 from __future__ import annotations
 
+import math
 import sys
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -32,6 +39,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "connectome_init_u_unobs",
+    "connectome_init_u_unobs_svdcv",
     "warmup_u_unobs",
     "LowRankUnobs",
 ]
@@ -119,6 +127,195 @@ def connectome_init_u_unobs(
 
     n_inited = sum(1 for ws in worm_states if ws.u_unobs is not None and ws.N_unobs > 0)
     print(f"[UnobsInit] Connectome-init u_unobs for {n_inited} worms (α={alpha})")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 1b. SV/DCV-informed initialisation
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _iir_filter_traces(
+    u: torch.Tensor,            # (T, N)
+    tau: float,                 # IIR time constant (seconds)
+    dt: float,                  # timestep (seconds)
+    activation: str = "sigmoid",
+) -> torch.Tensor:
+    """Apply IIR synaptic filter: s(t+1) = gamma * s(t) + phi(u(t)).
+
+    Returns the filtered (postsynaptic) signal s: (T, N).
+    This is the causal convolution that the dynamics model applies to
+    presynaptic activity before it enters the synaptic current.
+    """
+    gamma = math.exp(-dt / max(tau, 1e-6))
+    T, N = u.shape
+
+    # Apply activation
+    if activation == "sigmoid":
+        phi_u = torch.sigmoid(u)
+    elif activation == "softplus":
+        phi_u = F.softplus(u)
+    elif activation == "relu":
+        phi_u = F.relu(u)
+    else:
+        phi_u = u  # identity — not recommended
+
+    # Causal IIR: s[0] = phi(u[0]), s[t] = gamma*s[t-1] + phi(u[t])
+    s = torch.zeros_like(phi_u)
+    s[0] = phi_u[0]
+    for t in range(1, T):
+        s[t] = gamma * s[t - 1] + phi_u[t]
+
+    return s
+
+
+def _combined_connectivity_matrix(
+    T_e: torch.Tensor,             # (N, N) gap junctions (symmetric)
+    T_sv: torch.Tensor,            # (N, N) short-range chemical [post, pre]
+    T_dcv: torch.Tensor,           # (N, N) long-range chemical [post, pre]
+    obs_idx: torch.Tensor,
+    unobs_idx: torch.Tensor,
+    weight_e: float = 1.0,
+    weight_sv: float = 1.0,
+    weight_dcv: float = 0.5,
+    alpha: float = 1.0,
+) -> torch.Tensor:
+    """Build a mixing matrix C from combined gap + chemical connectivity.
+
+    The combined adjacency W = w_e * T_e + w_sv * T_sv + w_dcv * T_dcv
+    is used in place of T_e alone in the ridge regression.
+
+    T_sv and T_dcv are [post, pre] → W[i, j] means j→i for all types.
+    T_e is symmetric so direction doesn't matter.
+
+    Returns C: (N_obs, N_unobs).
+    """
+    # Normalise each matrix to unit Frobenius norm before combining
+    def _norm(T: torch.Tensor) -> torch.Tensor:
+        fn = T.float().norm()
+        return T.float() / fn.clamp(min=1e-8)
+
+    W = (weight_e * _norm(T_e) + weight_sv * _norm(T_sv)
+         + weight_dcv * _norm(T_dcv))
+
+    W_oo = W[obs_idx][:, obs_idx]        # (N_obs, N_obs)
+    W_ou = W[obs_idx][:, unobs_idx]      # (N_obs, N_unobs)
+
+    N_obs = len(obs_idx)
+    A = W_oo.t() @ W_oo + alpha * torch.eye(N_obs, device=T_e.device)
+    B = W_oo.t() @ W_ou
+    C = torch.linalg.solve(A, B)         # (N_obs, N_unobs)
+    return C
+
+
+def connectome_init_u_unobs_svdcv(
+    worm_states: "List[WormState]",
+    T_e: torch.Tensor,
+    T_sv: torch.Tensor,
+    T_dcv: torch.Tensor,
+    dt: float = 0.6,
+    tau_sv: float = 1.0,
+    tau_dcv: float = 4.0,
+    activation: str = "sigmoid",
+    alpha: float = 1.0,
+    weight_e: float = 1.0,
+    weight_sv: float = 1.0,
+    weight_dcv: float = 0.5,
+    temporal_smooth_sigma: float = 0.0,
+) -> None:
+    """Initialise u_unobs using gap junctions + IIR-filtered chemical synapses.
+
+    For each worm:
+      1. Build a combined mixing matrix C from T_e, T_sv, T_dcv.
+      2. Compute instantaneous contribution: u_obs @ C_gap
+      3. Compute IIR-filtered contribution:
+           s_sv(t)  = IIR(u_obs, tau_sv)  @ C_sv
+           s_dcv(t) = IIR(u_obs, tau_dcv) @ C_dcv
+      4. Blend: u_init = (gap_part + sv_part + dcv_part) / 3
+      5. Scale to match observed activity magnitude.
+
+    This gives unobserved neurons a head start that reflects not just
+    who they're connected to (topology) but the temporal filtering the
+    dynamics model will apply (IIR kernels).
+
+    Parameters
+    ----------
+    worm_states : list of WormState
+    T_e, T_sv, T_dcv : (N_atlas, N_atlas) connectivity matrices
+    dt : timestep in seconds
+    tau_sv, tau_dcv : IIR time constants (used for filtering observed traces)
+    activation : nonlinearity applied before IIR filtering
+    alpha : ridge regularisation
+    weight_e, weight_sv, weight_dcv : relative weights for combined matrix
+    temporal_smooth_sigma : temporal Gaussian smoothing (0 = off)
+    """
+    for worm in worm_states:
+        if worm.u_unobs is None or worm.N_unobs == 0:
+            continue
+
+        obs_idx = worm.obs_idx
+        unobs_idx = worm.unobs_idx
+        u_observed = worm.u_obs[:, obs_idx]   # (T, N_obs)
+
+        # --- Gap-junction channel: instantaneous mixing ---
+        C_gap = _connectome_mixing_matrix(T_e, obs_idx, unobs_idx, alpha=alpha)
+        u_gap = u_observed @ C_gap            # (T, N_unobs)
+
+        # --- SV channel: IIR-filtered mixing ---
+        # Filter observed traces with SV kernel, then mix via SV connectivity
+        C_sv = _combined_connectivity_matrix(
+            torch.zeros_like(T_e), T_sv, torch.zeros_like(T_dcv),
+            obs_idx, unobs_idx,
+            weight_e=0.0, weight_sv=1.0, weight_dcv=0.0,
+            alpha=alpha,
+        )
+        s_sv = _iir_filter_traces(u_observed, tau_sv, dt, activation)
+        u_sv = s_sv @ C_sv                    # (T, N_unobs)
+
+        # --- DCV channel: IIR-filtered mixing ---
+        C_dcv = _combined_connectivity_matrix(
+            torch.zeros_like(T_e), torch.zeros_like(T_sv), T_dcv,
+            obs_idx, unobs_idx,
+            weight_e=0.0, weight_sv=0.0, weight_dcv=1.0,
+            alpha=alpha,
+        )
+        s_dcv = _iir_filter_traces(u_observed, tau_dcv, dt, activation)
+        u_dcv = s_dcv @ C_dcv                 # (T, N_unobs)
+
+        # --- Blend all channels ---
+        # Normalise each channel to unit std, then weight-average
+        parts = []
+        weights = []
+        for name, part, w in [("gap", u_gap, weight_e),
+                               ("sv", u_sv, weight_sv),
+                               ("dcv", u_dcv, weight_dcv)]:
+            pstd = part.std()
+            if pstd > 1e-8 and w > 0:
+                parts.append(part / pstd)
+                weights.append(w)
+
+        if not parts:
+            continue
+
+        w_sum = sum(weights)
+        u_init = sum(w * p for w, p in zip(weights, parts)) / w_sum
+
+        # Optional temporal smoothing
+        if temporal_smooth_sigma > 0:
+            u_init = _temporal_smooth(u_init, temporal_smooth_sigma)
+
+        # Scale to match observed activity magnitude (conservative)
+        obs_std = u_observed.std()
+        init_std = u_init.std()
+        if init_std > 1e-8:
+            u_init = u_init * (obs_std / init_std) * 0.5
+
+        worm.u_unobs.data.copy_(u_init.detach())
+
+    n_inited = sum(1 for ws in worm_states if ws.u_unobs is not None and ws.N_unobs > 0)
+    print(
+        f"[UnobsInit] SV/DCV-informed init u_unobs for {n_inited} worms"
+        f" (α={alpha}, w_e={weight_e}, w_sv={weight_sv}, w_dcv={weight_dcv},"
+        f" τ_sv={tau_sv:.1f}, τ_dcv={tau_dcv:.1f})"
+    )
 
 
 def _temporal_smooth(x: torch.Tensor, sigma: float) -> torch.Tensor:

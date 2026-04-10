@@ -72,6 +72,7 @@ class Stage2ModelPT(nn.Module):
         self._fir_kernel_len = int(getattr(cfg, "fir_kernel_len", 5))
         self._fir_act = str(getattr(cfg, "fir_activation", "identity"))
         self._fir_include_reversal = bool(getattr(cfg, "fir_include_reversal", False))
+        self._chem_lag_include_reversal = bool(getattr(cfg, "chem_lag_include_reversal", False))
 
         self.register_buffer("T_e", T_e.to(device).float())
         self.register_buffer("T_sv", T_sv.to(device).float().abs())
@@ -184,13 +185,50 @@ class Stage2ModelPT(nn.Module):
             self.graph_poly_alpha = nn.Parameter(
                 torch.zeros(self.graph_poly_order - 1, device=device))
 
+        # ── Delayed Laplacian (gap_lag_order) ───────────────────────
+        self._gap_lag_order = int(getattr(cfg, 'gap_lag_order', 1))
+        if self._gap_lag_order > 1:
+            # one learnable weight per extra lag (α_2, α_3, ...)
+            self.gap_lag_alpha = nn.Parameter(
+                torch.zeros(self._gap_lag_order - 1, device=device))
+
         self._coupling_dropout = float(getattr(cfg, 'coupling_dropout', 0.0))
+
+        # ── Connectome ablation switches ────────────────────────────
+        self._use_gap = bool(getattr(cfg, 'use_gap_junctions', True))
+        self._use_sv  = bool(getattr(cfg, 'use_sv_synapses', True))
+        self._use_dcv = bool(getattr(cfg, 'use_dcv_synapses', True))
+
+        # ── Synapse-routed linear lag (FIR on raw u through connectome) ──
+        self._syn_lag_taps = int(getattr(cfg, 'synapse_lag_taps', 0))
+        if self._syn_lag_taps > 0:
+            K_sl = self._syn_lag_taps
+            # Per-neuron weights for each lag tap, routed through connectome
+            if self.T_e.any():
+                self._syn_lag_alpha_e = nn.Parameter(
+                    torch.zeros(K_sl, N, device=device))
+            if self.T_sv.any():
+                self._syn_lag_alpha_sv = nn.Parameter(
+                    torch.zeros(K_sl, N, device=device))
+            if self.T_dcv.any():
+                self._syn_lag_alpha_dcv = nn.Parameter(
+                    torch.zeros(K_sl, N, device=device))
+
+        # ── IIR pure delay (integer steps before exponential filter) ──
+        self._iir_delay_sv = int(getattr(cfg, 'iir_delay_sv', 0))
+        self._iir_delay_dcv = int(getattr(cfg, 'iir_delay_dcv', 0))
+        self._iir_max_delay = max(self._iir_delay_sv, self._iir_delay_dcv)
+        if self._iir_max_delay > 0:
+            self.register_buffer(
+                '_iir_phi_buf',
+                torch.zeros(self._iir_max_delay + 1, N, device=device))
 
         self._lag_order = int(getattr(cfg, 'lag_order', 0))
         self._lag_neighbor = bool(getattr(cfg, 'lag_neighbor', False))
         self._lag_conn_mask = str(getattr(cfg, 'lag_connectome_mask', 'T_e'))
         self._lag_nbr_act = str(getattr(cfg, 'lag_neighbor_activation', 'none'))
         self._lag_nbr_per_type = bool(getattr(cfg, 'lag_neighbor_per_type', False))
+        self._lag_exclude = set(getattr(cfg, 'lag_exclude_types', ()))
         if self._lag_order > 0:
             K_lag = self._lag_order
             self._lag_alpha = nn.Parameter(
@@ -201,6 +239,9 @@ class Stage2ModelPT(nn.Module):
             if self._lag_neighbor:
                 if self._lag_nbr_per_type:
                     # Separate per-type neighbor lag weights
+                    # Mask convention: mask[i,j]=1 iff j is presynaptic to i.
+                    # T_sv/T_dcv stored as [post,pre] so (T>0)[i,j]=1 already
+                    # means j→i.  T_e is symmetric.
                     self._lag_nbr_types = []  # list of prefixes with >0 edges
                     for prefix, T_mat in [('e', self.T_e), ('sv', self.T_sv), ('dcv', self.T_dcv)]:
                         mask = (T_mat.abs() > 0).float()
@@ -213,16 +254,42 @@ class Stage2ModelPT(nn.Module):
                         param.register_hook(
                             lambda g, m=mask: g * m.unsqueeze(0).expand_as(g))
                 else:
-                    # Single union mask (original behaviour)
+                    # Single union mask.
+                    # Mask convention: mask[i,j]=1 iff j is presynaptic to i.
+                    # T_sv/T_dcv stored as [post,pre], so (T>0) is already
+                    # correct (j→i).  T_e is symmetric.
                     if self._lag_conn_mask == 'all':
                         mask = ((self.T_e.abs() + self.T_sv + self.T_dcv) > 0).float()
-                    else:
+                    elif self._lag_conn_mask == 'chem':
+                        mask = ((self.T_sv + self.T_dcv) > 0).float()
+                    else:  # 'T_e'
                         mask = (self.T_e > 0).float()
                     self.register_buffer('_lag_nbr_mask', mask)
                     self._lag_G = nn.Parameter(
                         torch.zeros(K_lag, N, N, device=device))
                     self._lag_G.register_hook(
                         lambda g, m=mask: g * m.unsqueeze(0).expand_as(g))
+
+        # ── Lag-style chemical synapse (mode="lag") ──────────────────────
+        if self._chem_mode == 'lag':
+            _K_cl = int(getattr(cfg, 'chem_lag_kernel_len', 0))
+            if _K_cl <= 0:
+                _K_cl = int(getattr(cfg, 'lag_order', 5))
+            self._chem_lag_K = _K_cl
+            self._chem_lag_types = []
+            for prefix, T_mat in [('sv', self.T_sv), ('dcv', self.T_dcv)]:
+                mask = (T_mat.abs() > 0).float()
+                if mask.sum() == 0:
+                    continue
+                self._chem_lag_types.append(prefix)
+                self.register_buffer(f'_chem_lag_mask_{prefix}', mask)
+                param = nn.Parameter(torch.zeros(_K_cl, N, N, device=device))
+                setattr(self, f'_chem_lag_G_{prefix}', param)
+                param.register_hook(
+                    lambda g, m=mask: g * m.unsqueeze(0).expand_as(g))
+            # History buffer for step-by-step rollout (prior_step)
+            self.register_buffer('_chem_lag_history_buf',
+                                 torch.zeros(_K_cl, N, device=device))
 
     def _init_synaptic_params(self, cfg, device, N):
         for prefix, r in [("sv", self.r_sv), ("dcv", self.r_dcv)]:
@@ -370,6 +437,8 @@ class Stage2ModelPT(nn.Module):
             if hasattr(self, '_W_fir_dcv'):
                 p["W_fir_dcv"] = self._W_fir_dcv
                 p["E_dcv"] = self.E_dcv
+        elif self._chem_mode == 'lag':
+            pass  # weights accessed directly from _chem_lag_G_* in forward
         else:
             if self.r_sv > 0:
                 p["T_sv_eff"] = self.T_sv * self._get_W("W_sv")
@@ -404,12 +473,20 @@ class Stage2ModelPT(nn.Module):
         lo, hi = self.u_clip
 
         use_fir = (self._chem_mode == 'fir')
-        has_sv = self.r_sv > 0 if not use_fir else hasattr(self, '_W_fir_sv')
-        has_dcv = self.r_dcv > 0 if not use_fir else hasattr(self, '_W_fir_dcv')
+        use_lag_chem = (self._chem_mode == 'lag')
+        if use_lag_chem:
+            has_sv = 'sv' in getattr(self, '_chem_lag_types', [])
+            has_dcv = 'dcv' in getattr(self, '_chem_lag_types', [])
+        elif use_fir:
+            has_sv = hasattr(self, '_W_fir_sv')
+            has_dcv = hasattr(self, '_W_fir_dcv')
+        else:
+            has_sv = self.r_sv > 0
+            has_dcv = self.r_dcv > 0
 
         # IIR state vectors (only used in IIR mode)
-        s_sv = torch.zeros(N, self.r_sv, device=device) if not use_fir else None
-        s_dcv = torch.zeros(N, self.r_dcv, device=device) if not use_fir else None
+        s_sv = torch.zeros(N, self.r_sv, device=device) if self._chem_mode == 'iir' else None
+        s_dcv = torch.zeros(N, self.r_dcv, device=device) if self._chem_mode == 'iir' else None
 
         preds = torch.zeros_like(u)
         preds[0] = u[0]
@@ -433,7 +510,33 @@ class Stage2ModelPT(nn.Module):
             else:
                 phi_gated_all = phi_all
 
-        I_gap_all = (L @ u.T).T
+        I_gap_all = (L @ u.T).T if self._use_gap else torch.zeros_like(u)
+
+        # ── Delayed Laplacian: precompute shifted sums ──────────────
+        if self._gap_lag_order > 1 and self._use_gap:
+            gap_alpha = torch.tanh(self.gap_lag_alpha)
+            I_gap_pad = F.pad(I_gap_all, (0, 0, self._gap_lag_order - 1, 0))  # zero-pad at start
+            I_gap_delayed = I_gap_all.clone()
+            for k in range(self._gap_lag_order - 1):
+                shift = k + 1  # shift by 1, 2, ...
+                I_gap_delayed = I_gap_delayed + gap_alpha[k] * I_gap_pad[self._gap_lag_order - 1 - shift : self._gap_lag_order - 1 - shift + T]
+            I_gap_all = I_gap_delayed
+
+        # ── Synapse-routed linear lag (FIR on raw u through connectome) ──
+        syn_lag_all = None
+        if self._syn_lag_taps > 0:
+            K_sl = self._syn_lag_taps
+            u_sl_pad = F.pad(u, (0, 0, K_sl, 0))  # (K_sl+T, N)
+            syn_lag_all = torch.zeros(T, N, device=device)
+            for k in range(K_sl):
+                u_k = u_sl_pad[K_sl - 1 - k : K_sl - 1 - k + T]  # (T, N)
+                if hasattr(self, '_syn_lag_alpha_e'):
+                    syn_lag_all = syn_lag_all + self._syn_lag_alpha_e[k].unsqueeze(0) * (u_k @ self.T_e)
+                if hasattr(self, '_syn_lag_alpha_sv'):
+                    # alpha_sv[k] * (T_sv^T @ u_{t-k})
+                    syn_lag_all = syn_lag_all + self._syn_lag_alpha_sv[k].unsqueeze(0) * (u_k @ self.T_sv)
+                if hasattr(self, '_syn_lag_alpha_dcv'):
+                    syn_lag_all = syn_lag_all + self._syn_lag_alpha_dcv[k].unsqueeze(0) * (u_k @ self.T_dcv)
 
         I_stim_all = None
         if self.d_ell > 0 and stim_data is not None:
@@ -452,13 +555,18 @@ class Stage2ModelPT(nn.Module):
                 [u_lag_pad[K_lag - 1 - k : K_lag - 1 - k + T] for k in range(K_lag)],
                 dim=1,
             )
-            lag_self_all = (self._lag_alpha.unsqueeze(0) * lag_buf).sum(1)
+            if 'self' not in self._lag_exclude:
+                lag_self_all = (self._lag_alpha.unsqueeze(0) * lag_buf).sum(1)
+            else:
+                lag_self_all = torch.zeros(T, N, device=device)
             if self._lag_neighbor:
                 if self._lag_nbr_per_type:
                     # Per-type: separate weights, activation only on chemical
                     lag_nbr_all = torch.zeros(T, N, device=device)
                     nbr_buf_act = self._apply_lag_nbr_act(lag_buf)  # for sv/dcv
                     for prefix in getattr(self, '_lag_nbr_types', []):
+                        if prefix in self._lag_exclude:
+                            continue
                         G_p = getattr(self, f'_lag_G_{prefix}')
                         mask_p = getattr(self, f'_lag_nbr_mask_{prefix}')
                         G_masked = G_p * mask_p.unsqueeze(0)
@@ -476,6 +584,25 @@ class Stage2ModelPT(nn.Module):
                         G_masked.transpose(1, 2),
                     ).sum(0)
 
+        # ── Pre-compute lag-style chemical synapse currents ──────────────
+        I_chem_lag = {}
+        if use_lag_chem:
+            K_cl = self._chem_lag_K
+            u_cl_pad = F.pad(u, (0, 0, K_cl, 0))
+            cl_buf = torch.stack(
+                [u_cl_pad[K_cl - 1 - k : K_cl - 1 - k + T] for k in range(K_cl)],
+                dim=1,
+            )  # (T, K_cl, N)
+            cl_buf_act = self.phi(cl_buf)  # apply chemical synapse activation
+            for prefix in getattr(self, '_chem_lag_types', []):
+                G_p = getattr(self, f'_chem_lag_G_{prefix}')
+                mask_p = getattr(self, f'_chem_lag_mask_{prefix}')
+                G_masked = G_p * mask_p.unsqueeze(0)
+                I_chem_lag[prefix] = torch.bmm(
+                    cl_buf_act.permute(1, 0, 2),   # (K_cl, T, N)
+                    G_masked.transpose(1, 2),       # (K_cl, N, N)
+                ).sum(0)                            # (T, N)
+
         zero_N = torch.zeros(N, device=device)
 
         for t in range(1, T):
@@ -483,29 +610,41 @@ class Stage2ModelPT(nn.Module):
 
             I_sv = I_dcv = zero_N
 
-            if use_fir:
+            if use_lag_chem:
+                if has_sv and self._use_sv and 'sv' in I_chem_lag:
+                    I_sv = I_chem_lag['sv'][t]
+                    if self._chem_lag_include_reversal:
+                        I_sv = I_sv * (params["E_sv"] - u_prev)
+                if has_dcv and self._use_dcv and 'dcv' in I_chem_lag:
+                    I_dcv = I_chem_lag['dcv'][t]
+                    if self._chem_lag_include_reversal:
+                        I_dcv = I_dcv * (params["E_dcv"] - u_prev)
+            elif use_fir:
                 # Build phi_buf (K_fir, N): phi(u[t-1]), phi(u[t-2]), ...
                 # phi_pad offset: phi_pad[K_fir + t - 1 - k] for k=0..K-1
                 idx_start = t - 1          # maps to phi_pad[K_fir + t - 1]
                 phi_buf = torch.stack(
                     [phi_pad[K_fir + idx_start - k] for k in range(K_fir)]
                 )  # (K_fir, N)
-                if has_sv:
+                if has_sv and self._use_sv:
                     I_sv = self._synaptic_current_fir(
                         u_prev, phi_buf, params["W_fir_sv"], params["E_sv"])
-                if has_dcv:
+                if has_dcv and self._use_dcv:
                     I_dcv = self._synaptic_current_fir(
                         u_prev, phi_buf, params["W_fir_dcv"], params["E_dcv"])
             else:
                 phi_gated = phi_gated_all[t - 1]
-                if has_sv:
+                if has_sv and self._use_sv:
+                    # Apply pure delay: feed phi(u_{t-1-d}) instead of phi(u_{t-1})
+                    phi_sv = phi_gated_all[max(0, t - 1 - self._iir_delay_sv)] if self._iir_delay_sv > 0 else phi_gated
                     I_sv, s_sv = self._synaptic_current(
-                        u_prev, phi_gated, s_sv,
+                        u_prev, phi_sv, s_sv,
                         params["T_sv_eff"], params["a_sv"],
                         params["tau_sv"], params["E_sv"])
-                if has_dcv:
+                if has_dcv and self._use_dcv:
+                    phi_dcv = phi_gated_all[max(0, t - 1 - self._iir_delay_dcv)] if self._iir_delay_dcv > 0 else phi_gated
                     I_dcv, s_dcv = self._synaptic_current(
-                        u_prev, phi_gated, s_dcv,
+                        u_prev, phi_dcv, s_dcv,
                         params["T_dcv_eff"], params["a_dcv"],
                         params["tau_dcv"], params["E_dcv"])
 
@@ -514,6 +653,8 @@ class Stage2ModelPT(nn.Module):
             I_stim = I_stim_all[t - 1] if I_stim_all is not None else zero_N
 
             I_coupling = I_gap + I_sv + I_dcv
+            if syn_lag_all is not None:
+                I_coupling = I_coupling + syn_lag_all[t]
             if self._coupling_dropout > 0 and self.training:
                 I_coupling = F.dropout(I_coupling, p=self._coupling_dropout, training=True)
 
@@ -543,6 +684,9 @@ class Stage2ModelPT(nn.Module):
         s_dcv = torch.zeros(N, self.r_dcv, device=device)
         self.reset_lag_history()
         self.reset_fir_history()
+        self.reset_synapse_lag_history()
+        self.reset_iir_delay_history()
+        self.reset_chem_lag_history()
         preds = torch.zeros_like(u)
         preds[0] = u[0]
         for t in range(1, T):
@@ -649,6 +793,57 @@ class Stage2ModelPT(nn.Module):
             return F.relu(buf)
         return buf
 
+    # ── Lag-style chemical synapse: step-by-step for rollout ─────────
+    def reset_chem_lag_history(self):
+        if hasattr(self, '_chem_lag_history_buf'):
+            self._chem_lag_history_buf.zero_()
+        self._chem_lag_history_live = None
+
+    def init_chem_lag_history(self, u_seq: torch.Tensor, t: int):
+        if self._chem_mode != 'lag' or not hasattr(self, '_chem_lag_history_buf'):
+            return
+        K = self._chem_lag_K
+        buf = self._chem_lag_history_buf
+        for k in range(K):
+            idx = t - 1 - k
+            if 0 <= idx < u_seq.shape[0]:
+                buf.data[k].copy_(u_seq[idx].detach())
+            else:
+                buf.data[k].zero_()
+        self._chem_lag_history_live = None
+
+    def _chem_lag_push_and_current(self, u_prev: torch.Tensor) -> tuple:
+        """Push u_prev into chem-lag history and compute I_sv, I_dcv (lag-style FIR)."""
+        N, device = self.N, u_prev.device
+        K = self._chem_lag_K
+
+        live = getattr(self, '_chem_lag_history_live', None)
+        if live is None:
+            live = self._chem_lag_history_buf
+
+        old = live[:-1]
+        new_buf = torch.cat([u_prev.unsqueeze(0), old], dim=0)  # (K, N)
+
+        self._chem_lag_history_live = new_buf
+        self._chem_lag_history_buf.data.copy_(new_buf.data.detach())
+
+        # Apply chemical synapse activation
+        phi_buf = self.phi(new_buf)  # (K, N)
+
+        I_sv = I_dcv = torch.zeros(N, device=device)
+        for prefix in getattr(self, '_chem_lag_types', []):
+            G_p = getattr(self, f'_chem_lag_G_{prefix}')
+            mask_p = getattr(self, f'_chem_lag_mask_{prefix}')
+            G_masked = G_p * mask_p.unsqueeze(0)  # (K, N, N)
+            I_p = torch.zeros(N, device=device)
+            for k in range(K):
+                I_p = I_p + G_masked[k] @ phi_buf[k]
+            if prefix == 'sv':
+                I_sv = I_p
+            else:
+                I_dcv = I_p
+        return I_sv, I_dcv
+
     def _lag_push_and_compute(self, u_prev: torch.Tensor) -> torch.Tensor:
         if self._lag_order <= 0:
             return torch.zeros(self.N, device=u_prev.device)
@@ -667,11 +862,13 @@ class Stage2ModelPT(nn.Module):
         # Sync the registered buffer (detached)
         self._lag_history_buf.data.copy_(new_buf.data.detach())
 
-        I_lag = (self._lag_alpha * new_buf).sum(0)
+        I_lag = (self._lag_alpha * new_buf).sum(0) if 'self' not in self._lag_exclude else torch.zeros(self.N, device=u_prev.device)
         if self._lag_neighbor:
             if self._lag_nbr_per_type:
                 nbr_buf_act = self._apply_lag_nbr_act(new_buf)
                 for prefix in getattr(self, '_lag_nbr_types', []):
+                    if prefix in self._lag_exclude:
+                        continue
                     G_p = getattr(self, f'_lag_G_{prefix}')
                     mask_p = getattr(self, f'_lag_nbr_mask_{prefix}')
                     buf_p = new_buf if prefix == 'e' else nbr_buf_act
@@ -684,6 +881,88 @@ class Stage2ModelPT(nn.Module):
                     G_k = self._lag_G[k] * mask
                     I_lag = I_lag + G_k @ nbr_buf[k]
         return I_lag
+
+    # ── Synapse-routed linear lag (step-by-step for rollout) ─────────
+    def reset_synapse_lag_history(self):
+        if hasattr(self, '_syn_lag_history_buf'):
+            self._syn_lag_history_buf.zero_()
+        self._syn_lag_history_live = None
+
+    # ── IIR delay history (step-by-step for rollout) ─────────────────
+    def reset_iir_delay_history(self):
+        if hasattr(self, '_iir_phi_buf'):
+            self._iir_phi_buf.zero_()
+        self._iir_phi_live = None
+
+    def init_iir_delay_history(self, u_seq: torch.Tensor, t: int,
+                                gating_data=None):
+        """Seed the IIR delay buffer from the teacher-forced trajectory at time *t*.
+
+        After seeding, the first prior_step call with u_prev=u(t) will
+        correctly read phi_gated(u(t-d)) for delay d.
+        """
+        if self._iir_max_delay <= 0:
+            return
+        buf = self._iir_phi_buf
+        N = self.N
+        ones = torch.ones(N, device=u_seq.device)
+        for k in range(self._iir_max_delay + 1):
+            idx = t - 1 - k
+            if 0 <= idx < u_seq.shape[0]:
+                phi_val = self.phi(u_seq[idx])
+                g = gating_data[idx] if gating_data is not None and idx < gating_data.shape[0] else ones
+                phi_val = phi_val * g
+                buf.data[k].copy_(phi_val.detach())
+            else:
+                buf.data[k].zero_()
+        self._iir_phi_live = None
+
+    def init_synapse_lag_history(self, u_seq: torch.Tensor, t: int):
+        if self._syn_lag_taps <= 0:
+            return
+        K = self._syn_lag_taps
+        N = self.N
+        device = u_seq.device
+        if not hasattr(self, '_syn_lag_history_buf'):
+            self.register_buffer('_syn_lag_history_buf',
+                                torch.zeros(K, N, device=device))
+        buf = self._syn_lag_history_buf
+        for k in range(K):
+            idx = t - 1 - k
+            if 0 <= idx < u_seq.shape[0]:
+                buf.data[k].copy_(u_seq[idx].detach())
+            else:
+                buf.data[k].zero_()
+        self._syn_lag_history_live = None
+
+    def _synapse_lag_push_and_compute(self, u_prev: torch.Tensor) -> torch.Tensor:
+        """Compute I_syn_lag = sum_k alpha_k * (T^T @ u_{t-k})."""
+        N, device = self.N, u_prev.device
+        K = self._syn_lag_taps
+
+        live = getattr(self, '_syn_lag_history_live', None)
+        if live is None:
+            if not hasattr(self, '_syn_lag_history_buf'):
+                self.register_buffer('_syn_lag_history_buf',
+                                    torch.zeros(K, N, device=device))
+            live = self._syn_lag_history_buf
+
+        old = live[:-1]
+        new_buf = torch.cat([u_prev.unsqueeze(0), old], dim=0)  # (K, N)
+        self._syn_lag_history_live = new_buf
+        if hasattr(self, '_syn_lag_history_buf'):
+            self._syn_lag_history_buf.data.copy_(new_buf.data.detach())
+
+        I = torch.zeros(N, device=device)
+        for k in range(K):
+            u_k = new_buf[k]  # (N,)
+            if hasattr(self, '_syn_lag_alpha_e'):
+                I = I + self._syn_lag_alpha_e[k] * (self.T_e.t() @ u_k)
+            if hasattr(self, '_syn_lag_alpha_sv'):
+                I = I + self._syn_lag_alpha_sv[k] * (self.T_sv.t() @ u_k)
+            if hasattr(self, '_syn_lag_alpha_dcv'):
+                I = I + self._syn_lag_alpha_dcv[k] * (self.T_dcv.t() @ u_k)
+        return I
 
     def convolve_stimulus(self, stim_raw: torch.Tensor) -> torch.Tensor:
         if self.stim_kernel is None or self.stim_kernel_len <= 1:
@@ -709,6 +988,12 @@ class Stage2ModelPT(nn.Module):
         return self.laplacian_with_G()
 
     def _synaptic_current(self, u_prev, phi_gated, s, T_eff, a, tau, E):
+        # NOTE: T_eff is stored as [post,pre], so T_eff.t() has [pre,post].
+        # pool = T_eff.t() @ s  →  pool[i] = Σ_j T_eff[j,i]*s[j]  (j→i when
+        # T_eff[j,i]>0 means i=pre, j=post — i.e. this sums OUTGOING from i).
+        # The biophysically correct incoming current would be T_eff @ s.
+        # This convention has been in place since the model's inception and
+        # all sweep baselines share it, so changing it is a separate task.
         gamma = torch.exp(-self.dt / (tau + 1e-12))
         gamma = gamma.view(1, -1)
         s_next = gamma * s + phi_gated.unsqueeze(1)
@@ -812,26 +1097,72 @@ class Stage2ModelPT(nn.Module):
         I0_eff = self.I0 if I0 is None else I0.to(device=device, dtype=u_prev.dtype)
 
         I_sv = I_dcv = torch.zeros(N, device=device)
-        if self._chem_mode == 'fir':
+        if self._chem_mode == 'lag':
+            I_sv, I_dcv = self._chem_lag_push_and_current(u_prev)
+            if not self._use_sv:
+                I_sv = torch.zeros(N, device=device)
+            if not self._use_dcv:
+                I_dcv = torch.zeros(N, device=device)
+        elif self._chem_mode == 'fir':
             I_sv, I_dcv = self._fir_push_and_current(u_prev, gating)
+            if not self._use_sv:
+                I_sv = torch.zeros(N, device=device)
+            if not self._use_dcv:
+                I_dcv = torch.zeros(N, device=device)
         else:
             phi_gated = self.phi(u_prev) * gating.view(N)
-            if self.r_sv > 0:
-                I_sv, s_sv = self._synaptic_current(u_prev, phi_gated, s_sv,
+            # IIR delay: use phi_gated from d steps ago
+            if self._iir_max_delay > 0:
+                live = getattr(self, '_iir_phi_live', None)
+                if live is None:
+                    live = self._iir_phi_buf
+                new_buf = torch.cat([phi_gated.unsqueeze(0), live[:-1]], dim=0)
+                phi_sv = new_buf[self._iir_delay_sv] if self._iir_delay_sv > 0 else phi_gated
+                phi_dcv = new_buf[self._iir_delay_dcv] if self._iir_delay_dcv > 0 else phi_gated
+                self._iir_phi_live = new_buf
+                self._iir_phi_buf.data.copy_(new_buf.data.detach())
+            else:
+                phi_sv = phi_gated
+                phi_dcv = phi_gated
+            if self.r_sv > 0 and self._use_sv:
+                I_sv, s_sv = self._synaptic_current(u_prev, phi_sv, s_sv,
                     self.T_sv * self._get_W("W_sv"), self.a_sv, self.tau_sv, self.E_sv)
-            if self.r_dcv > 0:
-                I_dcv, s_dcv = self._synaptic_current(u_prev, phi_gated, s_dcv,
+            if self.r_dcv > 0 and self._use_dcv:
+                I_dcv, s_dcv = self._synaptic_current(u_prev, phi_dcv, s_dcv,
                     self.T_dcv * self._get_W("W_dcv"), self.a_dcv, self.tau_dcv, self.E_dcv)
 
         L = self.laplacian_with_G(G)
-        I_gap = L @ u_prev
+        I_gap = (L @ u_prev) if self._use_gap else torch.zeros(N, device=device)
 
-        if self.graph_poly_order > 1:
+        if self._use_gap and self.graph_poly_order > 1:
             alpha = torch.tanh(self.graph_poly_alpha)
             L_pow_u = I_gap
             for p in range(self.graph_poly_order - 1):
                 L_pow_u = L @ L_pow_u
                 I_gap = I_gap + alpha[p] * L_pow_u
+
+        # ── Delayed Laplacian (gap_lag_order) ──────────────────────
+        if self._use_gap and self._gap_lag_order > 1:
+            gap_alpha = torch.tanh(self.gap_lag_alpha)
+            buf = getattr(self, '_gap_lag_buf', None)
+            if buf is None:
+                buf = I_gap.detach().unsqueeze(0).repeat(self._gap_lag_order - 1, 1)
+                self._gap_lag_buf = buf
+            for k in range(self._gap_lag_order - 1):
+                I_gap = I_gap + gap_alpha[k] * buf[k]
+            # shift buffer: push current I_gap(raw), pop oldest
+            new_raw = (L @ u_prev).detach()
+            if self.graph_poly_order > 1:
+                alpha2 = torch.tanh(self.graph_poly_alpha)
+                L_pow = new_raw
+                for p in range(self.graph_poly_order - 1):
+                    L_pow = L @ L_pow
+                    new_raw = new_raw + alpha2[p] * L_pow
+                new_raw = new_raw.detach()
+            if buf.shape[0] > 1:
+                self._gap_lag_buf = torch.cat([new_raw.unsqueeze(0), buf[:-1]], dim=0)
+            else:
+                self._gap_lag_buf = new_raw.unsqueeze(0)
 
         I_lr = torch.zeros(N, device=device)
         if self.lowrank_rank > 0:
@@ -844,6 +1175,9 @@ class Stage2ModelPT(nn.Module):
             I_stim = (self.b * stim.view(N)) if self.stim_diagonal_only else (self.b @ stim)
 
         I_coupling = I_gap + I_sv + I_dcv + I_lr
+        # Synapse-routed linear lag (step-by-step version for rollout)
+        if self._syn_lag_taps > 0:
+            I_coupling = I_coupling + self._synapse_lag_push_and_compute(u_prev)
         if self._coupling_dropout > 0 and self.training:
             I_coupling = F.dropout(I_coupling, p=self._coupling_dropout, training=True)
 

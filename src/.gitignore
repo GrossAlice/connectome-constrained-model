@@ -31,3 +31,6 @@ Thumbs.db
 # Temporary / scratch launcher scripts
 _repro_*.py
 _multi_*.py
+*.png
+"stage2 (copy)/"
+stage2 (copy)/

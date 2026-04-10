@@ -143,17 +143,17 @@ def _train_transformer_cv(
     T, N = u.shape
     dev = torch.device(device)
 
-    # Config — small, fast, K=5, neural-only
+    # Config — matched to Conn-Transformer (small arch)
     cfg = TransformerBaselineConfig(
-        d_model=256,
-        n_heads=8,
-        n_layers=2,
-        d_ff=512,
+        d_model=32,
+        n_heads=2,
+        n_layers=1,
+        d_ff=64,
         dropout=0.1,
         context_length=K,
         lr=1e-3,
         weight_decay=1e-4,
-        batch_size=64,
+        batch_size=128,
         max_epochs=max_epochs,
         patience=patience,
         grad_clip=1.0,
@@ -825,7 +825,7 @@ def load_connectome(worm_labels: List[str]) -> Dict[int, List[int]]:
 
 
 class ConnTransformer(nn.Module):
-    """Tiny per-neuron causal transformer: (K, d_in) → scalar."""
+    """Per-neuron causal transformer: (K, d_in) → scalar."""
 
     def __init__(self, d_in: int, d_model: int = 32, n_heads: int = 2,
                  n_layers: int = 1, K: int = 5, dropout: float = 0.1):
@@ -866,15 +866,23 @@ class ConnLinearK(nn.Module):
 class ConnMLP(nn.Module):
     """Per-neuron MLP: flatten (K, d_in) → hidden → scalar."""
 
-    def __init__(self, d_in: int, K: int = 5, hidden: int = 64):
+    def __init__(self, d_in: int, K: int = 5, hidden: int = 64,
+                 dropout: float = 0.0):
         super().__init__()
-        self.net = nn.Sequential(
+        layers: list = [
             nn.Linear(K * d_in, hidden),
             nn.ReLU(),
+        ]
+        if dropout > 0:
+            layers.append(nn.Dropout(dropout))
+        layers += [
             nn.Linear(hidden, hidden // 2),
             nn.ReLU(),
-            nn.Linear(hidden // 2, 1),
-        )
+        ]
+        if dropout > 0:
+            layers.append(nn.Dropout(dropout))
+        layers.append(nn.Linear(hidden // 2, 1))
+        self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x.reshape(x.size(0), -1)).squeeze(-1)
@@ -949,10 +957,10 @@ def _train_conn_trf_cv(
             if model_type == "linear":
                 model = ConnLinearK(d_in, K=K).to(dev)
             elif model_type == "mlp":
-                model = ConnMLP(d_in, K=K).to(dev)
+                model = ConnMLP(d_in, K=K, dropout=0.5).to(dev)
             else:
                 model = ConnTransformer(d_in, d_model=32, n_heads=2,
-                                        n_layers=1, K=K).to(dev)
+                                        n_layers=1, K=K, dropout=0.1).to(dev)
             opt = torch.optim.Adam(model.parameters(), lr=1e-3,
                                    weight_decay=weight_decay)
             bvl, bst, w = float("inf"), None, 0
@@ -1157,15 +1165,16 @@ def _train_joint_baseline_cv(
             Yf = torch.tensor(Y_np[:nf], dtype=torch.float32, device=dev)
             Yv = torch.tensor(Y_np[nf:], dtype=torch.float32, device=dev)
 
-            mlp_model = JointMLP(din, N).to(dev)
+            mlp_model = JointMLP(din, N, hidden=(64, 32),
+                                dropout=0.5).to(dev)
             opt = torch.optim.Adam(mlp_model.parameters(), lr=1e-3,
-                                   weight_decay=1e-5)
+                                   weight_decay=0.01)
             bvl, bst, w = float("inf"), None, 0
             for ep in range(max_epochs):
                 mlp_model.train()
                 perm = torch.randperm(nf, device=dev)
-                for bs in range(0, nf, 256):
-                    idx = perm[bs : bs + 256]
+                for bs in range(0, nf, 128):
+                    idx = perm[bs : bs + 128]
                     loss = nn.functional.mse_loss(mlp_model(Xf[idx]),
                                                   Yf[idx])
                     opt.zero_grad()
@@ -1566,7 +1575,7 @@ def main():
         u_np, labels, loo_neurons, K=K, n_folds=args.cv_folds,
         device=args.device, window_size=args.window_size,
         max_epochs=args.baseline_epochs, patience=15, verbose=True,
-        model_type="mlp", weight_decay=1e-4,
+        model_type="mlp", weight_decay=0.01,
     )
     cm_time = time.time() - t0_cm
     print(f"  Conn-MLP done ({cm_time:.0f}s)")
@@ -1579,14 +1588,14 @@ def main():
     #  Conn-Transformer (per-neuron, connectome-restricted, K-context)
     # ══════════════════════════════════════════════════════════════════
     print(f"\n{'═'*60}")
-    print(f"  Conn-Transformer  K={K}  wd=0.01  (2-fold CV)")
+    print(f"  Conn-Transformer  K={K}  wd=1e-4  (2-fold CV)")
     print(f"{'═'*60}")
     t0_ct = time.time()
     ct_onestep, ct_loo_w = _train_conn_trf_cv(
         u_np, labels, loo_neurons, K=K, n_folds=args.cv_folds,
         device=args.device, window_size=args.window_size,
-        max_epochs=100, patience=15, verbose=True,
-        model_type="transformer", weight_decay=0.01,
+        max_epochs=args.trf_epochs, patience=20, verbose=True,
+        model_type="transformer", weight_decay=1e-4,
     )
     ct_time = time.time() - t0_ct
     print(f"  Conn-Trf done ({ct_time:.0f}s)")

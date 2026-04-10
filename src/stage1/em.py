@@ -310,7 +310,9 @@ def _em_step_neuron(
     E_d2 = float(np.sum(Euu[:-1] - 2.0 * Euc[:-1] + Ecc[:-1]))
     E_z2 = float(np.sum(Ecc[1:] - 2.0 * Ec1c0 + Ecc[:-1]))
 
-    if cfg.share_lambda_c:
+    if getattr(cfg, 'fix_tau_c', False):
+        pass  # λ_c frozen at init value
+    elif cfg.share_lambda_c:
         acc.lam_zd += E_zd
         acc.lam_d2 += E_d2
     elif E_d2 > 1e-12:
@@ -342,7 +344,9 @@ def _m_step_shared(
         s.rho[:] = float(np.clip(acc.rho_num / acc.rho_den,
                                   cfg.rho_clip[0], cfg.rho_clip[1]))
 
-    if cfg.share_lambda_c and acc.lam_d2 > 1e-12:
+    if getattr(cfg, 'fix_tau_c', False):
+        pass  # λ_c frozen
+    elif cfg.share_lambda_c and acc.lam_d2 > 1e-12:
         s.lam_c[:] = float(np.clip(acc.lam_zd / acc.lam_d2,
                                     cfg.lambda_clip[0], cfg.lambda_clip[1]))
         if cfg.share_rho:

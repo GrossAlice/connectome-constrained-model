@@ -134,6 +134,7 @@ def _print_config(cfg: Stage1Config) -> None:
         f"  share_lambda_c    : {cfg.share_lambda_c}",
         f"  share_sigma_c     : {cfg.share_sigma_c}",
         f"  fix_alpha         : {cfg.fix_alpha}  (alpha_value = {cfg.alpha_value})",
+        f"  fix_tau_c         : {getattr(cfg, 'fix_tau_c', False)}  (tau_c = {cfg.tau_c_init_sec} s)",
         f"  em_max_iters      : {cfg.em_max_iters}",
         f"  em_tol_rel_ll     : {cfg.em_tol_rel_ll}",
     ]

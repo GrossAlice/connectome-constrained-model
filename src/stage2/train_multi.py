@@ -423,12 +423,33 @@ def _train_multi_worm_inner(
     # 4b. Connectome-informed u_unobs initialisation
     T_e = data["T_e"]
     if bool(mc.u_unobs_connectome_init) and bool(mc.infer_unobserved):
-        from .unobs_init import connectome_init_u_unobs
-        connectome_init_u_unobs(
-            worm_states, T_e,
-            alpha=float(mc.u_unobs_init_alpha),
-            temporal_smooth_sigma=float(mc.u_unobs_init_smooth_sigma),
-        )
+        _init_mode = str(getattr(mc, "u_unobs_init_mode", "gap")).strip().lower()
+        if _init_mode == "svdcv":
+            from .unobs_init import connectome_init_u_unobs_svdcv
+            # Use median tau from model init as IIR time constants
+            _tau_sv = float(model.tau_sv.detach().median().item()) if model.tau_sv.numel() > 0 else 1.0
+            _tau_dcv = float(model.tau_dcv.detach().median().item()) if model.tau_dcv.numel() > 0 else 4.0
+            _act = str(getattr(cfg.dynamics, "iir_activation", "sigmoid"))
+            connectome_init_u_unobs_svdcv(
+                worm_states,
+                T_e, T_sv, T_dcv,
+                dt=common_dt,
+                tau_sv=_tau_sv,
+                tau_dcv=_tau_dcv,
+                activation=_act,
+                alpha=float(mc.u_unobs_init_alpha),
+                weight_e=float(getattr(mc, "u_unobs_init_weight_e", 1.0)),
+                weight_sv=float(getattr(mc, "u_unobs_init_weight_sv", 1.0)),
+                weight_dcv=float(getattr(mc, "u_unobs_init_weight_dcv", 0.5)),
+                temporal_smooth_sigma=float(mc.u_unobs_init_smooth_sigma),
+            )
+        else:
+            from .unobs_init import connectome_init_u_unobs
+            connectome_init_u_unobs(
+                worm_states, T_e,
+                alpha=float(mc.u_unobs_init_alpha),
+                temporal_smooth_sigma=float(mc.u_unobs_init_smooth_sigma),
+            )
 
     # 4c. Low-rank parameterisation: u_unobs = u_obs @ C
     if bool(mc.u_unobs_low_rank) and bool(mc.infer_unobserved):

@@ -29,7 +29,7 @@ def _infer_dataset_type(h5_path: str) -> str:
 
 # (indicator, sample_rate_hz, tau_c_init_sec)
 _PRESETS = {
-    "behaviour":    ("gcamp7f", 100.0 / 60.0, 5.0),
+    "behaviour":    ("gcamp7f", 100.0 / 60.0, 0.6),   # τ_c = dt for sub-Nyquist GCaMP7f
     "optogenetics": ("gcamp6s", 2.0,          2.0),
 }
 _PRESETS["unknown"] = _PRESETS["behaviour"]
@@ -50,10 +50,11 @@ class Stage1Config:
 
     # Preprocessing
     center_traces:  bool  = False
-    use_dff:        bool  = True
-    f0_method:      str   = "quantile"
+    use_dff:        bool  = False
+    use_f_over_f0:  bool  = True          # F/F₀ ratio (removes drift, stays positive)
+    f0_method:      str   = "rolling_quantile"
     f0_quantile:    float = 0.2
-    f0_window_sec:  float = 120.0
+    f0_window_sec:  float = 60.0
     f0_eps:         float = 1e-3
 
     # Dataset & indicator (auto-inferred in __post_init__)
@@ -64,14 +65,15 @@ class Stage1Config:
     # Time constants & initial values
     tau_u_init_sec:     float           = 1.0
     tau_c_init_sec:     Optional[float] = None
-    sigma_u_scale_init: float           = 0.7
+    sigma_u_scale_init: float           = 0.8
     sigma_c_init:       float           = 5e-3
 
     # Observation model
     fix_alpha:          bool  = True
     alpha_value:        float = 1.0
+    fix_tau_c:          bool  = True   # lock λ_c at init (τ_c ≈ dt, not identifiable)
     sigma_y_floor:      float = 0.06
-    sigma_y_floor_frac: float = 0.85
+    sigma_y_floor_frac: float = 0.95
     alpha_floor:        float = 1e-6
 
     # Parameter sharing (across neurons)
@@ -84,8 +86,11 @@ class Stage1Config:
     em_tol_rel_ll: float = 1e-4
 
     # Parameter bounds
-    tau_u_clip_sec: Tuple[float, float]           = (0.3, 1.0)
-    tau_c_clip_sec: Tuple[float, float]           = (1.5, 20.0)
+    # C. elegans = graded-potential neurons; GCaMP7f τ_c ≈ 0.4 s < dt = 0.6 s
+    # so indicator is sub-Nyquist — no classical deconvolution needed.
+    # τ_u reflects the *neural dynamics* timescale (seconds).
+    tau_u_clip_sec: Tuple[float, float]           = (1.0, 10.0)
+    tau_c_clip_sec: Tuple[float, float]           = (0.2, 20.0)
     rho_clip:       Optional[Tuple[float, float]] = None   # derived
     lambda_clip:    Optional[Tuple[float, float]] = None   # derived
     eps_var:        float                          = 1e-12

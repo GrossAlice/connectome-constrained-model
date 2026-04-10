@@ -131,6 +131,12 @@ def compute_rollout_loss(
             model.init_lag_history(u_target, t0)
         if hasattr(model, 'init_fir_history'):
             model.init_fir_history(u_target, t0, gating=gating_data)
+        if hasattr(model, 'init_synapse_lag_history'):
+            model.init_synapse_lag_history(u_target, t0)
+        if hasattr(model, 'init_iir_delay_history'):
+            model.init_iir_delay_history(u_target, t0, gating_data=gating_data)
+        if hasattr(model, 'init_chem_lag_history'):
+            model.init_chem_lag_history(u_target, t0)
 
         seg_loss = torch.tensor(0.0, device=device)
         seg_count = 0
@@ -186,6 +192,12 @@ def compute_teacher_forced_states(
 
     if hasattr(model, 'reset_lag_history'):
         model.reset_lag_history()
+    if hasattr(model, 'reset_synapse_lag_history'):
+        model.reset_synapse_lag_history()
+    if hasattr(model, 'reset_iir_delay_history'):
+        model.reset_iir_delay_history()
+    if hasattr(model, 'reset_chem_lag_history'):
+        model.reset_chem_lag_history()
 
     with torch.no_grad():
         for t in range(T - 1):
@@ -245,6 +257,12 @@ def compute_loo_aux_loss(
                 model.init_lag_history(u_target, t0)
             if hasattr(model, 'init_fir_history'):
                 model.init_fir_history(u_target, t0, gating=gating_data)
+            if hasattr(model, 'init_synapse_lag_history'):
+                model.init_synapse_lag_history(u_target, t0)
+            if hasattr(model, 'init_iir_delay_history'):
+                model.init_iir_delay_history(u_target, t0, gating_data=gating_data)
+            if hasattr(model, 'init_chem_lag_history'):
+                model.init_chem_lag_history(u_target, t0)
 
             u_pred_i = u_target[t0, i]
             seg_loss = torch.tensor(0.0, device=device)
@@ -540,6 +558,487 @@ def _make_temporal_folds(T: int, n_folds: int):
     return folds
 
 
+# ── Per-fold training (can be called from threads) ─────────────────
+def _train_one_fold(
+    fi: int,
+    te_s: int,
+    te_e: int,
+    *,
+    cfg: "Stage2PTConfig",
+    data: dict,
+    device: torch.device,
+    T: int,
+    N: int,
+    d_ell: int,
+    u_stage1: torch.Tensor,
+    u_var_stage1: Optional[torch.Tensor],
+    sigma_u: torch.Tensor,
+    gating_data,
+    stim_data_raw,
+    b_seq,
+    warm_start_dir: str | None,
+    save_dir: str | None,
+    stream: Optional[torch.cuda.Stream] = None,
+) -> dict:
+    """Train a single CV fold; returns dict with pred_np, test_mse,
+    state_dict, fold_r2.  Safe to call from a worker thread when each
+    fold gets its own CUDA stream."""
+    import contextlib
+    from .init_from_data import init_lambda_u, init_all_from_data
+    from .evaluate import _teacher_forced_prior, loo_forward_simulate_batched, choose_loo_subset
+    from ._utils import _r2, _cfg_val
+
+    _ctx = (torch.cuda.stream(stream)
+            if stream is not None else contextlib.nullcontext())
+
+    with _ctx:
+        print(f"\n{'='*60}")
+        print(f"[Stage2-CV] Fold {fi+1}  "
+              f"test=[{te_s},{te_e})  ({te_e - te_s} frames held out)")
+        print(f"{'='*60}")
+
+        train_mask = torch.ones(T - 1, dtype=torch.bool, device=device)
+        train_mask[te_s - 1 : te_e - 1] = False
+        n_train = int(train_mask.sum())
+        print(f"[fold {fi}] training on {n_train}/{T-1} frames")
+
+        sign_t = data.get("sign_t")
+        lambda_u_init = init_lambda_u(u_stage1, cfg)
+        model = Stage2ModelPT(
+            N, data["T_e"], data["T_sv"], data["T_dcv"], data["dt"],
+            cfg, device, d_ell=d_ell,
+            lambda_u_init=lambda_u_init,
+            sign_t=sign_t,
+        ).to(device)
+        init_all_from_data(model, u_stage1, cfg)
+
+        if warm_start_dir is not None:
+            ws_path = Path(warm_start_dir) / f"fold_{fi}_state.pt"
+            if ws_path.exists():
+                ws_state = torch.load(ws_path, map_location=device,
+                                      weights_only=True)
+                with torch.no_grad():
+                    for name, val in ws_state.items():
+                        if hasattr(model, name):
+                            param = getattr(model, name)
+                            if isinstance(param, torch.Tensor) and param.shape == val.shape:
+                                param.copy_(val.to(device))
+                print(f"[fold {fi}] Warm-started from {ws_path}")
+            else:
+                print(f"[fold {fi}] No warm-start file found at {ws_path}, "
+                      f"training from scratch")
+
+        with torch.no_grad():
+            lambda_u_raw_init_anchor = model._lambda_u_raw.detach().clone()
+            I0_init_anchor = model.I0.detach().clone()
+            tau_sv_init_anchor = model.tau_sv.detach().clone()
+            tau_dcv_init_anchor = model.tau_dcv.detach().clone()
+            _init_G_rms = float(model.G.pow(2).mean().sqrt())
+            _init_a_sv_rms = float(model.a_sv.pow(2).mean().sqrt())
+            _init_strength = _init_G_rms * _init_a_sv_rms
+
+        syn_lr_mult = float(getattr(cfg, "synaptic_lr_multiplier", 1.0) or 1.0)
+        syn_names = {"_a_sv_raw", "_a_dcv_raw", "_W_sv_raw", "_W_dcv_raw"}
+        syn_params = [p for n, p in model.named_parameters()
+                      if n in syn_names and p.requires_grad]
+        other_params = [p for n, p in model.named_parameters()
+                        if n not in syn_names and p.requires_grad]
+        param_groups = [{"params": other_params, "lr": cfg.learning_rate}]
+        if syn_params:
+            param_groups.append(
+                {"params": syn_params, "lr": cfg.learning_rate * syn_lr_mult})
+        params = other_params + syn_params
+        optimiser = optim.Adam(param_groups)
+
+        z_target = u_stage1.to(device)
+        uvar = (u_var_stage1.to(device) if u_var_stage1 is not None
+                else None)
+        stim_data = stim_data_raw
+
+        use_uvar = bool(getattr(cfg, "use_u_var_weighting", False))
+        uvar_scale = float(getattr(cfg, "u_var_scale", 1.0))
+        uvar_floor = float(getattr(cfg, "u_var_floor", 1e-8))
+
+        grad_clip = float(getattr(cfg, "grad_clip_norm", 0.0) or 0.0)
+        rollout_steps = int(getattr(cfg, "rollout_steps", 0) or 0)
+        rollout_weight = float(getattr(cfg, "rollout_weight", 0.0) or 0.0)
+        rollout_starts = int(getattr(cfg, "rollout_starts", 0) or 0)
+        warmstart_rollout = bool(getattr(cfg, "warmstart_rollout", False))
+        loo_aux_weight = float(getattr(cfg, "loo_aux_weight", 0.0) or 0.0)
+        loo_aux_steps = int(getattr(cfg, "loo_aux_steps", 20) or 20)
+        loo_aux_neurons = int(getattr(cfg, "loo_aux_neurons", 4) or 4)
+        loo_aux_starts = int(getattr(cfg, "loo_aux_starts", 1) or 1)
+        ridge_b = float(getattr(cfg, "ridge_b", 0.0) or 0.0)
+        dynamics_l2 = float(getattr(cfg, "dynamics_l2", 0.0) or 0.0)
+        corr_reg_weight = float(getattr(cfg, "corr_reg_weight", 0.0) or 0.0)
+        I0_reg = float(getattr(cfg, "I0_reg", 0.0) or 0.0)
+        lambda_u_reg = float(getattr(cfg, "lambda_u_reg", 0.0) or 0.0)
+        tau_reg = float(getattr(cfg, "tau_reg", 0.0) or 0.0)
+        net_floor_weight = float(getattr(cfg, "network_strength_floor", 0.0) or 0.0)
+        net_floor_target = float(getattr(cfg, "network_strength_target", 0.8) or 0.8)
+        behavior_weight = float(getattr(cfg, "behavior_weight", 0.0) or 0.0)
+
+        beh_decoder = None
+        if behavior_weight > 0.0 and b_seq is not None:
+            beh_decoder = init_behaviour_decoder(data)
+            if beh_decoder is not None:
+                if beh_decoder["type"] == "mlp":
+                    mlp_params = list(beh_decoder["model"].parameters())
+                    params.extend(mlp_params)
+                    optimiser.add_param_group(
+                        {"params": mlp_params, "lr": cfg.learning_rate})
+                else:
+                    params.append(beh_decoder["W"])
+                    optimiser.add_param_group(
+                        {"params": [beh_decoder["W"]], "lr": cfg.learning_rate})
+
+        # Skip torch.compile when training in parallel threads (dynamo
+        # is not thread-safe and gives marginal speedup on these tiny models).
+        if stream is None:
+            try:
+                if torch.cuda.is_available():
+                    _dynamo = getattr(torch, '_dynamo', None)
+                    if _dynamo is not None:
+                        _dynamo.config.suppress_errors = True
+                    model.forward_sequence = torch.compile(
+                        model.forward_sequence, mode="reduce-overhead")
+                    model._synaptic_current = torch.compile(
+                        model._synaptic_current, mode="reduce-overhead")
+            except Exception:
+                pass
+
+        _use_amp = (bool(getattr(cfg, "use_mixed_precision", False))
+                    and device.type == "cuda")
+
+        _eval_interval = int(getattr(cfg, "eval_interval", 0) or 0)
+        _best_heldout_r2 = -float("inf")
+        _best_state = None
+
+        # ── Pre-compute LOO subset for mid-training eval ───────────
+        _mid_loo_subset = None
+        _mid_loo_window = 50
+        _mid_loo_warmup = 40
+        if _eval_interval > 0:
+            _skip_cv_loo = bool(getattr(cfg, "skip_cv_loo", False))
+            if not _skip_cv_loo:
+                _mid_loo_window = _cfg_val(cfg, "eval_loo_window_size", 50, int)
+                if _mid_loo_window <= 0:
+                    _mid_loo_window = 50
+                _mid_loo_warmup = _cfg_val(cfg, "eval_loo_warmup_steps", 40, int)
+                # Build a lightweight onestep dict for subset selection
+                # (use variance mode which doesn't need onestep R²)
+                _dummy_onestep = {"r2": np.zeros(N), "prior_mu": np.zeros((T, N))}
+                _mid_loo_subset = choose_loo_subset(
+                    data, _dummy_onestep,
+                    subset_size=_cfg_val(cfg, "eval_loo_subset_size", 30, int),
+                    subset_mode="variance",
+                    explicit_indices=(
+                        None if getattr(cfg, "eval_loo_subset_neurons", None) is None
+                        else list(cfg.eval_loo_subset_neurons)
+                    ),
+                    seed=_cfg_val(cfg, "eval_loo_subset_seed", 0, int),
+                )
+
+        for epoch in range(cfg.num_epochs):
+            if stim_data_raw is not None and model.stim_kernel is not None:
+                stim_data = model.convolve_stimulus(stim_data_raw)
+            else:
+                stim_data = stim_data_raw
+
+            optimiser.zero_grad()
+
+            _input_noise = float(getattr(cfg, 'input_noise_sigma', 0.0) or 0.0)
+            if _input_noise > 0:
+                z_noisy = z_target + _input_noise * torch.randn_like(z_target)
+            else:
+                z_noisy = z_target
+
+            _curriculum = bool(getattr(cfg, 'rollout_curriculum', False))
+            if _curriculum and rollout_weight > 0:
+                _K_start = int(getattr(cfg, 'rollout_K_start', 5))
+                _K_end   = int(getattr(cfg, 'rollout_K_end', 30))
+                _cur_s   = int(getattr(cfg, 'rollout_curriculum_start_epoch', 0))
+                _cur_e   = int(getattr(cfg, 'rollout_curriculum_end_epoch', 100))
+                if epoch < _cur_s:
+                    _K_cur = _K_start
+                elif epoch >= _cur_e:
+                    _K_cur = _K_end
+                else:
+                    frac = (epoch - _cur_s) / max(_cur_e - _cur_s, 1)
+                    _K_cur = int(_K_start + frac * (_K_end - _K_start))
+                rollout_steps = _K_cur
+
+            _amp_ctx = torch.autocast(
+                device.type, dtype=torch.bfloat16, enabled=_use_amp)
+            _amp_ctx.__enter__()
+
+            prior_mu = model.forward_sequence(
+                z_noisy, gating_data=gating_data,
+                stim_data=stim_data)
+
+            if model._learn_noise:
+                if model._noise_mode == "heteroscedastic":
+                    _model_sigma = model.sigma_at(z_target[:-1])
+                else:
+                    _model_sigma = model.sigma_at()
+                use_rollout = (rollout_weight > 0 and rollout_steps > 0
+                               and rollout_starts > 0)
+                use_loo_aux = loo_aux_weight > 0 and loo_aux_steps > 0
+            else:
+                _model_sigma = None
+                use_rollout = (rollout_weight > 0 and rollout_steps > 0
+                               and rollout_starts > 0)
+                use_loo_aux = loo_aux_weight > 0 and loo_aux_steps > 0
+
+            one_step_loss = compute_dynamics_loss(
+                z_target[1:], prior_mu[1:], sigma_u,
+                u_var=uvar, use_u_var_weighting=use_uvar,
+                u_var_scale=uvar_scale, u_var_floor=uvar_floor,
+                model_sigma=_model_sigma,
+                train_mask=train_mask,
+            )
+
+            cached_states = None
+            if warmstart_rollout and (use_rollout or use_loo_aux):
+                cached_states = compute_teacher_forced_states(
+                    model, z_target,
+                    gating_data=gating_data, stim_data=stim_data)
+
+            rollout_loss_val = None
+            if use_rollout:
+                rollout_loss_val = compute_rollout_loss(
+                    model, z_target, sigma_u,
+                    rollout_steps=rollout_steps,
+                    rollout_starts=rollout_starts,
+                    gating_data=gating_data, stim_data=stim_data,
+                    cached_states=(cached_states if warmstart_rollout
+                                   else None),
+                    use_nll=model._learn_noise)
+
+            loo_loss_val = None
+            if use_loo_aux:
+                loo_loss_val = compute_loo_aux_loss(
+                    model, z_target, sigma_u,
+                    loo_steps=loo_aux_steps,
+                    loo_neurons=loo_aux_neurons,
+                    loo_starts=loo_aux_starts,
+                    gating_data=gating_data, stim_data=stim_data,
+                    cached_states=(cached_states if warmstart_rollout
+                                   else None),
+                    use_nll=model._learn_noise)
+
+            loss = one_step_loss
+            if rollout_loss_val is not None:
+                loss = loss + rollout_weight * rollout_loss_val
+            if loo_loss_val is not None:
+                loss = loss + loo_aux_weight * loo_loss_val
+            if ridge_b > 0 and model.d_ell > 0:
+                loss = loss + ridge_b * model.b.pow(2).mean()
+            if dynamics_l2 > 0:
+                dyn_l2 = [p.pow(2).mean() for p in model.parameters()
+                          if p.requires_grad]
+                if dyn_l2:
+                    loss = loss + dynamics_l2 * torch.stack(dyn_l2).mean()
+            if corr_reg_weight > 0 and hasattr(model, "_corr_reg_mask"):
+                _crm = model._corr_reg_mask
+                _cr_loss = torch.tensor(0.0, device=device)
+                for attr in ("W_sv", "W_dcv"):
+                    W = getattr(model, attr)
+                    T_mat = getattr(model, f"T_{attr.split('_')[1]}")
+                    mask = (T_mat > 0).float()
+                    if W.numel() > 0 and mask.sum() > 0:
+                        _cr_loss = _cr_loss + (W.pow(2) * _crm * mask).sum() / mask.sum()
+                if model.edge_specific_G:
+                    G = model.G
+                    mask_e = (model.T_e > 0).float()
+                    if mask_e.sum() > 0:
+                        _cr_loss = _cr_loss + (G.pow(2) * _crm * mask_e).sum() / mask_e.sum()
+                loss = loss + corr_reg_weight * _cr_loss
+            _noise_reg = float(getattr(cfg, "noise_reg", 0.0) or 0.0)
+            if _noise_reg > 0 and model._learn_noise:
+                if model._noise_mode == "heteroscedastic":
+                    loss = loss + _noise_reg * (
+                        model._sigma_w.pow(2).mean()
+                        + model._sigma_b.pow(2).mean())
+                else:
+                    loss = loss + _noise_reg * model._log_sigma_u.pow(2).mean()
+            if I0_reg > 0:
+                loss = loss + I0_reg * (
+                    model.I0 - I0_init_anchor).pow(2).mean()
+            if lambda_u_reg > 0:
+                loss = loss + lambda_u_reg * (
+                    model._lambda_u_raw
+                    - lambda_u_raw_init_anchor).pow(2).mean()
+            if tau_reg > 0:
+                _eps = 1e-6
+                if (model.tau_sv.requires_grad
+                        and model.tau_sv.numel() > 0):
+                    loss = loss + tau_reg * (
+                        torch.log(model.tau_sv.clamp(min=_eps))
+                        - torch.log(tau_sv_init_anchor.clamp(min=_eps))
+                    ).pow(2).mean()
+                if (model.tau_dcv.requires_grad
+                        and model.tau_dcv.numel() > 0):
+                    loss = loss + tau_reg * (
+                        torch.log(model.tau_dcv.clamp(min=_eps))
+                        - torch.log(tau_dcv_init_anchor.clamp(min=_eps))
+                    ).pow(2).mean()
+            if net_floor_weight > 0 and net_floor_target > 0:
+                _cur = (model.G.pow(2).mean().sqrt()
+                        * model.a_sv.pow(2).mean().sqrt())
+                _tgt = _init_strength * net_floor_target
+                _ratio = _cur / max(_tgt, 1e-12)
+                loss = loss + net_floor_weight * torch.relu(
+                    1.0 - _ratio).pow(2)
+                loss = loss + 0.1 * net_floor_weight * (
+                    1.0 - _ratio).pow(2)
+            beh_loss_val = None
+            if beh_decoder is not None and behavior_weight > 0.0:
+                beh_loss_val = compute_behaviour_loss(
+                    prior_mu, beh_decoder)
+                loss = loss + behavior_weight * beh_loss_val
+            _beh_cap = float(getattr(cfg, "behavior_weight_cap", 0.0) or 0.0)
+            if _beh_cap > 0 and hasattr(model, "b") and model.b.requires_grad:
+                loss = loss + _beh_cap * model.b.abs().mean()
+            if hasattr(model, '_noise_V') and model.noise_corr_rank > 0:
+                _noise_V_reg = float(getattr(cfg, "noise_reg", 0.0) or 0.0)
+                if _noise_V_reg > 0:
+                    loss = loss + _noise_V_reg * model._noise_V.pow(2).mean()
+
+            _amp_ctx.__exit__(None, None, None)
+
+            apply_training_step(
+                loss, optimiser, params, model, cfg,
+                grad_clip=grad_clip)
+
+            if epoch == 0 or (epoch + 1) == cfg.num_epochs or (epoch + 1) % max(_eval_interval, 10) == 0:
+                parts = [f"dyn={one_step_loss.item():.4f}",
+                         f"total={loss.item():.4f}"]
+                if rollout_loss_val is not None:
+                    parts.append(f"roll={rollout_loss_val.item():.4f}")
+                    if _curriculum:
+                        parts.append(f"K={rollout_steps}")
+                if loo_loss_val is not None:
+                    parts.append(f"loo={loo_loss_val.item():.4f}")
+                if beh_loss_val is not None:
+                    parts.append(f"beh={beh_loss_val.item():.4f}")
+                if _input_noise > 0:
+                    parts.append(f"noise={_input_noise:.3f}")
+                print(f"[fold {fi}] Epoch {epoch+1}/{cfg.num_epochs}: "
+                      f"{'  '.join(parts)}")
+
+            # ── Periodic LOO R² evaluation ───────────────────────────
+            _do_mid_eval = (
+                _eval_interval > 0
+                and (epoch + 1) % _eval_interval == 0
+                and (epoch + 1) < cfg.num_epochs
+                and _mid_loo_subset is not None
+                and len(_mid_loo_subset) > 0
+            )
+            if _do_mid_eval:
+                model.eval()
+                with torch.no_grad():
+                    _loo_preds = loo_forward_simulate_batched(
+                        model, u_stage1.to(device), _mid_loo_subset,
+                        gating_data,
+                        stim_data if stim_data is not None else stim_data_raw,
+                        window_size=_mid_loo_window,
+                        warmup_steps=_mid_loo_warmup,
+                    )
+                _u_np_ref = u_stage1.cpu().numpy()
+                _loo_r2_vals = []
+                for _ni in _mid_loo_subset:
+                    _pred_i = _loo_preds[_ni]
+                    _valid = ~np.isnan(_pred_i)
+                    if _valid.sum() > 1:
+                        _loo_r2_vals.append(
+                            _r2(_u_np_ref[_valid, _ni], _pred_i[_valid]))
+                if _loo_r2_vals:
+                    _loo_arr = np.array(_loo_r2_vals)
+                    _mean_loo = float(np.nanmean(_loo_arr))
+                    print(f"[fold {fi}] ── LOO eval @{epoch+1}: "
+                          f"R² mean={_mean_loo:.4f}  "
+                          f"median={float(np.nanmedian(_loo_arr)):.4f}  "
+                          f"#neg={int((_loo_arr < 0).sum())}/{len(_loo_arr)}")
+                    if _mean_loo > _best_heldout_r2:
+                        _best_heldout_r2 = _mean_loo
+                        _best_state = snapshot_model_state(model)
+                model.train()
+
+        # ── Post-training eval for this fold ────────────────────────
+        model.eval()
+        with torch.no_grad():
+            prior_mu_full = _teacher_forced_prior(
+                model,
+                u_stage1.to(device),
+                gating_data,
+                stim_data if stim_data is not None else stim_data_raw,
+            )
+        pred_np = prior_mu_full.cpu().numpy()
+        u_np = u_stage1.cpu().numpy()
+
+        # Compare final-epoch LOO R² against best mid-training checkpoint
+        if _best_state is not None and _mid_loo_subset and len(_mid_loo_subset) > 0:
+            with torch.no_grad():
+                _final_loo = loo_forward_simulate_batched(
+                    model, u_stage1.to(device), _mid_loo_subset,
+                    gating_data,
+                    stim_data if stim_data is not None else stim_data_raw,
+                    window_size=_mid_loo_window,
+                    warmup_steps=_mid_loo_warmup,
+                )
+            _final_loo_vals = []
+            for _ni in _mid_loo_subset:
+                _v = ~np.isnan(_final_loo[_ni])
+                if _v.sum() > 1:
+                    _final_loo_vals.append(_r2(u_np[_v, _ni], _final_loo[_ni][_v]))
+            _final_mean_loo = float(np.nanmean(_final_loo_vals)) if _final_loo_vals else -999
+            if _best_heldout_r2 > _final_mean_loo:
+                print(f"[fold {fi}] Restoring best checkpoint "
+                      f"(LOO R²={_best_heldout_r2:.4f} > final={_final_mean_loo:.4f})")
+                with torch.no_grad():
+                    for name, val in _best_state.items():
+                        if hasattr(model, name):
+                            param = getattr(model, name)
+                            if isinstance(param, torch.Tensor) and param.shape == val.shape:
+                                param.copy_(val.to(device))
+                model.eval()
+                with torch.no_grad():
+                    prior_mu_full = _teacher_forced_prior(
+                        model, u_stage1.to(device), gating_data,
+                        stim_data if stim_data is not None else stim_data_raw)
+                pred_np = prior_mu_full.cpu().numpy()
+
+        test_mse = float(np.mean(
+            (u_np[te_s:te_e] - pred_np[te_s:te_e]) ** 2))
+        state = snapshot_model_state(model)
+
+        if save_dir is not None:
+            _fold_pt = Path(save_dir) / f"fold_{fi}_state.pt"
+            torch.save(state, _fold_pt)
+
+        _fold_r2 = np.array([
+            _r2(u_np[te_s:te_e, i], pred_np[te_s:te_e, i])
+            for i in range(N)])
+        print(f"[fold {fi}] held-out MSE={test_mse:.6f}  "
+              f"R² mean={np.nanmean(_fold_r2):.4f}  "
+              f"median={np.nanmedian(_fold_r2):.4f}")
+
+    # synchronize stream before returning results
+    if stream is not None:
+        stream.synchronize()
+
+    return {
+        "fi": fi,
+        "te_s": te_s,
+        "te_e": te_e,
+        "pred_np": pred_np,
+        "test_mse": test_mse,
+        "state": state,
+        "fold_r2": _fold_r2,
+    }
+
+
 def train_stage2_cv(
     cfg: Stage2PTConfig,
     save_dir: str | None = None,
@@ -614,337 +1113,64 @@ def train_stage2_cv(
             print(f"  fold {fi}: test=[{s}, {e})  ({e-s} frames)")
         print(f"{'='*60}\n")
 
-        for fi, (te_s, te_e) in enumerate(folds):
-            print(f"\n{'='*60}")
-            print(f"[Stage2-CV] Fold {fi+1}/{n_folds}  "
-                  f"test=[{te_s},{te_e})  ({te_e - te_s} frames held out)")
-            print(f"{'='*60}")
+        # ── Decide whether to train folds in parallel ──────────────
+        _parallel_train = (
+            bool(getattr(cfg, "parallel_folds", False))
+            and torch.cuda.is_available()
+            and n_folds >= 2
+        )
 
-            train_mask = torch.ones(T - 1, dtype=torch.bool, device=device)
-            train_mask[te_s - 1 : te_e - 1] = False
-            n_train = int(train_mask.sum())
-            print(f"[fold {fi}] training on {n_train}/{T-1} frames")
+        # Common kwargs for _train_one_fold
+        _fold_kw = dict(
+            cfg=cfg, data=data, device=device,
+            T=T, N=N, d_ell=d_ell,
+            u_stage1=u_stage1, u_var_stage1=u_var_stage1,
+            sigma_u=sigma_u, gating_data=gating_data,
+            stim_data_raw=stim_data_raw, b_seq=b_seq,
+            warm_start_dir=warm_start_dir, save_dir=save_dir,
+        )
 
-            sign_t = data.get("sign_t")
-            lambda_u_init = init_lambda_u(u_stage1, cfg)
-            model = Stage2ModelPT(
-                N, data["T_e"], data["T_sv"], data["T_dcv"], data["dt"],
-                cfg, device, d_ell=d_ell,
-                lambda_u_init=lambda_u_init,
-                sign_t=sign_t,
-            ).to(device)
-            init_all_from_data(model, u_stage1, cfg)
-
-            if warm_start_dir is not None:
-                ws_path = Path(warm_start_dir) / f"fold_{fi}_state.pt"
-                if ws_path.exists():
-                    ws_state = torch.load(ws_path, map_location=device,
-                                          weights_only=True)
-                    with torch.no_grad():
-                        for name, val in ws_state.items():
-                            if hasattr(model, name):
-                                param = getattr(model, name)
-                                if isinstance(param, torch.Tensor) and param.shape == val.shape:
-                                    param.copy_(val.to(device))
-                    print(f"[fold {fi}] Warm-started from {ws_path}")
-                else:
-                    print(f"[fold {fi}] No warm-start file found at {ws_path}, "
-                          f"training from scratch")
-
-            with torch.no_grad():
-                lambda_u_raw_init_anchor = model._lambda_u_raw.detach().clone()
-                I0_init_anchor = model.I0.detach().clone()
-                tau_sv_init_anchor = model.tau_sv.detach().clone()
-                tau_dcv_init_anchor = model.tau_dcv.detach().clone()
-                _init_G_rms = float(model.G.pow(2).mean().sqrt())
-                _init_a_sv_rms = float(model.a_sv.pow(2).mean().sqrt())
-                _init_strength = _init_G_rms * _init_a_sv_rms
-
-            syn_lr_mult = float(getattr(cfg, "synaptic_lr_multiplier", 1.0) or 1.0)
-            syn_names = {"_a_sv_raw", "_a_dcv_raw", "_W_sv_raw", "_W_dcv_raw"}
-            syn_params = [p for n, p in model.named_parameters()
-                          if n in syn_names and p.requires_grad]
-            other_params = [p for n, p in model.named_parameters()
-                            if n not in syn_names and p.requires_grad]
-            param_groups = [{"params": other_params, "lr": cfg.learning_rate}]
-            if syn_params:
-                param_groups.append(
-                    {"params": syn_params, "lr": cfg.learning_rate * syn_lr_mult})
-            params = other_params + syn_params
-            optimiser = optim.Adam(param_groups)
-
-            z_target = u_stage1.to(device)
-            uvar = (u_var_stage1.to(device) if u_var_stage1 is not None
-                    else None)
-            stim_data = stim_data_raw
-
-            use_uvar = bool(getattr(cfg, "use_u_var_weighting", False))
-            uvar_scale = float(getattr(cfg, "u_var_scale", 1.0))
-            uvar_floor = float(getattr(cfg, "u_var_floor", 1e-8))
-
-            grad_clip = float(getattr(cfg, "grad_clip_norm", 0.0) or 0.0)
-            rollout_steps = int(getattr(cfg, "rollout_steps", 0) or 0)
-            rollout_weight = float(getattr(cfg, "rollout_weight", 0.0) or 0.0)
-            rollout_starts = int(getattr(cfg, "rollout_starts", 0) or 0)
-            warmstart_rollout = bool(getattr(cfg, "warmstart_rollout", False))
-            loo_aux_weight = float(getattr(cfg, "loo_aux_weight", 0.0) or 0.0)
-            loo_aux_steps = int(getattr(cfg, "loo_aux_steps", 20) or 20)
-            loo_aux_neurons = int(getattr(cfg, "loo_aux_neurons", 4) or 4)
-            loo_aux_starts = int(getattr(cfg, "loo_aux_starts", 1) or 1)
-            ridge_b = float(getattr(cfg, "ridge_b", 0.0) or 0.0)
-            dynamics_l2 = float(getattr(cfg, "dynamics_l2", 0.0) or 0.0)
-            corr_reg_weight = float(getattr(cfg, "corr_reg_weight", 0.0) or 0.0)
-            I0_reg = float(getattr(cfg, "I0_reg", 0.0) or 0.0)
-            lambda_u_reg = float(getattr(cfg, "lambda_u_reg", 0.0) or 0.0)
-            tau_reg = float(getattr(cfg, "tau_reg", 0.0) or 0.0)
-            net_floor_weight = float(getattr(cfg, "network_strength_floor", 0.0) or 0.0)
-            net_floor_target = float(getattr(cfg, "network_strength_target", 0.8) or 0.8)
-            behavior_weight = float(getattr(cfg, "behavior_weight", 0.0) or 0.0)
-
-            beh_decoder = None
-            if behavior_weight > 0.0 and b_seq is not None:
-                beh_decoder = init_behaviour_decoder(data)
-                if beh_decoder is not None:
-                    if beh_decoder["type"] == "mlp":
-                        mlp_params = list(beh_decoder["model"].parameters())
-                        params.extend(mlp_params)
-                        optimiser.add_param_group(
-                            {"params": mlp_params, "lr": cfg.learning_rate})
-                    else:
-                        params.append(beh_decoder["W"])
-                        optimiser.add_param_group(
-                            {"params": [beh_decoder["W"]], "lr": cfg.learning_rate})
-
+        if _parallel_train:
+            # Warm-up lazy CUDA wrappers that are NOT thread-safe
+            # (torch.linalg.solve, torch.linalg.lstsq, etc.)
+            _dummy = torch.eye(2, device=device)
+            torch.linalg.solve(_dummy, _dummy)
             try:
-                if torch.cuda.is_available():
-                    _dynamo = getattr(torch, '_dynamo', None)
-                    if _dynamo is not None:
-                        _dynamo.config.suppress_errors = True
-                    model.forward_sequence = torch.compile(
-                        model.forward_sequence, mode="reduce-overhead")
-                    model._synaptic_current = torch.compile(
-                        model._synaptic_current, mode="reduce-overhead")
+                torch.linalg.lstsq(_dummy, _dummy[:, :1])
             except Exception:
                 pass
+            del _dummy
 
-            _use_amp = (bool(getattr(cfg, "use_mixed_precision", False))
-                        and device.type == "cuda")
-
-            for epoch in range(cfg.num_epochs):
-                if stim_data_raw is not None and model.stim_kernel is not None:
-                    stim_data = model.convolve_stimulus(stim_data_raw)
-                else:
-                    stim_data = stim_data_raw
-
-                optimiser.zero_grad()
-
-                _input_noise = float(getattr(cfg, 'input_noise_sigma', 0.0) or 0.0)
-                if _input_noise > 0:
-                    z_noisy = z_target + _input_noise * torch.randn_like(z_target)
-                else:
-                    z_noisy = z_target
-
-                _curriculum = bool(getattr(cfg, 'rollout_curriculum', False))
-                if _curriculum and rollout_weight > 0:
-                    _K_start = int(getattr(cfg, 'rollout_K_start', 5))
-                    _K_end   = int(getattr(cfg, 'rollout_K_end', 30))
-                    _cur_s   = int(getattr(cfg, 'rollout_curriculum_start_epoch', 0))
-                    _cur_e   = int(getattr(cfg, 'rollout_curriculum_end_epoch', 100))
-                    if epoch < _cur_s:
-                        _K_cur = _K_start
-                    elif epoch >= _cur_e:
-                        _K_cur = _K_end
-                    else:
-                        frac = (epoch - _cur_s) / max(_cur_e - _cur_s, 1)
-                        _K_cur = int(_K_start + frac * (_K_end - _K_start))
-                    rollout_steps = _K_cur
-
-                _amp_ctx = torch.autocast(
-                    device.type, dtype=torch.bfloat16, enabled=_use_amp)
-                _amp_ctx.__enter__()
-
-                prior_mu = model.forward_sequence(
-                    z_noisy, gating_data=gating_data,
-                    stim_data=stim_data)
-
-                if model._learn_noise:
-                    if model._noise_mode == "heteroscedastic":
-                        _model_sigma = model.sigma_at(z_target[:-1])
-                    else:
-                        _model_sigma = model.sigma_at()
-                    use_rollout = (rollout_weight > 0 and rollout_steps > 0
-                                   and rollout_starts > 0)
-                    use_loo_aux = loo_aux_weight > 0 and loo_aux_steps > 0
-                else:
-                    _model_sigma = None
-                    use_rollout = (rollout_weight > 0 and rollout_steps > 0
-                                   and rollout_starts > 0)
-                    use_loo_aux = loo_aux_weight > 0 and loo_aux_steps > 0
-
-                one_step_loss = compute_dynamics_loss(
-                    z_target[1:], prior_mu[1:], sigma_u,
-                    u_var=uvar, use_u_var_weighting=use_uvar,
-                    u_var_scale=uvar_scale, u_var_floor=uvar_floor,
-                    model_sigma=_model_sigma,
-                    train_mask=train_mask,
-                )
-
-                cached_states = None
-                if warmstart_rollout and (use_rollout or use_loo_aux):
-                    cached_states = compute_teacher_forced_states(
-                        model, z_target,
-                        gating_data=gating_data, stim_data=stim_data)
-
-                rollout_loss_val = None
-                if use_rollout:
-                    rollout_loss_val = compute_rollout_loss(
-                        model, z_target, sigma_u,
-                        rollout_steps=rollout_steps,
-                        rollout_starts=rollout_starts,
-                        gating_data=gating_data, stim_data=stim_data,
-                        cached_states=(cached_states if warmstart_rollout
-                                       else None),
-                        use_nll=model._learn_noise)
-
-                loo_loss_val = None
-                if use_loo_aux:
-                    loo_loss_val = compute_loo_aux_loss(
-                        model, z_target, sigma_u,
-                        loo_steps=loo_aux_steps,
-                        loo_neurons=loo_aux_neurons,
-                        loo_starts=loo_aux_starts,
-                        gating_data=gating_data, stim_data=stim_data,
-                        cached_states=(cached_states if warmstart_rollout
-                                       else None),
-                        use_nll=model._learn_noise)
-
-                loss = one_step_loss
-                if rollout_loss_val is not None:
-                    loss = loss + rollout_weight * rollout_loss_val
-                if loo_loss_val is not None:
-                    loss = loss + loo_aux_weight * loo_loss_val
-                if ridge_b > 0 and model.d_ell > 0:
-                    loss = loss + ridge_b * model.b.pow(2).mean()
-                if dynamics_l2 > 0:
-                    dyn_l2 = [p.pow(2).mean() for p in model.parameters()
-                              if p.requires_grad]
-                    if dyn_l2:
-                        loss = loss + dynamics_l2 * torch.stack(dyn_l2).mean()
-                if corr_reg_weight > 0 and hasattr(model, "_corr_reg_mask"):
-                    _crm = model._corr_reg_mask
-                    _cr_loss = torch.tensor(0.0, device=device)
-                    for attr in ("W_sv", "W_dcv"):
-                        W = getattr(model, attr)
-                        T_mat = getattr(model, f"T_{attr.split('_')[1]}")
-                        mask = (T_mat > 0).float()
-                        if W.numel() > 0 and mask.sum() > 0:
-                            _cr_loss = _cr_loss + (W.pow(2) * _crm * mask).sum() / mask.sum()
-                    if model.edge_specific_G:
-                        G = model.G
-                        mask_e = (model.T_e > 0).float()
-                        if mask_e.sum() > 0:
-                            _cr_loss = _cr_loss + (G.pow(2) * _crm * mask_e).sum() / mask_e.sum()
-                    loss = loss + corr_reg_weight * _cr_loss
-                _noise_reg = float(getattr(cfg, "noise_reg", 0.0) or 0.0)
-                if _noise_reg > 0 and model._learn_noise:
-                    if model._noise_mode == "heteroscedastic":
-                        loss = loss + _noise_reg * (
-                            model._sigma_w.pow(2).mean()
-                            + model._sigma_b.pow(2).mean())
-                    else:
-                        loss = loss + _noise_reg * model._log_sigma_u.pow(2).mean()
-                if I0_reg > 0:
-                    loss = loss + I0_reg * (
-                        model.I0 - I0_init_anchor).pow(2).mean()
-                if lambda_u_reg > 0:
-                    loss = loss + lambda_u_reg * (
-                        model._lambda_u_raw
-                        - lambda_u_raw_init_anchor).pow(2).mean()
-                if tau_reg > 0:
-                    _eps = 1e-6
-                    if (model.tau_sv.requires_grad
-                            and model.tau_sv.numel() > 0):
-                        loss = loss + tau_reg * (
-                            torch.log(model.tau_sv.clamp(min=_eps))
-                            - torch.log(tau_sv_init_anchor.clamp(min=_eps))
-                        ).pow(2).mean()
-                    if (model.tau_dcv.requires_grad
-                            and model.tau_dcv.numel() > 0):
-                        loss = loss + tau_reg * (
-                            torch.log(model.tau_dcv.clamp(min=_eps))
-                            - torch.log(tau_dcv_init_anchor.clamp(min=_eps))
-                        ).pow(2).mean()
-                if net_floor_weight > 0 and net_floor_target > 0:
-                    _cur = (model.G.pow(2).mean().sqrt()
-                            * model.a_sv.pow(2).mean().sqrt())
-                    _tgt = _init_strength * net_floor_target
-                    _ratio = _cur / max(_tgt, 1e-12)
-                    loss = loss + net_floor_weight * torch.relu(
-                        1.0 - _ratio).pow(2)
-                    loss = loss + 0.1 * net_floor_weight * (
-                        1.0 - _ratio).pow(2)
-                beh_loss_val = None
-                if beh_decoder is not None and behavior_weight > 0.0:
-                    beh_loss_val = compute_behaviour_loss(
-                        prior_mu, beh_decoder)
-                    loss = loss + behavior_weight * beh_loss_val
-                _beh_cap = float(getattr(cfg, "behavior_weight_cap", 0.0) or 0.0)
-                if _beh_cap > 0 and hasattr(model, "b") and model.b.requires_grad:
-                    loss = loss + _beh_cap * model.b.abs().mean()
-                if hasattr(model, '_noise_V') and model.noise_corr_rank > 0:
-                    _noise_V_reg = float(getattr(cfg, "noise_reg", 0.0) or 0.0)
-                    if _noise_V_reg > 0:
-                        loss = loss + _noise_V_reg * model._noise_V.pow(2).mean()
-
-                _amp_ctx.__exit__(None, None, None)
-
-                apply_training_step(
-                    loss, optimiser, params, model, cfg,
-                    grad_clip=grad_clip)
-
-                if epoch == 0 or (epoch + 1) == cfg.num_epochs or (epoch + 1) % 10 == 0:
-                    parts = [f"dyn={one_step_loss.item():.4f}",
-                             f"total={loss.item():.4f}"]
-                    if rollout_loss_val is not None:
-                        parts.append(f"roll={rollout_loss_val.item():.4f}")
-                        if _curriculum:
-                            parts.append(f"K={rollout_steps}")
-                    if loo_loss_val is not None:
-                        parts.append(f"loo={loo_loss_val.item():.4f}")
-                    if beh_loss_val is not None:
-                        parts.append(f"beh={beh_loss_val.item():.4f}")
-                    if _input_noise > 0:
-                        parts.append(f"noise={_input_noise:.3f}")
-                    print(f"[fold {fi}] Epoch {epoch+1}/{cfg.num_epochs}: "
-                          f"{'  '.join(parts)}")
-
-            model.eval()
-            with torch.no_grad():
-                prior_mu_full = _teacher_forced_prior(
-                    model,
-                    u_stage1.to(device),
-                    gating_data,
-                    stim_data if stim_data is not None else stim_data_raw,
-                )
-            pred_np = prior_mu_full.cpu().numpy()
-            pred_u_full[te_s:te_e] = pred_np[te_s:te_e]
-
-            u_np = u_stage1.cpu().numpy()
-            test_mse = float(np.mean(
-                (u_np[te_s:te_e] - pred_np[te_s:te_e]) ** 2))
-            fold_test_mse.append(test_mse)
-            fold_states.append(snapshot_model_state(model))
-
-            if save_dir is not None:
-                _fold_pt = Path(save_dir) / f"fold_{fi}_state.pt"
-                torch.save(fold_states[-1], _fold_pt)
-
-            _fold_r2 = np.array([
-                _r2(u_np[te_s:te_e, i], pred_np[te_s:te_e, i])
-                for i in range(N)])
-            print(f"[fold {fi}] held-out MSE={test_mse:.6f}  "
-                  f"R² mean={np.nanmean(_fold_r2):.4f}  "
-                  f"median={np.nanmedian(_fold_r2):.4f}")
+            print(f"[Stage2-CV] Training {n_folds} folds in PARALLEL "
+                  f"(ThreadPool + CUDA streams)")
+            from concurrent.futures import ThreadPoolExecutor
+            streams = [torch.cuda.Stream(device=device)
+                       for _ in range(n_folds)]
+            with ThreadPoolExecutor(max_workers=n_folds) as pool:
+                futures = [
+                    pool.submit(
+                        _train_one_fold, fi, te_s, te_e,
+                        stream=streams[fi], **_fold_kw,
+                    )
+                    for fi, (te_s, te_e) in enumerate(folds)
+                ]
+                fold_results = [f.result() for f in futures]
+            # Unpack in fold order
+            fold_results.sort(key=lambda r: r["fi"])
+            for r in fold_results:
+                fi, te_s, te_e = r["fi"], r["te_s"], r["te_e"]
+                pred_u_full[te_s:te_e] = r["pred_np"][te_s:te_e]
+                fold_test_mse.append(r["test_mse"])
+                fold_states.append(r["state"])
+        else:
+            if n_folds >= 2:
+                print(f"[Stage2-CV] Training {n_folds} folds SEQUENTIALLY "
+                      f"(set parallel_folds=True to parallelise)")
+            for fi, (te_s, te_e) in enumerate(folds):
+                r = _train_one_fold(fi, te_s, te_e, stream=None, **_fold_kw)
+                pred_u_full[te_s:te_e] = r["pred_np"][te_s:te_e]
+                fold_test_mse.append(r["test_mse"])
+                fold_states.append(r["state"])
 
         valid_mask = ~np.isnan(pred_u_full[:, 0])
         u_np = u_stage1.cpu().numpy()

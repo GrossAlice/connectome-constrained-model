@@ -33,58 +33,75 @@ class DataConfig:
 
 @dataclass
 class DynamicsConfig:
+    # ── Membrane / AR(1) dynamics ───────────────────────────────────
     learn_lambda_u: bool = True
     learn_I0: bool = True
     lambda_u_lo: float = 0.1           # floor on lambda_u (0 = unconstrained)
     lambda_u_hi: float = 0.9999       # ceiling on lambda_u
-    linear_chemical_synapses: bool = False
-    chemical_synapse_activation: str = "sigmoid"
-    noise_corr_rank: int = 0          # 0=diagonal; >0 = low-rank Σ = diag + V V^T
+    u_next_clip_min: Optional[float] = -10
+    u_next_clip_max: Optional[float] = 10
 
+    # ── Connectome ablation switches ───────────────────────────────
+    use_gap_junctions: bool = True     # False→I_gap=0 (disable electrical synapses)
+    use_sv_synapses: bool = True       # False→I_sv=0  (disable SV chemical synapses)
+    use_dcv_synapses: bool = True      # False→I_dcv=0 (disable DCV chemical synapses)
+
+    # ── Gap junctions (electrical synapses, T_e) ────────────────────
     edge_specific_G: bool = True       # False→scalar; True→per-edge (N,N)
-    G_init_mode: str = "corr_weighted"      # "uniform"|"log_counts"|"sqrt_counts"|"corr_weighted"
-    W_init_mode: str = "corr_weighted"       # "uniform"|"corr_weighted" — scale W_sv/W_dcv by |corr(i,j)|
+    G_init_mode: str = "corr_weighted" # "uniform"|"log_counts"|"sqrt_counts"|"corr_weighted"
+    graph_poly_order: int = 1          # 1=standard; 2-3 adds higher-order Laplacian hops
+    gap_lag_order: int = 1             # 1=standard L·u(t-1); 2=also +α·L·u(t-2)  (delayed Laplacian)
 
-    tau_sv_init: Tuple[float, ...] = (0.5, 5)
+    # ── Chemical synapse shared (SV + DCV) ───────────────────────────
+    chemical_synapse_activation: str = "sigmoid"  # nonlinearity before IIR/FIR/lag filtering
+    chemical_synapse_mode: str = "iir"  # "iir" (exponential IIR) | "fir" (learnable FIR per-edge) | "lag" (lag-style FIR, pre-computed)
+    per_neuron_amplitudes: bool = True  # (N, r) per-neuron vs shared (r,)
+    learn_reversals: bool = False
+    reversal_mode: str = "per_neuron"   # "scalar"|"per_neuron"|"per_edge"
+    W_init_mode: str = "corr_weighted"  # "uniform"|"corr_weighted" — scale W_sv/W_dcv by |corr(i,j)|
+    fir_kernel_len: int = 15            # FIR kernel length in time-steps (only if mode="fir")
+    fir_activation: str = "softplus"    # activation before FIR filter: "identity"|"sigmoid"|"softplus"
+    fir_include_reversal: bool = False  # multiply by (E - u_i) driving force in FIR mode
+    chem_lag_kernel_len: int = 0        # kernel length for mode="lag" (0=use lag_order)
+    chem_lag_include_reversal: bool = False  # multiply chem_lag output by (E - u) driving force
+
+    # ── Synaptic vesicle (SV, T_sv — fast chemical) ─────────────────
+    tau_sv_init: Tuple[float, ...] = (1, 5)
     a_sv_init: Tuple[float, ...] = (2.0, 0.8)
     fix_tau_sv: bool = True
     fix_a_sv: bool = False
     learn_W_sv: bool = True
+    iir_delay_sv: int = 0              # pure delay (timesteps) before SV IIR filter
 
-    tau_dcv_init: Tuple[float, ...] = (3.0, 5.0)
+    # ── Synapse-routed linear lag (FIR on raw u through connectome) ──
+    synapse_lag_taps: int = 0          # 0=off; K>0 adds FIR lag taps through T_sv/T_dcv
+
+    # ── Dense-core vesicle (DCV, T_dcv — slow chemical) ─────────────
+    tau_dcv_init: Tuple[float, ...] = (3.0, 7.0)
     a_dcv_init: Tuple[float, ...] = (0.8, 0.6)
     fix_tau_dcv: bool = True
     fix_a_dcv: bool = False
     learn_W_dcv: bool = True
-    per_neuron_amplitudes: bool = True  # (N, r) per-neuron vs shared (r,)
-
-    learn_reversals: bool = False
-    reversal_mode: str = "per_neuron"   # "scalar"|"per_neuron"|"per_edge"
-
-    u_next_clip_min: Optional[float] = -10
-    u_next_clip_max: Optional[float] = 10
-    learn_noise: bool = True
-    noise_floor: float = 1e-3          # minimum sigma (softplus + floor)
-    noise_reg: float = 0.0             # L2 penalty on log_sigma_u (prevents collapse)
-    noise_mode: str = "heteroscedastic"  # "homoscedastic" | "heteroscedastic"
-
-    lowrank_rank: int = 0              # 0=off; >0 captures non-connectome interactions
-    graph_poly_order: int = 1          # 1=standard; 2-3 adds higher-order hops
-    coupling_dropout: float = 0.0      # 0=off; >0 = dropout probability
-
-
-    # ── Chemical synapse kernel mode ─────────────────────────────────
-    chemical_synapse_mode: str = "iir"  # "iir" (exponential IIR) | "fir" (learnable FIR per-edge)
-    fir_kernel_len: int = 5              # FIR kernel length in time-steps (only if mode="fir")
-    fir_activation: str = "softplus"    # activation before FIR filter: "identity"|"sigmoid"|"softplus"
-    fir_include_reversal: bool = False  # multiply by (E - u_i) driving force in FIR mode
+    iir_delay_dcv: int = 0             # pure delay (timesteps) before DCV IIR filter
 
     # ── Lag (FIR self + neighbor on raw u) ───────────────────────────
-    lag_order: int = 5                 # 0=off; K>0 adds K self-lag terms
+    lag_order: int = 10                 # 0=off; K>0 adds K self-lag terms
     lag_neighbor: bool = True          # True: also add connectome-sparse neighbor lags
-    lag_connectome_mask: str = "all"   # "T_e"|"all" — which connectome to use for neighbor lags
+    lag_connectome_mask: str = "all"   # "T_e"|"chem"|"all" — neighbor lag sparsity (chem=T_sv+T_dcv only, excludes T_e)
     lag_neighbor_activation: str = "none"  # "none"|"sigmoid"|"softplus"|"tanh" — apply φ(u_j) before neighbor lag weighting
-    lag_neighbor_per_type: bool = False  # True: separate lag weights per connectome type (T_e, T_sv, T_dcv)
+    lag_neighbor_per_type: bool = True  # True: separate lag weights per connectome type (T_e, T_sv, T_dcv)
+    lag_exclude_types: Tuple[str, ...] = ()  # ablate specific I_lag components: "self","e","sv","dcv"
+
+    # ── Non-connectome / low-rank interactions ───────────────────────
+    lowrank_rank: int = 0              # 0=off; >0 captures non-connectome interactions
+    coupling_dropout: float = 0.0      # 0=off; >0 = dropout on all coupling currents
+
+    # ── Noise / observation model ────────────────────────────────────
+    learn_noise: bool = True
+    noise_mode: str = "heteroscedastic"  # "homoscedastic" | "heteroscedastic"
+    noise_floor: float = 1e-3          # minimum sigma (softplus + floor)
+    noise_reg: float = 0.0             # L2 penalty on log_sigma_u (prevents collapse)
+    noise_corr_rank: int = 0          # 0=diagonal; >0 = low-rank Σ = diag + V V^T
 
 @dataclass
 class BehaviorConfig:
@@ -113,16 +130,17 @@ class StimulusConfig:
 
 @dataclass
 class TrainConfig:
-    num_epochs: int = 30
+    num_epochs: int = 300
+    eval_interval: int = 25            # evaluate held-out R² every N epochs (0=off)
     learning_rate: float = 0.001
     device: str = "cuda"
     grad_clip_norm: float = 1
-    dynamics_l2:    float = 0.0
+    dynamics_l2:    float = 1e-3
     corr_reg_weight: float = 0.0       # penalise low-correlation edges (requires init_corr_reg_mask)
     seed: int = 42                  # global RNG seed for reproducibility (0=unseeded)
 
-    rollout_steps: int = 30
-    rollout_weight: float = 0.0
+    rollout_steps: int = 10
+    rollout_weight: float = 0.3
     rollout_starts: int = 8
     warmstart_rollout: bool = True
 
@@ -171,13 +189,13 @@ class EvalConfig:
     eval_loo_window_size: int = 50
     eval_loo_warmup_steps: int = 40  # teacher-forced burn-in before each LOO window (0=cold)
     skip_cv_loo: bool = False        # skip LOO evaluation during CV (faster dev iterations)
-    skip_free_run: bool = False      # skip free-run + decomposition during CV (faster sweeps)
+    skip_free_run: bool = True       # skip free-run + decomposition during CV (faster sweeps)
 
 
 @dataclass
 class OutputConfig:
     plot_every: int = 10
-    out_u_mean: Optional[str] = "stage2_pt/u_mean"
+    out_u_mean: Optional[str] = None
     out_params: str = "stage2_pt/params"
     skip_final_eval: bool = False      # skip generate_eval_loo_plots after CV
     make_posture_video: bool = True
@@ -203,8 +221,12 @@ class MultiWormConfig:
     u_unobs_smoothness: float = 0.01
     sigma_u_unobs_scale: float = 2.0
     u_unobs_connectome_init: bool = True   # use gap-junction graph to init u_unobs
+    u_unobs_init_mode: str = "gap"         # "gap" (T_e only) | "svdcv" (T_e + T_sv + T_dcv)
     u_unobs_init_alpha: float = 1.0        # ridge regularisation for connectome init
     u_unobs_init_smooth_sigma: float = 0.0 # temporal smoothing of init (0 = off)
+    u_unobs_init_weight_e: float = 1.0     # weight for gap junctions in svdcv mode
+    u_unobs_init_weight_sv: float = 1.0    # weight for SV synapses in svdcv mode
+    u_unobs_init_weight_dcv: float = 0.5   # weight for DCV synapses in svdcv mode
     u_unobs_warmup_epochs: int = 20        # pre-train u_unobs before main loop (0 = off)
     u_unobs_warmup_lr: float = 0.01        # learning rate for warmup phase
     u_unobs_low_rank: bool = False          # parameterise u_unobs = u_obs @ C
